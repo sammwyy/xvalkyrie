@@ -14,6 +14,7 @@
 #include <dxgi1_6.h>
 #include <intrin.h>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -188,6 +189,162 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource *resource, D3D12_RESOURCE_STATE
     barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
     return barrier;
 }
+// Several planes: the title's picture and an overlay above it (its interface), which the
+// console's display puts together. Here they are drawn into the back buffer, the first
+// stretched over all of it as it is and each one after over what is below by its alpha,
+// taken as premultiplied.
+struct Compositor {
+    ID3D12RootSignature *signature = nullptr;
+    ID3D12PipelineState *opaque = nullptr, *over = nullptr;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    ID3D12DescriptorHeap *views = nullptr, *target = nullptr;
+};
+Compositor compositor;
+constexpr UINT most_planes = 4;
+constexpr char compositor_source[] = R"(
+Texture2D plane : register(t0);
+SamplerState linear_clamp : register(s0);
+void vs(uint id : SV_VertexID, out float4 position : SV_Position, out float2 uv : TEXCOORD) {
+    uv = float2((id << 1) & 2, id & 2);
+    position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps(float4 position : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    return plane.Sample(linear_clamp, uv);
+}
+)";
+std::vector<std::uint8_t> compile_compositor(const char *entry, const char *target) {
+    using Compile =
+        HRESULT(WINAPI *)(const void *, SIZE_T, const char *, const void *, void *, const char *,
+                          const char *, UINT, UINT, ID3DBlob **, ID3DBlob **);
+    static const auto compile = [] {
+        const auto library =
+            LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return library ? reinterpret_cast<Compile>(GetProcAddress(library, "D3DCompile")) : nullptr;
+    }();
+    ID3DBlob *code = nullptr, *errors = nullptr;
+    std::vector<std::uint8_t> bytes;
+    if (compile && SUCCEEDED(compile(compositor_source, sizeof compositor_source - 1, "compositor",
+                                     nullptr, nullptr, entry, target, 0, 0, &code, &errors))) {
+        const auto *const data = static_cast<const std::uint8_t *>(code->GetBufferPointer());
+        bytes.assign(data, data + code->GetBufferSize());
+    }
+    for (auto *const blob : {code, errors})
+        if (blob)
+            blob->Release();
+    return bytes;
+}
+// the compositor for back buffers of `format`, made the first time; false if it cannot be
+bool prepare_compositor(ID3D12Device *device, DXGI_FORMAT format) {
+    auto &c = compositor;
+    if (c.opaque && c.format == format)
+        return true;
+    for (IUnknown *object : {static_cast<IUnknown *>(c.opaque), static_cast<IUnknown *>(c.over)})
+        if (object)
+            object->Release();
+    c.opaque = c.over = nullptr;
+    if (!c.signature) {
+        const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameter.DescriptorTable = {1, &range};
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC sampler{};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const D3D12_ROOT_SIGNATURE_DESC desc{1, &parameter, 1, &sampler,
+                                             D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob *blob = nullptr;
+        if (FAILED(
+                D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)))
+            return false;
+        const auto result = device->CreateRootSignature(
+            0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&c.signature));
+        blob->Release();
+        const D3D12_DESCRIPTOR_HEAP_DESC views{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, most_planes,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        const D3D12_DESCRIPTOR_HEAP_DESC target{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(result) ||
+            FAILED(device->CreateDescriptorHeap(&views, IID_PPV_ARGS(&c.views))) ||
+            FAILED(device->CreateDescriptorHeap(&target, IID_PPV_ARGS(&c.target))))
+            return false;
+    }
+    static const auto vertex = compile_compositor("vs", "vs_5_0");
+    static const auto pixel = compile_compositor("ps", "ps_5_0");
+    if (vertex.empty() || pixel.empty())
+        return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = c.signature;
+    desc.VS = {vertex.data(), vertex.size()};
+    desc.PS = {pixel.data(), pixel.size()};
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = format;
+    desc.SampleDesc = {1, 0};
+    if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&c.opaque))))
+        return false;
+    auto &blend = desc.BlendState.RenderTarget[0];
+    blend.BlendEnable = TRUE;
+    blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&c.over))))
+        return false;
+    c.format = format;
+    return true;
+}
+// the planes drawn into `back`, recorded on `list`
+void compose(ID3D12Device *device, ID3D12GraphicsCommandList *list, ID3D12Resource *back,
+             std::span<ID3D12Resource *const> pictures) {
+    auto &c = compositor;
+    const auto size =
+        device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto target = c.target->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(back, nullptr, target);
+    std::vector<D3D12_RESOURCE_BARRIER> barriers{
+        transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    for (UINT i = 0; i < pictures.size(); ++i) {
+        const auto left = tracked_state(pictures[i], D3D12_RESOURCE_STATE_PRESENT);
+        if (left != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+            barriers.push_back(
+                transition(pictures[i], left, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = chain_format(pictures[i]->GetDesc().Format);
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        auto at = c.views->GetCPUDescriptorHandleForHeapStart();
+        at.ptr += std::size_t{i} * size;
+        device->CreateShaderResourceView(pictures[i], &view, at);
+    }
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    const auto desc = back->GetDesc();
+    const D3D12_VIEWPORT viewport{
+        0, 0, static_cast<float>(desc.Width), static_cast<float>(desc.Height), 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height)};
+    list->SetGraphicsRootSignature(c.signature);
+    list->SetDescriptorHeaps(1, &c.views);
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (UINT i = 0; i < pictures.size(); ++i) {
+        auto at = c.views->GetGPUDescriptorHandleForHeapStart();
+        at.ptr += std::uint64_t{i} * size;
+        list->SetPipelineState(i ? c.over : c.opaque);
+        list->SetGraphicsRootDescriptorTable(0, at);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
+    for (auto &barrier : barriers)
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+}
 // XV_D3D_PROBE=<frame>: what the title presents at that frame, and its render targets
 void probe(ID3D12Resource *picture) {
     static const int at = [] {
@@ -283,7 +440,20 @@ HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_para
     if (!planes || !plane || !plane->resource_count || !plane->resources || !plane->resources[0])
         return S_OK;
     auto *const picture = plane->resources[0];
-    const auto desc = picture->GetDesc();
+    auto desc = picture->GetDesc();
+    // the planes past the first that can be shown, and the largest, which the chain is made for
+    std::vector<ID3D12Resource *> pictures{picture};
+    for (UINT i = 1; i < std::min(planes, most_planes); ++i) {
+        const auto &above = plane[i];
+        if (!above.resource_count || !above.resources || !above.resources[0])
+            continue;
+        const auto of = above.resources[0]->GetDesc();
+        if (chain_format(of.Format) == DXGI_FORMAT_UNKNOWN || of.SampleDesc.Count > 1)
+            continue;
+        pictures.push_back(above.resources[0]);
+        if (of.Width * of.Height > desc.Width * desc.Height)
+            desc = of;
+    }
     if (chain_format(desc.Format) == DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count > 1) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true))
             std::fprintf(stderr,
@@ -307,7 +477,13 @@ HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_para
         result = state.allocator->Reset();
     if (SUCCEEDED(result))
         result = state.list->Reset(state.allocator, nullptr);
-    if (SUCCEEDED(result)) {
+    ID3D12Device *device = nullptr;
+    if (SUCCEEDED(result) && pictures.size() > 1 &&
+        SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) &&
+        prepare_compositor(device, state.format)) {
+        compose(device, state.list, back, pictures);
+        result = state.list->Close();
+    } else if (SUCCEEDED(result)) {
         // whatever state the title left its picture in is where it stays
         const auto left = tracked_state(picture, D3D12_RESOURCE_STATE_PRESENT);
         D3D12_RESOURCE_BARRIER barriers[2] = {
@@ -330,6 +506,8 @@ HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_para
     }
     if (back)
         back->Release();
+    if (device)
+        device->Release();
     graphics::frame_counted();
     ++presents;
     frame_watchdog();
