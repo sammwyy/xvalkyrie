@@ -7972,9 +7972,13 @@ HRESULT STDMETHODCALLTYPE deserialize_pipeline(ID3D12Device *self, const std::ui
         *pipeline = nullptr;
     static std::atomic<int> seen{0};
     const int index = seen++;
-    // XV_PSO_NOTIMPL: the cache is not read at all, as on a console that has none, to see
-    // what the title does then
-    if (static const bool refused = std::getenv("XV_PSO_NOTIMPL") != nullptr; refused)
+    // A Series title is told the cache is not there, as on a console that has none: it then
+    // makes its pipelines from the shaders it ships, which are translated, where the cache's
+    // would draw nothing. XV_PSO_CACHE takes the cache's all the same, XV_PSO_NOTIMPL refuses
+    // them for an Xbox One title too.
+    if (static const bool refused = std::getenv("XV_PSO_NOTIMPL") != nullptr ||
+                                    (console == Target::scarlett && !std::getenv("XV_PSO_CACHE"));
+        refused)
         return E_NOTIMPL;
     const auto readable = [](std::uint64_t address, std::size_t bytes) {
         MEMORY_BASIC_INFORMATION info{};
