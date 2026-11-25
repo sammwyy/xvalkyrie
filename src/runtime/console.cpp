@@ -20,9 +20,11 @@ bool windows_app(std::span<const std::uint8_t> file) {
     return !analysis::console_target(analysis::import_profile(report)) &&
            (report.at("dll_characteristics").get<std::uint64_t>() & app_container);
 }
+std::optional<Target> title_target(std::span<const std::uint8_t> file) {
+    return analysis::console_target(analysis::import_profile(pe::inspect(file, pe::Detail::light)));
+}
 Registry title_registry(std::span<const std::uint8_t> file) {
-    const auto target =
-        analysis::console_target(analysis::import_profile(pe::inspect(file, pe::Detail::light)));
+    const auto target = title_target(file);
     if (target)
         return console_registry(*target);
     // Not a console build: nothing of ours to bind it to. It gets the host's own functions,

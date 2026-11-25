@@ -43,6 +43,11 @@ constexpr std::string_view model_name(ConsoleModel model) {
                                        "Xbox Series X"};
     return names[static_cast<int>(model)];
 }
+// as a window's caption names it
+constexpr std::string_view model_short_name(ConsoleModel model) {
+    constexpr std::string_view names[]{"Xbox One", "XOne S", "XOne X", "Series S", "Series X"};
+    return names[static_cast<int>(model)];
+}
 constexpr std::optional<ConsoleModel> parse_model(std::string_view id) {
     for (const auto model : console_models)
         if (model_id(model) == id)

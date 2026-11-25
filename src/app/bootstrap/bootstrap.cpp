@@ -32,12 +32,14 @@ runtime::ConsoleSettings console_settings() {
         saved.headset,        saved.keyboard_dialog,    wide(saved.language), saved.system_storage,
         saved.series_model,   saved.one_model};
 }
-// "<title> [<title ID>] | <video driver> | <n> FPS | XValkyrie <version> <commit>", with the frame
-// rate over the time since it was last asked for. The driver is what the title's device was made
-// on, and the backend selected until it has one.
+// "<title> [<title ID>] | <console> | <video driver> | <n> FPS | XValkyrie <version> <commit>",
+// with the console the title is told it runs on and the frame rate over the time since it was
+// last asked for. The driver is what the title's device was made on, and the backend selected
+// until it has one.
 struct Caption {
     using Clock = std::chrono::steady_clock;
     std::wstring name;
+    std::wstring console;
     Clock::time_point since = Clock::now();
     std::uint64_t frames = graphics::frames_presented();
     std::wstring operator()() {
@@ -51,9 +53,9 @@ struct Caption {
         if (driver.empty())
             driver = graphics::selected_backend() == graphics::Backend::vulkan ? "Vulkan"
                                                                                : "Direct3D 11";
-        auto text = name + L" | " + wide(driver) + L" | " +
-                    std::to_wstring(static_cast<long long>(rate + .5)) + L" FPS | XValkyrie " +
-                    wide(release);
+        auto text = name + L" | " + (console.empty() ? L"" : console + L" | ") + wide(driver) +
+                    L" | " + std::to_wstring(static_cast<long long>(rate + .5)) +
+                    L" FPS | XValkyrie " + wide(release);
         if (*commit)
             text += L" " + wide(commit);
         return text;
@@ -176,7 +178,12 @@ std::uint32_t run(const std::filesystem::path &path, runtime::ExecuteOptions opt
     // the title by its name, and by its title ID where it has one
     const auto id = title_id(path);
     const auto name = title_name(path) + (id.empty() ? "" : " [" + id + "]");
-    surface::set_title_caption(Caption{wide(name)});
+    std::wstring console;
+    if (const auto target = runtime::title_target(bytes))
+        console = wide(std::string(model_short_name(
+            model_for(*target, *target == Target::scarlett ? options.console.series_model
+                                                           : options.console.one_model))));
+    surface::set_title_caption(Caption{wide(name), console});
     if (const auto icon = title_icon(path); !icon.empty())
         surface::set_title_icon(icon);
     surface::use_exclusive_fullscreen(graphics::fullscreen_mode() == graphics::Fullscreen::native);
