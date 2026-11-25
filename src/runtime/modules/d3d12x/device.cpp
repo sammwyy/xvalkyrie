@@ -597,16 +597,15 @@ const D3D12_CLEAR_VALUE *host_clear_value(ID3D12Device *device, const D3D12_CLEA
 D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
 resource_allocation_info(D3D12_RESOURCE_ALLOCATION_INFO *info, ID3D12Device *self, UINT mask,
                          UINT count, const D3D12_RESOURCE_DESC *descs) {
-    // A Series title's texture that is only read takes what the console's layout of it does,
-    // in the swizzle mode it names or the one the console picks, which is how its archives
-    // store it: a title may read a streamed texture in pieces of this size, and the console's
+    // A Series title's texture takes what the console's layout of it does, in the swizzle
+    // mode it names or the one the console picks. That is how its archives store one that is
+    // only read: a title may read a streamed texture in pieces of this size, and the console's
     // reader stops on a piece that does not end where one of the archive's does, smaller or
-    // larger. What is drawn to the host lays out itself.
+    // larger. A title also lays out the targets of a frame in memory by these sizes, against
+    // a budget of the console's: the host's, larger for small ones, go past a Series S's. The
+    // host lays out its own resources, which are made apart from the title's memory.
     std::uint64_t laid_size = 0, laid_alignment = 1;
-    constexpr UINT drawn = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (console == Target::scarlett && descs && count == 1 && !(descs->Flags & drawn) &&
+    if (console == Target::scarlett && descs && count == 1 &&
         !series_allocation(descs, laid_size, laid_alignment))
         laid_size = 0;
     const struct Laid {
@@ -6550,6 +6549,11 @@ void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_
         host_of(self)->SetComputeRootUnorderedAccessView(index, root_uav_address(address));
 }
 void STDMETHODCALLTYPE dispatch(void *self, UINT x, UINT y, UINT z) {
+    if (capturing()) // XV_CAPTURE: the dispatches of the frame, as its draws
+        std::fprintf(stderr, "[Capture] Dispatch %u %u %u pipeline %p%s%s\n", x, y, z,
+                     static_cast<void *>(static_cast<ListProxy *>(self)->pipeline),
+                     static_cast<ListProxy *>(self)->no_pipeline ? " NO PIPELINE" : "",
+                     static_cast<ListProxy *>(self)->heap_uses ? " (heaps)" : "");
     if (static_cast<ListProxy *>(self)->no_pipeline)
         return;
     prepare_dispatch(static_cast<ListProxy *>(self));
