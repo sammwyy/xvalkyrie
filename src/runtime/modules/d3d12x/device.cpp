@@ -2135,14 +2135,17 @@ DXGI_FORMAT host_format(DXGI_FORMAT format, bool resource = false) {
 bool packed_16(DXGI_FORMAT format) {
     return format == DXGI_FORMAT_B5G5R5A1_UNORM || format == DXGI_FORMAT_B4G4R4A4_UNORM;
 }
+// So is R9G9B9E5_SHAREDEXP (67), which a title draws its lighting into on a Series S: such a
+// target is R16G16B16A16_FLOAT, whose range and precision hold all of it.
 DXGI_FORMAT target_format(DXGI_FORMAT format) {
-    return packed_16(format) ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
+    return packed_16(format)                          ? DXGI_FORMAT_R8G8B8A8_UNORM
+           : format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                      : format;
 }
 DXGI_FORMAT view_format(ID3D12Resource *resource, DXGI_FORMAT format) {
     format = host_format(format);
-    return packed_16(format) && resource && resource->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM
-               ? DXGI_FORMAT_R8G8B8A8_UNORM
-               : format;
+    const auto drawn = target_format(format);
+    return drawn != format && resource && resource->GetDesc().Format == drawn ? drawn : format;
 }
 // the value a target is cleared to names its format as well
 const D3D12_CLEAR_VALUE *host_clear(const D3D12_CLEAR_VALUE *clear, D3D12_CLEAR_VALUE &host) {
@@ -2376,6 +2379,12 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
                     channel(0), channel(1), channel(2), channel(3));
             }
             view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc = &view;
+        }
+        // a shared exponent colour of a target 16-bit floats stand for (see target_format)
+        if (resource && view.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+            of.Format == target_format(view.Format)) {
+            view.Format = of.Format;
             desc = &view;
         }
     } else if (resource && of.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
@@ -9379,6 +9388,10 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         overrides.push_back({57, reinterpret_cast<Slot>(&deserialize_pipeline<0>)});
         overrides.push_back({67, reinterpret_cast<Slot>(&deserialize_pipeline<1>)});
         overrides.push_back({71, reinterpret_cast<Slot>(&create_uav_at)});
+        // a committed resource with the first kit's arguments (heap properties, heap flags,
+        // description, state, clear value, interface, resource): AMD's upscaler for the
+        // console makes its textures through it where it has no heap to place them in
+        overrides.push_back({76, reinterpret_cast<Slot>(&create_committed_resource)});
     }
     overrides.push_back({8, reinterpret_cast<Slot>(&create_command_queue)});
     overrides.push_back({62, reinterpret_cast<Slot>(&create_compute_pipeline_x)});
