@@ -10,6 +10,7 @@
 [![license](https://img.shields.io/badge/license-GPL--3.0-ec3630.svg)](LICENSE)
 [![language](https://img.shields.io/badge/C%2B%2B-20-ec3630.svg)](CMakeLists.txt)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-ec3630.svg)](#building)
+[![discord](https://img.shields.io/badge/discord-join-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/pTehpajhXF)
 
 [Compatibility](#compatibility) · [Status](#status) · [How it works](#how-it-works) · [Building](#building) · [Usage](#usage) · [Roadmap](ROADMAP.md)
 
