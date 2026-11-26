@@ -1,7 +1,8 @@
 add_executable(xv_tests tests.cpp pe_directories.cpp loader_image.cpp xvd.cpp pri.cpp
   gameruntime.cpp dstorage.cpp console_shader.cpp memory.cpp timers.cpp placement.cpp
   frame_events.cpp d3d12x.cpp d3d12x_memory.cpp d3d12x_formats.cpp d3d12x_objects.cpp xg.cpp
-  d3d12x_descriptors.cpp d3d12x_queues.cpp xapu.cpp console_model.cpp)
+  d3d12x_descriptors.cpp d3d12x_queues.cpp xapu.cpp console_model.cpp
+  d3d12x_resources.cpp d3d12x_dispatch.cpp)
 target_link_libraries(xv_tests PRIVATE xv_options xv_pe xv_core xv_catch xv_xvd xv_pri xv_loader
   xv_runtime_common xv_runtime_modules opus d3dcompiler d3d12 dxgi)
 # Catch2's own handler of faults takes as fatal those the code catches itself (see tests.cpp)
