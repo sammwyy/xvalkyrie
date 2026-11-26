@@ -4929,12 +4929,16 @@ class Translator {
         if (stage_ == Stage::pixel && valid_mask && exec_changes_)
             line("if (!" + active() + ") discard;");
         if (stage_ == Stage::mesh && target == 20) {
-            // the lane's primitive: three vertex numbers of ten bits; bit 31 culls it
+            // The lane's primitive: three vertex numbers of ten bits; bit 31 culls it, and so
+            // does a number past the vertices the shader makes, which the host's GPU may hang
+            // on where the console's draws nothing.
             const auto value = v(ins.w1 & 0xff);
+            const auto corners = "uint3(" + value + " & 0x3ffu, (" + value + " >> 10) & 0x3ffu, (" +
+                                 value + " >> 20) & 0x3ffu)";
             line("if (" + std::string(exec_changes_ ? active() + " && " : "") + "xv_flat < " +
-                 std::to_string(mesh_primitives_) + "u) xv_prims[xv_flat] = (" + value +
-                 " & 0x80000000u) != 0u ? uint3(0u, 0u, 0u) : uint3(" + value + " & 0x3ffu, (" +
-                 value + " >> 10) & 0x3ffu, (" + value + " >> 20) & 0x3ffu);");
+                 std::to_string(mesh_primitives_) + "u) { uint3 corners = " + corners +
+                 "; xv_prims[xv_flat] = (" + value + " & 0x80000000u) != 0u || any(corners >= " +
+                 std::to_string(mesh_vertices_) + "u) ? uint3(0u, 0u, 0u) : corners; }");
             exported_ = true;
             return;
         }
