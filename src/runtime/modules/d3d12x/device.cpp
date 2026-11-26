@@ -3553,6 +3553,13 @@ std::span<const std::uint8_t> shader_bytes(const D3D12_SHADER_BYTECODE &code) {
         return {};
     return {static_cast<const std::uint8_t *>(code.pShaderBytecode), code.BytecodeLength};
 }
+// XV_D3D_DRED: the console shaders a pipeline is made of, which a list marks for the GPU
+// where it is given the pipeline, so that what the GPU stopped in is named
+const bool dred_marks = std::getenv("XV_D3D_DRED") != nullptr;
+// since the last pipeline made on this thread; plain, as the title's threads have no
+// constructors run for what threads of ours keep
+thread_local wchar_t shaders_made[64];
+std::map<const void *, std::wstring> pipeline_marks; // under kept_mutex
 bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
                    modules::HostShaderModel model = modules::HostShaderModel::sm5,
                    std::span<const modules::PackedInput> packed = {},
@@ -3560,6 +3567,13 @@ bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
     const auto container = shader_bytes(code);
     if (!code.pShaderBytecode || !modules::console_only_shader(container))
         return false;
+    if (dred_marks) {
+        const auto name = modules::host_shader_note(stage, container, false).substr(0, 10);
+        if (const auto used = std::wcslen(shaders_made);
+            used + name.size() + 2 < std::size(shaders_made))
+            std::swprintf(shaders_made + used, std::size(shaders_made) - used, L"%hs ",
+                          name.c_str());
+    }
     const auto made =
         modules::host_shader(stage, container, model, packed, signature_part(signature));
     if (made.empty())
@@ -3844,6 +3858,11 @@ std::map<const void *, std::string> made_pipelines;
 // n on, when the title has got further
 std::atomic<bool> lost_again{false};
 void lost_pipeline(const char *how, void *const *pipeline, const void *root) {
+    if (dred_marks && pipeline && *pipeline) {
+        const std::lock_guard lock(kept_mutex);
+        pipeline_marks[*pipeline] = shaders_made;
+    }
+    shaders_made[0] = 0;
     static const bool checking = std::getenv("XV_D3D_LOST") != nullptr;
     if (!checking || !pipeline || !*pipeline)
         return;
@@ -4818,6 +4837,9 @@ struct ListProxy {
     bool broken = false;
     // what it does to memory by address, in order, done when a queue is given it (when_run)
     std::vector<std::function<void()>> on_memory;
+    // XV_D3D_DRED: the markers of the pipelines it was given (mark_pipeline), of each of its
+    // last recordings, as a list may be recorded again while the GPU still runs the last one
+    std::deque<std::vector<std::wstring>> marks;
     RootArgument &argument(UINT parameter, bool compute = false) {
         auto &arguments = compute ? compute_arguments : graphics_arguments;
         if (arguments.size() <= parameter)
@@ -4827,6 +4849,43 @@ struct ListProxy {
 };
 std::mutex proxy_mutex;
 std::set<const void *> list_proxies;
+// XV_D3D_DRED: a marker for the GPU where the list is given a pipeline, and what it is made
+// of kept with the list, so that the GPU's breadcrumbs say which pipeline it stopped in
+void mark_pipeline(ListProxy *list, ID3D12PipelineState *state) {
+    if (!dred_marks || !state)
+        return;
+    std::wstring text;
+    {
+        const std::lock_guard lock(kept_mutex);
+        const auto found = pipeline_marks.find(state);
+        text = found == pipeline_marks.end() ? L"?" : found->second;
+    }
+    list->host->SetMarker(0, L"", sizeof(wchar_t));
+    const std::lock_guard lock(proxy_mutex);
+    if (list->marks.empty())
+        list->marks.emplace_back();
+    list->marks.back().push_back(std::move(text));
+}
+void STDMETHODCALLTYPE ignored_list_marker(void *, UINT, const void *, UINT) {}
+// the pipeline the GPU last had where a list of the title's stopped, by its markers
+std::wstring marked_pipeline(const void *host, const D3D12_AUTO_BREADCRUMB_OP *history, UINT count,
+                             UINT done) {
+    UINT before = 0, all = 0;
+    for (UINT i = 0; i < count; ++i)
+        if (history[i] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
+            ++all, before += i < done;
+    const std::lock_guard lock(proxy_mutex);
+    for (const auto *const proxy : list_proxies) {
+        const auto *const list = static_cast<const ListProxy *>(proxy);
+        if (list->host != host)
+            continue;
+        for (auto at = list->marks.rbegin(); at != list->marks.rend(); ++at)
+            if (at->size() == all)
+                return before ? (*at)[before - 1] : L"(none yet)";
+        return L"(not kept)";
+    }
+    return L"(not a list of the title's)";
+}
 // the host's list for a title's one, which may be either
 ID3D12CommandList *host_list(void *list) {
     const std::lock_guard lock(proxy_mutex);
@@ -5652,6 +5711,12 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->waits_memory = false;
     list->broken = false;
     list->on_memory.clear();
+    if (dred_marks) {
+        const std::lock_guard lock(proxy_mutex);
+        list->marks.emplace_back();
+        if (list->marks.size() > 8)
+            list->marks.pop_front();
+    }
     const auto result = host_of(self)->Reset(allocator, state);
     if (static std::atomic<int> shown{0};
         std::getenv("XV_D3D_LOST") && (FAILED(result) || shown < 80) && shown++ < 200) {
@@ -6209,6 +6274,7 @@ void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *state
     list->no_pipeline = state && !(state = list_pipeline(state));
     list->pipeline = state;
     list->heap_uses = state ? heap_uses(state) : nullptr;
+    mark_pipeline(list, state);
     if (state && !host_set_pipeline(list->host, state)) {
         if (static std::atomic<bool> told{false}; !told.exchange(true)) {
             std::fprintf(stderr,
@@ -6825,6 +6891,9 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[137] = reinterpret_cast<Slot>(&reset_list);
     vtable[21] = reinterpret_cast<Slot>(&set_viewports);
     vtable[25] = reinterpret_cast<Slot>(&set_pipeline_state);
+    // XV_D3D_DRED: the title's own markers left out, so that the GPU's are only ours
+    if (dred_marks)
+        vtable[56] = reinterpret_cast<Slot>(&ignored_list_marker);
     vtable[22] = reinterpret_cast<Slot>(&set_scissors);
     vtable[26] = reinterpret_cast<Slot>(&resource_barrier);
     vtable[27] = reinterpret_cast<Slot>(&execute_bundle);
@@ -9138,6 +9207,10 @@ ID3D12PipelineState *made_pipeline(DeferredPipeline &pipeline) {
         pipeline.host = SUCCEEDED(result) ? static_cast<ID3D12PipelineState *>(made) : nullptr;
         if (pipeline.host && !pipeline.name.empty())
             pipeline.host->SetName(pipeline.name.c_str());
+        if (pipeline.host && dred_marks) {
+            const std::lock_guard lock(kept_mutex);
+            pipeline_marks[pipeline.host] += pipeline.name;
+        }
         if (static std::atomic<int> told{0}; !pipeline.host && told++ < 8) {
             std::fprintf(stderr,
                          "[Runtime] a pipeline the title made earlier is turned down by the host "
@@ -9643,6 +9716,11 @@ void report_failure() {
                  ++i)
                 std::fprintf(stderr, " %s%d", i == done ? ">" : "",
                              static_cast<int>(node->pCommandHistory[i]));
+            if (dred_marks && done)
+                std::fprintf(stderr, ", with pipeline %ls",
+                             marked_pipeline(node->pCommandList, node->pCommandHistory,
+                                             node->BreadcrumbCount, done)
+                                 .c_str());
             std::fprintf(stderr, "\n");
         }
     dred->Release();
