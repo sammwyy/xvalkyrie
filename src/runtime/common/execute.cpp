@@ -608,6 +608,14 @@ int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
                      region.Protect);
     }
     report_cxx_type(record);
+    // the registers, for a check of the title's that stops it (an int3 after a compare)
+    const auto &c = *info->ContextRecord;
+    std::fprintf(stderr,
+                 "[Runtime] rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx rbp %llx "
+                 "rsp %llx r8 %llx r9 %llx r10 %llx r11 %llx r12 %llx r13 %llx r14 %llx "
+                 "r15 %llx\n",
+                 c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11,
+                 c.R12, c.R13, c.R14, c.R15);
     report_guest_stack(info->ContextRecord);
     report_unwound_stack(info->ContextRecord);
     report_recent_calls();
