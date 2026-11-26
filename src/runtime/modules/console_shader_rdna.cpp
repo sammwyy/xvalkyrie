@@ -940,8 +940,16 @@ class Translator {
                 (ins.name == "s_movk_i32" || ins.name == "s_cmovk_i32" ||
                  ins.name == "s_addk_i32" || ins.name == "s_mulk_i32"))
                 sopk_writes_exec_ = true;
-            if (ends(ins.name, "_b64") || ends(ins.name, "saveexec_b64"))
+            // A wave of 64 lanes has masks of two registers: the 64-bit scalar operations on
+            // EXEC or VCC show it. Other 64-bit ones move addresses, as a wave of 32 does too.
+            if (ends(ins.name, "saveexec_b64"))
                 wave64_ = true;
+            if ((ins.format == F::sop1 || ins.format == F::sop2) && ends(ins.name, "_b64")) {
+                const auto mask = [](std::uint32_t code) { return code == 106 || code == 126; };
+                if (mask((ins.w0 >> 16) & 0x7f) || mask(ins.w0 & 0xff) ||
+                    (ins.format == F::sop2 && mask((ins.w0 >> 8) & 0xff)))
+                    wave64_ = true;
+            }
             if (ins.format == F::ds && ins.name != "ds_swizzle_b32" && ins.name != "ds_nop")
                 uses_shared_ = true;
             if (stage_ == Stage::compute &&

@@ -187,6 +187,16 @@ TEST_CASE("a wave is this one lane where its lanes are counted") {
     CHECK(number.find("countbits(s8)") != std::string::npos);
 }
 
+TEST_CASE("a wave is of 64 lanes where its masks are, not where it moves addresses in pairs") {
+    // v_cmp_lt_f32_e64 s20, 0, v1; s_mov_b64 s[6:7], s[0:1]: a wave of 32, whose compare
+    // writes one register
+    auto source = translated({0xd4010014, 0x00020280, 0xbe860400});
+    CHECK(source.find("s21 = s20;") == std::string::npos);
+    // and s_and_saveexec_b64 s[8:9], s[20:21] after it: a wave of 64, whose masks are pairs
+    source = translated({0xd4010014, 0x00020280, 0xbe860400, 0xbe882414});
+    CHECK(source.find("s21 = s20;") != std::string::npos);
+}
+
 TEST_CASE("a sum over a wave's lanes is this lane's own value") {
     // v_add_nc_u32_dpp8 v2, v2, v2 from the lane beside; v_add_nc_u32_dpp v3, v3, v3 from the
     // lane before, with zero for none, and from two before, with nothing for none;
