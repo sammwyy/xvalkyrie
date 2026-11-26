@@ -842,6 +842,10 @@ std::vector<Placement> take_d3d12_placements() {
         // memory whose pages the title has unmapped: a texture of a heap it maps pages into
         // waits for them again, one of memory it has let go of is done with
         if (!readable(placement.start, placement.end - placement.start)) {
+            // what is still mapped of it is the title's to write again: nothing here would
+            // take a fault on its guard any more
+            if (placement.guarded)
+                protect(placement, PAGE_READWRITE);
             if (placement.series)
                 pending.push_back(placement);
             else
