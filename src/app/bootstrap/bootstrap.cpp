@@ -5,6 +5,7 @@
 #include "backends/input/input.hpp"
 #include "backends/surface/surface.hpp"
 #include "host/files.hpp"
+#include "host/usage.hpp"
 #include "launcher/config.hpp"
 #include "launcher/launch.hpp"
 #include "launcher/library.hpp"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -32,30 +34,30 @@ runtime::ConsoleSettings console_settings() {
         saved.headset,        saved.keyboard_dialog,    wide(saved.language), saved.system_storage,
         saved.series_model,   saved.one_model};
 }
-// "<title> [<title ID>] | <console> | <video driver> | <n> FPS | XValkyrie <version> <commit>",
-// with the console the title is told it runs on and the frame rate over the time since it was
-// last asked for. The driver is what the title's device was made on, and the backend selected
-// until it has one.
+// "<title> [<title ID>] | <console> | <video driver> | <n> FPS | CPU <n>% | MEM <n>% (<n>G) |
+// XValkyrie <version> <commit>", with the console the title is told it runs on, the frame rate
+// (with a decimal below 10), the share of the processors the process took since the last time
+// and the memory it holds. The driver is what the title's device was made on, and the backend
+// selected until it has one.
 struct Caption {
-    using Clock = std::chrono::steady_clock;
     std::wstring name;
     std::wstring console;
-    Clock::time_point since = Clock::now();
-    std::uint64_t frames = graphics::frames_presented();
     std::wstring operator()() {
-        const auto now = Clock::now();
-        const auto presented = graphics::frames_presented();
-        const double seconds = std::chrono::duration<double>(now - since).count();
-        const auto rate = seconds > 0 ? static_cast<double>(presented - frames) / seconds : 0;
-        since = now;
-        frames = presented;
+        const auto rate = graphics::frame_rate();
+        const auto usage = host::process_usage();
         auto driver = graphics::video_driver();
         if (driver.empty())
             driver = graphics::selected_backend() == graphics::Backend::vulkan ? "Vulkan"
                                                                                : "Direct3D 11";
+        wchar_t numbers[96];
+        std::swprintf(numbers, std::size(numbers), L"%.*f FPS | CPU %.0f%% | MEM %.0f%% (%.1fG)",
+                      rate < 10 ? 1 : 0, rate, usage.processor * 100,
+                      usage.installed ? 100.0 * static_cast<double>(usage.memory) /
+                                            static_cast<double>(usage.installed)
+                                      : 0.0,
+                      static_cast<double>(usage.memory) / (1ull << 30));
         auto text = name + L" | " + (console.empty() ? L"" : console + L" | ") + wide(driver) +
-                    L" | " + std::to_wstring(static_cast<long long>(rate + .5)) +
-                    L" FPS | XValkyrie " + wide(release);
+                    L" | " + numbers + L" | XValkyrie " + wide(release);
         if (*commit)
             text += L" " + wide(commit);
         return text;

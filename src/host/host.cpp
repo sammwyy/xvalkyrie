@@ -2,6 +2,7 @@
 #include "host/memory.hpp"
 #include "host/module.hpp"
 #include "host/threading.hpp"
+#include "host/usage.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <utility>
 #include <windows.h>
 // after windows.h, which it needs
+#include <psapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <timeapi.h>
@@ -20,6 +22,35 @@
 namespace xv::host {
 namespace {
 [[noreturn]] void fail(const char *operation, DWORD error = GetLastError());
+}
+ProcessUsage process_usage() {
+    static std::mutex mutex;
+    static std::uint64_t busy_before = 0, wall_before = 0;
+    const auto ticks = [](const FILETIME &time) {
+        return std::uint64_t{time.dwHighDateTime} << 32 | time.dwLowDateTime;
+    };
+    ProcessUsage usage;
+    FILETIME created, ended, kernel, user, now;
+    GetSystemTimeAsFileTime(&now);
+    if (GetProcessTimes(GetCurrentProcess(), &created, &ended, &kernel, &user)) {
+        const std::lock_guard lock(mutex);
+        const auto busy = ticks(kernel) + ticks(user), wall = ticks(now);
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        if (wall_before && wall > wall_before)
+            usage.processor = std::min(1.0, static_cast<double>(busy - busy_before) /
+                                                (static_cast<double>(wall - wall_before) *
+                                                 std::max<DWORD>(system.dwNumberOfProcessors, 1)));
+        busy_before = busy;
+        wall_before = wall;
+    }
+    PROCESS_MEMORY_COUNTERS counters{sizeof counters};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters))
+        usage.memory = counters.WorkingSetSize;
+    MEMORYSTATUSEX status{sizeof status};
+    if (GlobalMemoryStatusEx(&status))
+        usage.installed = status.ullTotalPhys;
+    return usage;
 }
 std::filesystem::path executable_directory() {
     std::wstring path(32768, L'\0');

@@ -32,10 +32,11 @@ Fullscreen fullscreen_mode();
 void select_fullscreen_mode(Fullscreen mode);
 
 // How many frames titles have presented in this process, whatever the backend. A backend
-// calls frame_counted() once per Present; the difference between two readings over the
-// time between them is the frame rate.
+// calls frame_counted() once per Present.
 void frame_counted();
 std::uint64_t frames_presented();
+// frames a second, over about the last second of them
+double frame_rate();
 
 // What the title's frames are drawn with in this process, for people: "Direct3D 11",
 // "Vulkan", "Direct3D 12". Whoever creates the host device says so with drawing_with();
