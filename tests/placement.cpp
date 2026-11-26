@@ -128,7 +128,10 @@ TEST_CASE("a placement is uploaded again after every write, one made while it is
         // to be taken: no longer than this
         WaitForSingleObject(written, 100);
     };
-    CHECK(take_first_bytes() == std::vector{3});
+    // the texture is read out of its tiling after the lock is let go of, so the write may
+    // already be there: the upload has the one value or the other, and the next has the write
+    const auto first = take_first_bytes();
+    CHECK((first == std::vector{3} || first == std::vector{4}));
     texture.referenced = nullptr;
     writer.join();
     CHECK(take_first_bytes() == std::vector{4});
