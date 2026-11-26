@@ -13,8 +13,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -428,6 +430,45 @@ std::string stand_in(ShaderStage stage, Bytes container) {
 }
 // whether this thread's shaders are translated to read the heaps themselves
 thread_local bool heap_shaders = false;
+// The translation of a large shader, and the host's compilers with what it makes, go deeper
+// than the megabyte a thread has by default: where the thread this is called on has less
+// than 32 MiB left, `work` runs on one of 64 MiB, with this one's heap_shaders, while this
+// one waits.
+void on_large_stack(const std::function<void()> &work) {
+    ULONG_PTR low = 0, high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    const char here = 0;
+    if (reinterpret_cast<ULONG_PTR>(&here) - low >= (32u << 20)) {
+        work();
+        return;
+    }
+    struct Call {
+        const std::function<void()> *work;
+        bool heaps;
+        std::exception_ptr error;
+    } call{&work, heap_shaders, nullptr};
+    auto *const thread = CreateThread(
+        nullptr, 64u << 20,
+        [](void *argument) -> DWORD {
+            auto *const call = static_cast<Call *>(argument);
+            heap_shaders = call->heaps;
+            try {
+                (*call->work)();
+            } catch (...) {
+                call->error = std::current_exception();
+            }
+            return 0;
+        },
+        &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!thread) {
+        work();
+        return;
+    }
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    if (call.error)
+        std::rethrow_exception(call.error);
+}
 // the translation of the code; nothing if the code is not one that is handled, and then
 // `why` says what stopped it
 std::optional<std::string> translated_source(ShaderStage stage, Bytes container,
@@ -1262,9 +1303,12 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
     if (shader.empty()) {
         std::string why = "stand-ins asked for";
         bool needs_sm6 = false;
-        auto source = stand_ins_only ? std::nullopt
-                                     : translated_source(stage, container, &why, nullptr,
-                                                         &needs_sm6, signed_inputs, root_signature);
+        std::optional<std::string> source;
+        if (!stand_ins_only)
+            on_large_stack([&] {
+                source = translated_source(stage, container, &why, nullptr, &needs_sm6,
+                                           signed_inputs, root_signature);
+            });
         const bool sm6 =
             model == HostShaderModel::sm6 || (model == HostShaderModel::automatic && needs_sm6);
         if (needs_sm6 && !sm6) {
@@ -1302,7 +1346,10 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
         }
         const bool kept = !folder.empty() && !asking;
         if (source)
-            shader = compile(stage, *source, kept ? folder / name : std::filesystem::path{}, sm6);
+            on_large_stack([&] {
+                shader =
+                    compile(stage, *source, kept ? folder / name : std::filesystem::path{}, sm6);
+            });
         const bool done = !shader.empty();
         // a pipeline whose shaders read the heaps is of the newer model in every stage: a
         // stand-in for one of them is too
@@ -1513,18 +1560,20 @@ std::shared_ptr<Precompile> precompile_shaders(const std::filesystem::path &cach
                         const Bytes all(bytes);
                         bool needs_sm6 = false;
                         std::string why;
-                        auto source = translated_source(stage, all.subspan(32, (*header)[6]), &why,
-                                                        nullptr, &needs_sm6, (*header)[5],
-                                                        all.subspan(32 + (*header)[6]));
-                        const bool sm6 = model == HostShaderModel::sm6 ||
-                                         (model == HostShaderModel::automatic && needs_sm6);
-                        if (source && needs_sm6 && !sm6) {
-                            why = "the pipeline needs Shader Model 5 shaders";
-                        } else if (source) {
-                            why = "the host's compiler";
-                            shader = sm6 ? compile_sm6(stage, *source)
-                                         : compile_now(stage, *source, false, &why);
-                        }
+                        on_large_stack([&] {
+                            auto source = translated_source(stage, all.subspan(32, (*header)[6]),
+                                                            &why, nullptr, &needs_sm6, (*header)[5],
+                                                            all.subspan(32 + (*header)[6]));
+                            const bool sm6 = model == HostShaderModel::sm6 ||
+                                             (model == HostShaderModel::automatic && needs_sm6);
+                            if (source && needs_sm6 && !sm6) {
+                                why = "the pipeline needs Shader Model 5 shaders";
+                            } else if (source) {
+                                why = "the host's compiler";
+                                shader = sm6 ? compile_sm6(stage, *source)
+                                             : compile_now(stage, *source, false, &why);
+                            }
+                        });
                         // what the host's compiler turns down as well: it is given the same
                         // shader by this version of the translator, which a run of the title
                         // still tries for itself
