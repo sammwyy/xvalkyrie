@@ -2334,6 +2334,17 @@ class Translator {
                                    : "bound") +
                 ", type " + std::to_string(resource.type) + ")");
     }
+    // A root view has no bounds on the host, and a title's shader reads one at offsets from
+    // its data: past its buffer the host's GPU hangs. The host gives the last word there is of
+    // each (xv_bounds, set with the views), which an offset is kept within.
+    std::string root_limit(const Resource &resource) {
+        if (!declared_.count("xv_bounds")) {
+            declared_["xv_bounds"] = "cbuffer";
+            declarations_ += "cbuffer xv_bounds : register(b2, space200) { uint xv_root_read; "
+                             "uint xv_root_written; };\n";
+        }
+        return resource.type == 1 ? "xv_root_written" : "xv_root_read";
+    }
     // The name of a resource as the host's shader has it, declared the first time as `type`.
     // One picked at run time is an element of an array over a range of its table: each type
     // gets a range of its own, which is what the table has several for.
@@ -2545,7 +2556,8 @@ class Translator {
         if (resource.root) {
             const auto name =
                 object(resource, resource.type == 1 ? "RWByteAddressBuffer" : "ByteAddressBuffer");
-            return name + ".Load(" + bytes_of(resource, index) + at + ")";
+            return name + ".Load(min(" + bytes_of(resource, index) + at + ", " +
+                   root_limit(resource) + "))";
         }
         return words(resource) + "[" + index + "].w[" + field(at, fixed, more) + "]";
     }
@@ -2571,10 +2583,12 @@ class Translator {
         written(resource);
         const auto at = "(" + offset + " + " + std::to_string(more) + "u)";
         const std::string guard = exec_changes_ ? "if " + active() + " " : "";
-        if (resource.root)
-            line(guard + object(resource, "RWByteAddressBuffer") + ".Store(" +
-                 bytes_of(resource, index) + at + ", " + value + ");");
-        else
+        if (resource.root) {
+            // past the view's buffer a store is dropped (root_limit)
+            const auto place = bytes_of(resource, index) + at;
+            line(guard + "if (" + place + " <= " + root_limit(resource) + ") " +
+                 object(resource, "RWByteAddressBuffer") + ".Store(" + place + ", " + value + ");");
+        } else
             line(guard + words(resource) + "[" + index + "].w[" + field(at, fixed, more) +
                  "] = " + value + ";");
     }
@@ -4808,8 +4822,9 @@ class Translator {
             if (resource.root) {
                 const auto buffer = object(resource, "RWByteAddressBuffer");
                 const auto at = bytes_of(resource, index) + "(" + extra + " & ~3u)";
-                line(guard + "{ uint X; " + buffer + ".InterlockedAnd(" + at + ", " + clear +
-                     ", X); " + buffer + ".InterlockedOr(" + at + ", " + part + ", X); }");
+                line(guard + "if (" + at + " <= " + root_limit(resource) + ") { uint X; " + buffer +
+                     ".InterlockedAnd(" + at + ", " + clear + ", X); " + buffer +
+                     ".InterlockedOr(" + at + ", " + part + ", X); }");
             } else {
                 const auto word =
                     words(resource) + "[" + index + "].w[" +
@@ -4837,8 +4852,10 @@ class Translator {
                         method = function;
                 if (!method)
                     give_up("an atomic " + std::string(how) + " on a root buffer");
-                line(guard + object(resource, "RWByteAddressBuffer") + "." + method + "(" +
-                     bytes_of(resource, index) + at + ", " + v(data) + ", " + id + ");");
+                const auto place = bytes_of(resource, index) + at;
+                line(guard + "if (" + place + " <= " + root_limit(resource) + ") " +
+                     object(resource, "RWByteAddressBuffer") + "." + method + "(" + place + ", " +
+                     v(data) + ", " + id + ");");
             } else {
                 line(guard +
                      atomic(name.substr(14),

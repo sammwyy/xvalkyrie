@@ -2156,6 +2156,7 @@ const D3D12_CLEAR_VALUE *host_clear(const D3D12_CLEAR_VALUE *clear, D3D12_CLEAR_
 }
 std::uint64_t root_address(std::uint64_t address);
 std::uint64_t root_uav_address(std::uint64_t address);
+std::uint32_t root_view_limit(std::uint64_t address);
 std::uint64_t root_constants(std::uint64_t address);
 void when_run(void *self, std::function<void()> work);
 // the title's list a method of this thread is recording into, whose copies of the title's
@@ -3805,7 +3806,7 @@ ID3D12RootSignature *heap_signature(ID3D12Device *device) {
     std::call_once(once, [&] {
         using Serialize = HRESULT(WINAPI *)(const void *, void **, void **);
         const auto serialize = host_d3d12<Serialize>("D3D12SerializeVersionedRootSignature");
-        D3D12_ROOT_PARAMETER1 parameters[5]{};
+        D3D12_ROOT_PARAMETER1 parameters[6]{};
         for (UINT n = 0; n < 2; ++n) {
             parameters[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             parameters[n].Constants = {n, 200, 24};
@@ -3818,6 +3819,11 @@ ID3D12RootSignature *heap_signature(ID3D12Device *device) {
             parameters[n].Descriptor = {0, 201, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
             parameters[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
+        // b2 of space 200: the last word of the root views' buffers there is to read and to
+        // write (fill_user), which shaders keep their offsets within
+        parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[5].Constants = {2, 200, 2};
+        parameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         // s0: the one shaders sample with when they make a sampler of words in their code;
         // s1: the same, for a shader that compares with it (a shadow map's)
         D3D12_STATIC_SAMPLER_DESC samplers[2]{};
@@ -3835,7 +3841,7 @@ ID3D12RootSignature *heap_signature(ID3D12Device *device) {
         }
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
         desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-        desc.Desc_1_1.NumParameters = 5;
+        desc.Desc_1_1.NumParameters = 6;
         desc.Desc_1_1.pParameters = parameters;
         desc.Desc_1_1.NumStaticSamplers = 2;
         desc.Desc_1_1.pStaticSamplers = samplers;
@@ -5900,10 +5906,11 @@ void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_
 template <class View>
 void fill_user(ListProxy *list, const HeapUses::Stage &stage,
                const std::vector<ListProxy::RootArgument> &arguments, std::uint32_t first,
-               std::uint32_t (&user)[24], View view) {
+               std::uint32_t (&user)[24], std::uint32_t (&bounds)[2], View view) {
     std::uintptr_t tables[24]{};
     ShadowHeap heaps[24]{};
     std::memset(user, 0, sizeof user);
+    bounds[0] = bounds[1] = 0;
     for (const auto &entry : stage.entries) {
         const auto at = entry.reg - first;
         const auto *const argument =
@@ -5932,10 +5939,12 @@ void fill_user(ListProxy *list, const HeapUses::Stage &stage,
                 if (n < argument->words.size())
                     user[at + n] = argument->words[n];
         } else if (entry.kind == 2 && argument->kind == 3) {
+            bounds[0] = root_view_limit(argument->value);
             view(2, root_address(argument->value));
         } else if (entry.kind == 2 && argument->kind == 2) {
             view(3, root_constants(argument->value));
         } else if (entry.kind == 2 && argument->kind == 4) {
+            bounds[1] = root_view_limit(argument->value);
             view(4, root_uav_address(argument->value));
         }
     }
@@ -6005,8 +6014,8 @@ void prepare_dispatch(ListProxy *list) {
         list->host->SetComputeRootSignature(signature);
         list->compute_ours_bound = true;
     }
-    std::uint32_t user[24];
-    fill_user(list, list->heap_uses->stages[0], list->compute_arguments, 0, user,
+    std::uint32_t user[24], bounds[2];
+    fill_user(list, list->heap_uses->stages[0], list->compute_arguments, 0, user, bounds,
               [&](UINT parameter, std::uint64_t address) {
                   if (parameter == 2)
                       list->host->SetComputeRootShaderResourceView(parameter, address);
@@ -6016,6 +6025,7 @@ void prepare_dispatch(ListProxy *list) {
                       list->host->SetComputeRootUnorderedAccessView(parameter, address);
               });
     list->host->SetComputeRoot32BitConstants(0, 24, user, 0);
+    list->host->SetComputeRoot32BitConstants(5, 2, bounds, 0);
 }
 // Before a draw: the host's list gets the root signature the pipeline is under. One of the
 // title's cache that reads the heap is told where the table the title draws with starts
@@ -6055,10 +6065,10 @@ void prepare_draw(ListProxy *list) {
         list->ours_bound = true;
     }
     // the user registers from s8 on: a table's first descriptor, constants as they are
-    std::uint32_t user[24]{};
+    std::uint32_t user[24]{}, bounds[2]{}, both[2]{};
     const auto &arguments = list->graphics_arguments;
     for (UINT index = 0; index < 2; ++index) {
-        fill_user(list, list->heap_uses->stages[index], arguments, 8, user,
+        fill_user(list, list->heap_uses->stages[index], arguments, 8, user, bounds,
                   [&](UINT parameter, std::uint64_t address) {
                       if (parameter == 2)
                           list->host->SetGraphicsRootShaderResourceView(parameter, address);
@@ -6068,7 +6078,10 @@ void prepare_draw(ListProxy *list) {
                           list->host->SetGraphicsRootUnorderedAccessView(parameter, address);
                   });
         list->host->SetGraphicsRoot32BitConstants(index, 24, user, 0);
+        // the stages share the root views
+        both[0] = std::max(both[0], bounds[0]), both[1] = std::max(both[1], bounds[1]);
     }
+    list->host->SetGraphicsRoot32BitConstants(5, 2, both, 0);
     // XV_D3D_LOST: what the first of these draws are given
     if (static std::atomic<int> shown{0};
         std::getenv("XV_D3D_LOST") && (shown++ < 24 || lost_again)) {
@@ -6624,6 +6637,21 @@ std::uint64_t root_address(std::uint64_t address) {
         if (const auto copy = ring_copy(reinterpret_cast<const void *>(address), readable))
             return copy;
     return unseen_root_address(false);
+}
+// The last word a root view of `address` may read or write: the rest of its buffer, of the
+// copy root_address makes of memory of the title's, or of the buffer for unseen memory
+std::uint32_t root_view_limit(std::uint64_t address) {
+    ID3D12Resource *resource = nullptr;
+    std::uint64_t offset = 0, bytes = 0;
+    if (!address)
+        bytes = 0;
+    else if (!buffer_at(address, resource, offset, bytes) && gpu_address(address))
+        bytes = ~std::uint64_t{0};
+    else if (!resource)
+        bytes = std::max<std::uint64_t>(
+            readable_bytes(reinterpret_cast<const void *>(address), most_copied), most_copied);
+    return bytes < 4 ? 0u
+                     : static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes - 4, 0xfffffffcu));
 }
 // A root UAV of memory the host's GPU cannot see writes where nothing reads
 std::uint64_t root_uav_address(std::uint64_t address) {
