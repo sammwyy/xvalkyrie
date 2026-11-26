@@ -52,6 +52,7 @@ endif()
 # The DirectX 12 Agility SDK: Microsoft's newer Direct3D 12 runtime, for hosts whose own is
 # older than what the later console kits ask of it. Only D3D12Core.dll is used, which the
 # package's license lets an application carry; it goes next to xvboot (xv_deploy_agility).
+# The tests run on it as well, with its debug layer, which is not shipped (LAYERS).
 set(XV_AGILITY_VERSION 620)
 FetchContent_Declare(xv_agility
   URL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg"
@@ -59,7 +60,16 @@ FetchContent_Declare(xv_agility
   DOWNLOAD_NAME agility.zip)
 FetchContent_MakeAvailable(xv_agility)
 function(xv_deploy_agility target)
+  cmake_parse_arguments(PARSE_ARGV 1 deploy "LAYERS" "" "")
   target_compile_definitions(${target} PRIVATE XV_AGILITY_VERSION=${XV_AGILITY_VERSION})
+  if(deploy_LAYERS)
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/D3D12"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${xv_agility_SOURCE_DIR}/build/native/bin/x64/d3d12SDKLayers.dll"
+        "$<TARGET_FILE_DIR:${target}>/D3D12/d3d12SDKLayers.dll"
+      VERBATIM)
+  endif()
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/D3D12"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

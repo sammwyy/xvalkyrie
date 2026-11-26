@@ -11,6 +11,13 @@
 #include <sstream>
 #include <vector>
 
+// The Agility SDK's Direct3D 12 runtime, in D3D12 next to the tests (see xv_deploy_agility),
+// which xvboot runs titles on: the tests see what titles get, on any host
+extern "C" {
+__declspec(dllexport) extern const unsigned int D3D12SDKVersion = XV_AGILITY_VERSION;
+__declspec(dllexport) extern const char *D3D12SDKPath = ".\\D3D12\\";
+}
+
 namespace {
 // Catch2's own handler of faults goes first at each test and ends the run at any access
 // violation, also one the code that made it catches itself: the Direct3D runtime, its debug
