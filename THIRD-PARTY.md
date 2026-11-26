@@ -153,3 +153,12 @@ ranks, BC7 control codes and dictionaries, 77,982 bytes), which a BCPack stream 
 decoded without, recreated as C++ from `crates/victory-formats/src/bcpack-tables.bin` of the
 same project. They are part of the format, not this project's work, and this project's license
 does not cover them.
+
+## Ideas and findings from XCL and XSEmu
+
+Some of how XValkyrie handles the console's driver containers (an `ACCC` part holding
+`FSPX`, which the console's FidelityFX upscaler makes its passes of), the pipelines of the
+console's ray tracing structures' library, and the host's 32-lane waves follows what
+[xcl-dev/xcl](https://github.com/xcl-dev/xcl) (ivall and contributors) and its fork
+[zortos293/XSEmu](https://github.com/zortos293/XSEmu) found and document (`HANDOFF.md`,
+`docs/wave64-on-wave32.md`, `crates/xcl/src/gpu/recomp/pso.rs`). Credit to their authors.

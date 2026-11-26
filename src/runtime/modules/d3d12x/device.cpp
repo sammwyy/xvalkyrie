@@ -1743,7 +1743,8 @@ struct TableRange {
 };
 std::mutex signature_mutex;
 std::map<const void *, std::vector<std::vector<TableRange>>> tables_of; // per parameter
-std::map<const void *, std::string> signature_text; // XV_D3D_LOST: its parameters, in words
+std::map<const void *, std::string> signature_text;         // XV_D3D_LOST: its parameters, in words
+std::map<const void *, std::vector<bool>> table_parameters; // which parameters are tables
 void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
     using Create = HRESULT(WINAPI *)(const void *, SIZE_T, REFIID, void **);
     static const auto create = host_d3d12<Create>("D3D12CreateVersionedRootSignatureDeserializer");
@@ -1798,10 +1799,23 @@ void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
                     std::to_string(parameter.Descriptor.Flags);
         text += " visibility " + std::to_string(parameter.ShaderVisibility);
     }
+    std::vector<bool> is_table(desc->Desc_1_1.NumParameters);
+    for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i)
+        is_table[i] = desc->Desc_1_1.pParameters[i].ParameterType ==
+                      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     reader->Release();
     const std::lock_guard lock(signature_mutex);
     signature_text[signature] = std::move(text);
     tables_of[signature] = std::move(tables);
+    table_parameters[signature] = std::move(is_table);
+}
+// Whether a root signature has a table at a parameter, as far as it is known: the host's
+// driver faults when a list is given a table for a parameter that is not one.
+bool table_parameter(const void *signature, UINT parameter) {
+    const std::lock_guard lock(signature_mutex);
+    const auto found = table_parameters.find(signature);
+    return found == table_parameters.end() ||
+           (parameter < found->second.size() && found->second[parameter]);
 }
 
 UINT element_bytes(DXGI_FORMAT format);
@@ -4219,11 +4233,43 @@ bool ends_host_driver(const D3D12_SHADER_BYTECODE &code) {
             return true;
     return false;
 }
+// Whether a pipeline is made by the console's library that builds ray tracing structures,
+// which are not built here (see ray_tracing_method): the host's driver takes minutes over
+// some of its shaders, and while it does every list that is given a pipeline waits for it.
+// The console's modules are mapped by the loader, not by Windows: one is known by the name
+// guest_location gives its addresses.
+bool from_bvh_builder(void *caller) {
+    return detail::guest_location(caller).starts_with("xboxbvhbuilder.dll+");
+}
+// set while a compute pipeline that library asked for is made, here or later
+thread_local bool bvh_pipeline = false;
+// A program in the console driver's own container: an ACCC part holding FSPX, the RDNA2 code
+// with no DXIL, which the console's FidelityFX upscaler makes its passes of. The host's driver
+// is given a container with no program it can read, and takes forever over it holding a lock
+// every list that sets a pipeline waits on. (As XCL found, pso::fspx.)
+bool console_driver_program(const D3D12_SHADER_BYTECODE &code) {
+    const auto *const bytes = static_cast<const std::uint8_t *>(code.pShaderBytecode);
+    const auto size = code.BytecodeLength;
+    if (!bytes || size < 32 || std::memcmp(bytes, "DXBC", 4))
+        return false;
+    std::uint32_t parts = 0;
+    std::memcpy(&parts, bytes + 28, 4);
+    for (std::uint32_t n = 0; n < parts && n < 64 && 36 + 4 * n <= size; ++n) {
+        std::uint32_t at = 0;
+        std::memcpy(&at, bytes + 32 + 4 * n, 4);
+        if (std::size_t{at} + 12 <= size && !std::memcmp(bytes + at, "ACCC", 4) &&
+            !std::memcmp(bytes + at + 8, "FSPX", 4))
+            return true;
+    }
+    return false;
+}
 // Whether the host's driver faults when a list is given the pipeline, on a list of ours that
 // is thrown away when it does: some of the console's ray tracing library's pipelines are made
 // and then fault there, and a list of the title's that did so could not be executed, while
 // the title waited for its work.
 bool host_set_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *state);
+bool host_set_table(ID3D12GraphicsCommandList *list, UINT parameter,
+                    D3D12_GPU_DESCRIPTOR_HANDLE table);
 bool faults_when_set(ID3D12Device *device, ID3D12PipelineState *state,
                      ID3D12RootSignature *signature) {
     static std::mutex mutex;
@@ -4291,7 +4337,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
         host.CS = {shader.data(), shader.size()};
         return emptied = true;
     };
-    if (desc && ends_host_driver(desc->CS))
+    if (desc && (ends_host_driver(desc->CS) || bvh_pipeline || console_driver_program(desc->CS)))
         empty();
     HRESULT result;
     {
@@ -5841,9 +5887,50 @@ void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
     list->argument(parameter, true) = {1, table.ptr, {}};
     decode_table(list->compute_root, parameter, table.ptr);
     bind_heap_of(self, table.ptr);
+    bool visible = false;
+    {
+        const std::lock_guard lock(shadow_mutex);
+        const auto *const heap = shadow_heap(table.ptr);
+        visible = heap && heap->shader_visible;
+    }
+    // a handle in no heap shaders see is no handle of the host's: its driver faults on it
+    if (!visible) {
+        if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+            std::fprintf(stderr,
+                         "[Runtime] a compute table at %llx, in no heap shaders see, set from "
+                         "%s, is left out\n",
+                         static_cast<unsigned long long>(table.ptr),
+                         detail::guest_location(_ReturnAddress()).c_str());
+            std::fflush(stderr);
+        }
+        return;
+    }
+    if (!table_parameter(list->compute_root, parameter)) {
+        if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+            std::fprintf(stderr,
+                         "[Runtime] a compute table for parameter %u of a root signature that has "
+                         "no table there, set from %s, is left out\n",
+                         parameter, detail::guest_location(_ReturnAddress()).c_str());
+            std::fflush(stderr);
+        }
+        return;
+    }
     if (!list->compute_ours_bound)
-        host_of(self)->SetComputeRootDescriptorTable(
-            parameter, host_gpu(list, table, table_span(list->compute_root, parameter)));
+        if (!host_set_table(host_of(self), parameter,
+                            host_gpu(list, table, table_span(list->compute_root, parameter)))) {
+            if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+                std::fprintf(stderr,
+                             "[Runtime] the host's driver faults on a compute table set from %s "
+                             "(parameter %u of root signature %p, table %llx, pipeline %p): its "
+                             "list is not executed\n",
+                             detail::guest_location(_ReturnAddress()).c_str(), parameter,
+                             list->compute_root, static_cast<unsigned long long>(table.ptr),
+                             static_cast<void *>(list->pipeline));
+                std::fflush(stderr);
+            }
+            list->no_pipeline = true;
+            list->broken = true;
+        }
 }
 void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
                                                D3D12_GPU_DESCRIPTOR_HANDLE table) {
@@ -6309,6 +6396,16 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 bool host_set_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *state) {
     __try {
         list->SetPipelineState(state);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// and on a compute table set after such a pipeline
+bool host_set_table(ID3D12GraphicsCommandList *list, UINT parameter,
+                    D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    __try {
+        list->SetComputeRootDescriptorTable(parameter, table);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -9429,6 +9526,7 @@ struct DeferredPipeline {
     ID3D12PipelineState *host = nullptr;
     std::atomic<bool> ready{false};  // `host` is made, or turned down
     std::atomic<bool> queued{false}; // given to the threads that make pipelines
+    bool bvh = false;                // made by the ray tracing structures' library
 };
 // for a title that asks for an interface a pipeline of ours has
 bool deferrable(REFIID iid) {
@@ -9501,8 +9599,10 @@ ID3D12PipelineState *made_pipeline(DeferredPipeline &pipeline) {
             pipeline.kind == 0
                 ? create_graphics_pipeline(pipeline.device, &pipeline.graphics, iid, &made)
             : pipeline.kind == 1
-                ? create_compute_pipeline(pipeline.device, &pipeline.compute, iid, &made)
+                ? (bvh_pipeline = pipeline.bvh,
+                   create_compute_pipeline(pipeline.device, &pipeline.compute, iid, &made))
                 : create_pipeline_state(pipeline.device, &stream, iid, &made);
+        bvh_pipeline = false;
         pipeline.host = SUCCEEDED(result) ? static_cast<ID3D12PipelineState *>(made) : nullptr;
         if (pipeline.host && !pipeline.name.empty())
             pipeline.host->SetName(pipeline.name.c_str());
@@ -9689,11 +9789,17 @@ HRESULT STDMETHODCALLTYPE deferred_graphics_pipeline(ID3D12Device *self,
 HRESULT STDMETHODCALLTYPE deferred_compute_pipeline(ID3D12Device *self,
                                                     const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                                                     REFIID iid, void **state) {
-    if (!desc || !state || !deferrable(iid) || desc->CachedPSO.pCachedBlob)
-        return create_compute_pipeline(self, desc, iid, state);
+    const bool builder = from_bvh_builder(_ReturnAddress());
+    if (!desc || !state || !deferrable(iid) || desc->CachedPSO.pCachedBlob) {
+        bvh_pipeline = builder;
+        const auto result = create_compute_pipeline(self, desc, iid, state);
+        bvh_pipeline = false;
+        return result;
+    }
     auto pipeline = std::make_unique<DeferredPipeline>();
     pipeline->device = self;
     pipeline->kind = 1;
+    pipeline->bvh = builder;
     pipeline->compute = *desc;
     pipeline->compute.CS = hold_shader(*pipeline, desc->CS);
     hold_signature(*pipeline, desc->pRootSignature);
