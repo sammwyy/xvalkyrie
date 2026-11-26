@@ -5,6 +5,7 @@
 #include "formats/pe/inspect.hpp"
 #include "formats/xvd/identify.hpp"
 #include "host/files.hpp"
+#include "launcher/debug.hpp"
 #include "launcher/launch.hpp"
 #include "loader/image.hpp"
 #include "runtime/console.hpp"
@@ -60,7 +61,12 @@ const std::string_view commands =
     "  xvboot shader-corpus FOLDER [--compile]\n"
     "                                   how many of the shaders a run left there with\n"
     "                                   XV_SHADER_CODE are translated, and what stops the rest;\n"
-    "                                   with --compile, the host's compiler is asked as well\n";
+    "                                   with --compile, the host's compiler is asked as well\n"
+    "  xvboot shader-journal JOURNAL OUT [--all]\n"
+    "                                   the shaders of a title's journal in the shader cache that\n"
+    "                                   this version has not made (all with --all), as such a\n"
+    "                                   folder: OUT/heaps for those that read the heaps, which\n"
+    "                                   shader-corpus takes with XV_HEAP_SHADERS=1, OUT/plain\n";
 
 std::optional<int> run(int argc, wchar_t **argv) {
     if (argc < 2)
@@ -239,6 +245,40 @@ std::optional<int> run(int argc, wchar_t **argv) {
                                     {"stopped", reasons}}
                          .dump(2)
                   << '\n';
+        return 0;
+    }
+    if ((argc == 4 || (argc == 5 && std::filesystem::path(argv[4]) == "--all")) &&
+        command == "shader-journal") {
+        const std::filesystem::path out(argv[3]);
+        std::size_t written = 0;
+        for (const auto &shader :
+             runtime::modules::journal_shaders(shader_cache_folder(), argv[2])) {
+            if (argc == 4 && shader.state == runtime::modules::JournalShader::State::made)
+                continue;
+            const auto bytes = host::read_snapshot(shader.file, 64 * 1024 * 1024);
+            if (bytes.size() < 32)
+                continue;
+            std::uint32_t sizes[2];
+            std::memcpy(sizes, bytes.data() + 24, sizeof sizes);
+            if (32ull + sizes[0] + sizes[1] > bytes.size())
+                continue;
+            const auto folder = out / (shader.heaps ? "heaps" : "plain");
+            std::filesystem::create_directories(folder);
+            const auto name = shader.hash + "-" + "vpc123m"[static_cast<int>(shader.stage)];
+            std::ofstream(folder / (name + ".dxbc"), std::ios::binary)
+                .write(reinterpret_cast<const char *>(bytes.data() + 32), sizes[0]);
+            // the machine code, as XV_SHADER_CODE has it
+            const auto code = runtime::modules::console_shader_code(
+                std::span<const std::uint8_t>(bytes).subspan(32, sizes[0]));
+            std::ofstream(folder / (name + ".bin"), std::ios::binary)
+                .write(reinterpret_cast<const char *>(code.data()),
+                       static_cast<std::streamsize>(code.size() * 4));
+            if (sizes[1])
+                std::ofstream(folder / (name + ".rts0"), std::ios::binary)
+                    .write(reinterpret_cast<const char *>(bytes.data() + 32 + sizes[0]), sizes[1]);
+            ++written;
+        }
+        std::cout << written << " shaders\n";
         return 0;
     }
     if ((argc == 4 || argc == 5) && command == "shader-precompile") {
