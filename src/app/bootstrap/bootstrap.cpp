@@ -34,10 +34,11 @@ runtime::ConsoleSettings console_settings() {
         saved.headset,        saved.keyboard_dialog,    wide(saved.language), saved.system_storage,
         saved.series_model,   saved.one_model};
 }
-// "<title> [<title ID>] | <console> | <video driver> | <n> FPS | CPU <n>% | MEM <n>% (<n>G) |
-// XValkyrie <version> <commit>", with the console the title is told it runs on, the frame rate
-// (with a decimal below 10), the share of the processors the process took since the last time
-// and the memory it holds. The driver is what the title's device was made on, and the backend
+// "<title> [<title ID>] | <console> | <video driver> | <n> FPS | CPU <n>% | GPU <n>% |
+// MEM <n>% (<n>G) | VRAM <n>% (<n>G) | XValkyrie <version> <commit>", with the console the
+// title is told it runs on, the frame rate (with a decimal below 10), the share of the
+// processors and of the GPU the process took since the last time and the memory and video
+// memory it holds. The driver is what the title's device was made on, and the backend
 // selected until it has one.
 struct Caption {
     std::wstring name;
@@ -49,13 +50,19 @@ struct Caption {
         if (driver.empty())
             driver = graphics::selected_backend() == graphics::Backend::vulkan ? "Vulkan"
                                                                                : "Direct3D 11";
-        wchar_t numbers[96];
-        std::swprintf(numbers, std::size(numbers), L"%.*f FPS | CPU %.0f%% | MEM %.0f%% (%.1fG)",
-                      rate < 10 ? 1 : 0, rate, usage.processor * 100,
-                      usage.installed ? 100.0 * static_cast<double>(usage.memory) /
-                                            static_cast<double>(usage.installed)
-                                      : 0.0,
-                      static_cast<double>(usage.memory) / (1ull << 30));
+        const auto share = [](std::uint64_t part, std::uint64_t whole) {
+            return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+        };
+        const auto gigabytes = [](std::uint64_t bytes) {
+            return static_cast<double>(bytes) / (1ull << 30);
+        };
+        wchar_t numbers[160];
+        std::swprintf(
+            numbers, std::size(numbers),
+            L"%.*f FPS | CPU %.0f%% | GPU %.0f%% | MEM %.0f%% (%.1fG) | VRAM %.0f%% (%.1fG)",
+            rate < 10 ? 1 : 0, rate, usage.processor * 100, usage.graphics * 100,
+            share(usage.memory, usage.installed), gigabytes(usage.memory),
+            share(usage.video_memory, usage.video_installed), gigabytes(usage.video_memory));
         auto text = name + L" | " + (console.empty() ? L"" : console + L" | ") + wide(driver) +
                     L" | " + numbers + L" | XValkyrie " + wide(release);
         if (*commit)

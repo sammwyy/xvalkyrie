@@ -14,6 +14,9 @@
 #include <utility>
 #include <windows.h>
 // after windows.h, which it needs
+#include <dxgi1_4.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <psapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -22,7 +25,76 @@
 namespace xv::host {
 namespace {
 [[noreturn]] void fail(const char *operation, DWORD error = GetLastError());
+// The busiest kind of the GPU's engines this process used since the last reading, as the
+// host's task manager tells it: the counters of each engine are summed by their kind
+// ("..._engtype_3D", "..._engtype_Copy"...). Counters with English names, whatever the
+// host's language.
+double gpu_share() {
+    static PDH_HQUERY query = nullptr;
+    static PDH_HCOUNTER counter = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const auto path = L"\\GPU Engine(pid_" + std::to_wstring(GetCurrentProcessId()) +
+                          L"_*)\\Utilization Percentage";
+        if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS)
+            query = nullptr;
+        else if (PdhAddEnglishCounterW(query, path.c_str(), 0, &counter) != ERROR_SUCCESS)
+            counter = nullptr;
+    }
+    if (!query || !counter || PdhCollectQueryData(query) != ERROR_SUCCESS)
+        return 0;
+    DWORD bytes = 0, count = 0;
+    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count,
+                                     nullptr) != static_cast<PDH_STATUS>(PDH_MORE_DATA))
+        return 0;
+    std::vector<std::uint8_t> buffer(bytes);
+    auto *const items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W *>(buffer.data());
+    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count,
+                                     items) != ERROR_SUCCESS)
+        return 0;
+    std::vector<std::pair<std::wstring, double>> kinds;
+    for (DWORD i = 0; i < count; ++i) {
+        const std::wstring name = items[i].szName ? items[i].szName : L"";
+        const auto at = name.find(L"engtype_");
+        const auto kind = at == std::wstring::npos ? name : name.substr(at);
+        const auto found = std::find_if(kinds.begin(), kinds.end(),
+                                        [&](const auto &known) { return known.first == kind; });
+        if (found == kinds.end())
+            kinds.emplace_back(kind, items[i].FmtValue.doubleValue);
+        else
+            found->second += items[i].FmtValue.doubleValue;
+    }
+    double busiest = 0;
+    for (const auto &[kind, percent] : kinds)
+        busiest = std::max(busiest, percent);
+    return std::min(busiest, 100.0) / 100;
 }
+// the video memory this process holds on the first adapter, and the adapter's own
+void video_memory(std::uint64_t &used, std::uint64_t &installed) {
+    static IDXGIAdapter3 *adapter = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        IDXGIFactory4 *factory = nullptr;
+        IDXGIAdapter1 *first = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+            if (SUCCEEDED(factory->EnumAdapters1(0, &first))) {
+                first->QueryInterface(IID_PPV_ARGS(&adapter));
+                first->Release();
+            }
+            factory->Release();
+        }
+    }
+    DXGI_ADAPTER_DESC1 desc{};
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    if (!adapter || FAILED(adapter->GetDesc1(&desc)) ||
+        FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)))
+        return;
+    used = local.CurrentUsage;
+    installed = desc.DedicatedVideoMemory;
+}
+} // namespace
 ProcessUsage process_usage() {
     static std::mutex mutex;
     static std::uint64_t busy_before = 0, wall_before = 0;
@@ -50,6 +122,9 @@ ProcessUsage process_usage() {
     MEMORYSTATUSEX status{sizeof status};
     if (GlobalMemoryStatusEx(&status))
         usage.installed = status.ullTotalPhys;
+    const std::lock_guard lock(mutex);
+    usage.graphics = gpu_share();
+    video_memory(usage.video_memory, usage.video_installed);
     return usage;
 }
 std::filesystem::path executable_directory() {
