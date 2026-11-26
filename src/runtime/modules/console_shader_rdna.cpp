@@ -1557,7 +1557,9 @@ class Translator {
             auto tracked = known_;
             track(ins, tracked);
             try {
-                emit_chosen(ins);
+                // a step of a reduction over the wave taken whole at its first (emit_reduction)
+                if (!reduction_steps_.count(ins.at))
+                    emit_chosen(ins);
             } catch (Unsupported &unsupported) {
                 if (unsupported.at == ~0u)
                     unsupported.at = ins.at;
@@ -1651,9 +1653,12 @@ class Translator {
                      "u) {");
                 indent_ += "    ";
                 try {
+                    ++choosing_;
                     emit_chosen(ins);
+                    --choosing_;
                     any = true;
                 } catch (const Unsupported &unsupported) {
+                    --choosing_;
                     // A descriptor of another kind than the instruction takes was not
                     // loaded for it: it is what the register held on a way that skips
                     // both the load and, with no lane active, the instruction.
@@ -2326,13 +2331,23 @@ class Translator {
                     throw Retry{};
                 }
         }
-        give_up(std::string("a store to something that is not an unordered access view (") +
+        // one of several a register may hold, which a store is not given on the console: the
+        // one it holds on a way that skips the load of the other with no lane active
+        const bool chosen = choosing_ > 0 && resource.loaded && resource.dynamic < 0;
+        throw Unsupported{
+            std::string("a store to something that is not an unordered access view (") +
                 (resource.root ? "a root view"
                  : resource.heap
                      ? (heap_parameter_.count(resource.parameter) ? "of the heap" : "of a table")
                  : resource.loaded ? "of a table's ranges"
                                    : "bound") +
-                ", type " + std::to_string(resource.type) + ")");
+                ", type " + std::to_string(resource.type) +
+                (resource.heap && resource.dynamic < 0
+                     ? ", descriptor " + std::to_string(resource.reg) + " of s" +
+                           std::to_string(table_register_[resource.parameter])
+                     : std::string()) +
+                ")",
+            ~0u, chosen};
     }
     // A root view has no bounds on the host, and a title's shader reads one at offsets from
     // its data: past its buffer the host's GPU hangs. The host gives the last word there is of
@@ -2929,7 +2944,91 @@ class Translator {
         else
             set_v(destination, binary(name, a, v((ins.w0 >> 9) & 0xff), v(destination)));
     }
+    // The wave operation an instruction that reduces a register over its lanes stands for, as
+    // HLSL has it with the type it is of, if it is one.
+    static std::optional<std::pair<std::string, std::string>>
+    wave_reduction(std::string_view name) {
+        static constexpr std::array<std::array<std::string_view, 3>, 11> known{{
+            {"v_min_u32", "WaveActiveMin", "uint"},
+            {"v_max_u32", "WaveActiveMax", "uint"},
+            {"v_min_i32", "WaveActiveMin", "int"},
+            {"v_max_i32", "WaveActiveMax", "int"},
+            {"v_min_f32", "WaveActiveMin", "float"},
+            {"v_max_f32", "WaveActiveMax", "float"},
+            {"v_add_nc_u32", "WaveActiveSum", "uint"},
+            {"v_add_f32", "WaveActiveSum", "float"},
+            {"v_or_b32", "WaveActiveBitOr", "uint"},
+            {"v_and_b32", "WaveActiveBitAnd", "uint"},
+            {"v_xor_b32", "WaveActiveBitXor", "uint"},
+        }};
+        for (const auto &[op, wave, type] : known)
+            if (name == op)
+                return std::pair{std::string(wave), std::string(type)};
+        return std::nullopt;
+    }
+    // A reduction of a register over the whole wave, as compiled code makes one after setting
+    // every lane on and the ones that were off to the operation's identity: steps of one
+    // operation, each with a lane read of the register into itself (DPP), or with what a
+    // v_permlane(x)16 read of it gave, up to a v_readlane of it. The first step is the wave's
+    // operation over its lanes, which the host's lanes that do not run here take no part in as
+    // the console's that were off add nothing; the steps after it are left out.
+    bool emit_reduction(const Ins &ins) {
+        if (ins.format != F::vop2 || ins.form != Ins::Form::lanes)
+            return false;
+        const auto reduced = (ins.w0 >> 17) & 0xff;
+        if (((ins.w0 >> 9) & 0xff) != reduced || (ins.modifier & 0xff) != reduced)
+            return false;
+        const auto wave = wave_reduction(ins.name);
+        // A wave of 64 lanes ends with the two halves' results put together, which the host's
+        // has as one: only operations that make the same of a value taken twice are kept.
+        if (!wave || (wave64_ && (wave->first == "WaveActiveSum" || ins.name == "v_xor_b32")))
+            return false;
+        const auto first = static_cast<std::size_t>(
+            std::find_if(code_list_.begin(), code_list_.end(),
+                         [&](const Ins &one) { return one.at == ins.at; }) -
+            code_list_.begin());
+        std::vector<std::uint32_t> steps;
+        std::optional<std::uint32_t> read; // what a permlane read of it is in
+        bool ended = false;
+        for (std::size_t i = first + 1; i < code_list_.size() && !ended; ++i) {
+            const auto &next = code_list_[i];
+            if (starts(next.name, "s_waitcnt") || next.name == "s_nop") {
+                continue;
+            } else if (next.format == F::vop2 && next.form == Ins::Form::lanes &&
+                       next.name == ins.name && ((next.w0 >> 17) & 0xff) == reduced &&
+                       ((next.w0 >> 9) & 0xff) == reduced && (next.modifier & 0xff) == reduced) {
+                steps.push_back(next.at);
+            } else if (next.format == F::vop3 &&
+                       (next.name == "v_permlanex16_b32" || next.name == "v_permlane16_b32") &&
+                       (next.w1 & 0x1ff) == 256 + reduced) {
+                read = next.w0 & 0xff;
+                steps.push_back(next.at);
+            } else if (next.format == F::vop2 && next.form == Ins::Form::plain && read &&
+                       next.name == ins.name && ((next.w0 >> 17) & 0xff) == reduced &&
+                       (((next.w0 & 0x1ff) == 256 + *read && ((next.w0 >> 9) & 0xff) == reduced) ||
+                        ((next.w0 & 0x1ff) == 256 + reduced && ((next.w0 >> 9) & 0xff) == *read))) {
+                steps.push_back(next.at);
+                read.reset();
+            } else if (next.format == F::vop3 && next.name == "v_readlane_b32" &&
+                       (next.w1 & 0x1ff) == 256 + reduced) {
+                ended = true;
+            } else {
+                break;
+            }
+        }
+        if (!ended || read)
+            return false;
+        needs_sm6_ = true;
+        const auto &[operation, type] = *wave;
+        const auto value = type == "uint" ? v(reduced) : "as" + type + "(" + v(reduced) + ")";
+        set_v(reduced, type == "uint" ? operation + "(" + value + ")"
+                                      : "asuint(" + operation + "(" + value + "))");
+        reduction_steps_.insert(steps.begin(), steps.end());
+        return true;
+    }
     void emit_short(const Ins &ins) {
+        if (ins.form == Ins::Form::lanes && stage_ != Stage::compute && emit_reduction(ins))
+            return;
         if (ins.form == Ins::Form::lanes) {
             // a pixel shader's are moves within a quad; a compute shader's sum over its wave
             if (stage_ == Stage::pixel)
@@ -4745,7 +4844,8 @@ class Translator {
             const bool store = starts(name, "buffer_store");
             const auto components = name.size() - (store ? 20 : 19);
             if (resource.root || resource.type >= 2)
-                give_up("a buffer with a format that is not a view");
+                throw Unsupported{"a buffer with a format that is not a view", ~0u,
+                                  choosing_ > 0 && resource.loaded && resource.dynamic < 0};
             if (ends(name.substr(0, name.size() - components - 1), "d16"))
                 give_up(std::string(name));
             if (store) {
@@ -5304,6 +5404,8 @@ class Translator {
     bool older_ = false;                           // an Xbox One shader
     std::vector<Placed> in_memory_, in_registers_; // its root parameters
     bool sums_lanes_ = false; // a compute shader with instructions that read other lanes
+    std::set<std::uint32_t> reduction_steps_; // instructions a reduction over the wave takes in
+    int choosing_ = 0;       // emit_chosen is making an instruction for one of several descriptors
     bool unlearned_ = false; // an instruction was left out for a descriptor of a kind not known yet
     bool needs_sm6_ = false, sopk_writes_exec_ = false;
     bool fetched_ = false, exported_ = false, vertex_id_ = false, instance_id_ = false;
