@@ -4164,6 +4164,40 @@ bool ends_host_driver(const D3D12_SHADER_BYTECODE &code) {
             return true;
     return false;
 }
+// Whether the host's driver faults when a list is given the pipeline, on a list of ours that
+// is thrown away when it does: some of the console's ray tracing library's pipelines are made
+// and then fault there, and a list of the title's that did so could not be executed, while
+// the title waited for its work.
+bool host_set_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *state);
+bool faults_when_set(ID3D12Device *device, ID3D12PipelineState *state,
+                     ID3D12RootSignature *signature) {
+    static std::mutex mutex;
+    static ID3D12CommandAllocator *allocator = nullptr;
+    static ID3D12GraphicsCommandList *list = nullptr;
+    static unsigned set = 0;
+    const std::lock_guard lock(mutex);
+    // what the list records is never run: it is begun again now and then
+    if (list && ++set % 1024 == 0 &&
+        (FAILED(list->Close()) || FAILED(allocator->Reset()) ||
+         FAILED(list->Reset(allocator, nullptr))))
+        return false;
+    if (!list) {
+        if (!allocator && FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                                                IID_PPV_ARGS(&allocator))))
+            return false;
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator, nullptr,
+                                             IID_PPV_ARGS(&list))))
+            return false;
+    }
+    if (signature)
+        list->SetComputeRootSignature(signature);
+    if (host_set_pipeline(list, state))
+        return false;
+    // what the driver had of the list is not to be trusted after that
+    list = nullptr;
+    allocator = nullptr;
+    return true;
+}
 // CreateComputePipelineState (11)
 HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
                                                   const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
@@ -4218,6 +4252,13 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     if (FAILED(result) && !emptied && desc && host.CS.pShaderBytecode == desc->CS.pShaderBytecode &&
         empty())
         result = original<Create>(self, 11)(self, &host, iid, state);
+    if (SUCCEEDED(result) && state && *state && !emptied &&
+        faults_when_set(self, static_cast<ID3D12PipelineState *>(*state), host.pRootSignature) &&
+        empty()) {
+        static_cast<IUnknown *>(*state)->Release();
+        *state = nullptr;
+        result = original<Create>(self, 11)(self, &host, iid, state);
+    }
     if (SUCCEEDED(result) && state)
         lost_pipeline("compute", state, host.pRootSignature);
     if (SUCCEEDED(result) && state && *state && uses) {
