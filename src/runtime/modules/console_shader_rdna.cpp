@@ -315,6 +315,24 @@ struct Facts {
         met.try_emplace(std::min(a, b), std::min(a, b));
         return true;
     }
+    // Loads of one table by places known only when the shader runs, whose descriptors meet
+    // in one register (as a loop's first block has the one its two ways back load), each by
+    // the first load of its set: one variable then has the place of whichever was loaded.
+    std::map<std::uint32_t, std::uint32_t> indexed;
+    std::uint32_t indexed_first(std::uint32_t origin) const {
+        for (auto found = indexed.find(origin); found != indexed.end() && found->second != origin;
+             found = indexed.find(origin))
+            origin = found->second;
+        return origin;
+    }
+    bool index_together(std::uint32_t a, std::uint32_t b) {
+        a = indexed_first(a), b = indexed_first(b);
+        if (a == b)
+            return false;
+        indexed[std::max(a, b)] = std::min(a, b);
+        indexed.try_emplace(std::min(a, b), std::min(a, b));
+        return true;
+    }
 };
 struct Retry {};
 // thrown where an instruction uses a descriptor that is one of several
@@ -1212,6 +1230,10 @@ class Translator {
                         a.value == b.value && a.part == b.part && a.dynamic < 0 && b.dynamic < 0 &&
                         a.origin != b.origin && !(a.choice && a.choice == b.choice))
                         met |= facts_.meet(a.origin, b.origin);
+                    if (a.kind == Known::descriptor && b.kind == Known::descriptor &&
+                        a.value == b.value && a.part == b.part && a.dynamic >= 0 &&
+                        b.dynamic >= 0 && a.dynamic != b.dynamic)
+                        met |= facts_.index_together(a.origin, b.origin);
                     const auto joined = join(entry_[to][reg], state[reg]);
                     changed |= !(joined == entry_[to][reg]);
                     entry_[to][reg] = joined;
@@ -1224,7 +1246,8 @@ class Translator {
             throw Retry{};
     }
     int dynamic_of(const Ins &ins) {
-        return dynamic_id_.try_emplace(ins.at, static_cast<int>(dynamic_id_.size())).first->second;
+        const auto first = facts_.indexed_first(ins.at);
+        return dynamic_id_.try_emplace(first, static_cast<int>(dynamic_id_.size())).first->second;
     }
     // the place that stands for one lane of a vector register a shader keeps a scalar in
     std::optional<std::uint32_t> spill(std::uint32_t reg, std::uint32_t lane, bool make) {
@@ -1370,6 +1393,11 @@ class Translator {
                 loaded.origin = ins.at;
                 if (ins.w1 >> 25 != 0x7d) {
                     loaded.dynamic = dynamic_of(ins);
+                    // one of a set: the set's first, its place in its variable alone
+                    if (facts_.indexed.count(ins.at)) {
+                        loaded.origin = facts_.indexed_first(ins.at);
+                        loaded.offset = 0;
+                    }
                 } else if (facts_.met.count(ins.at)) {
                     loaded.choice = facts_.first_of(ins.at) + 1;
                 }
