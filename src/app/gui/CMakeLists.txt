@@ -11,7 +11,7 @@ add_custom_command(OUTPUT "${xv_font}"
   COMMAND ${CMAKE_COMMAND} "-DINPUT=${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf" "-DOUTPUT=${xv_font}"
     -DNAME=xv_font_roboto -P "${PROJECT_SOURCE_DIR}/cmake/Embed.cmake"
   DEPENDS "${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf" "${PROJECT_SOURCE_DIR}/cmake/Embed.cmake" VERBATIM)
-add_library(xv_gui desktop.cpp file_dialog.cpp keys.cpp logo.cpp properties.cpp settings.cpp theme.cpp widgets.cpp "${xv_font}")
+add_library(xv_gui debug_options.cpp desktop.cpp file_dialog.cpp keys.cpp logo.cpp properties.cpp settings.cpp theme.cpp widgets.cpp "${xv_font}")
 target_include_directories(xv_gui SYSTEM PRIVATE ${stb_SOURCE_DIR})
 target_compile_definitions(xv_gui PRIVATE GLFW_INCLUDE_NONE)
 target_compile_definitions(xv_gui PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

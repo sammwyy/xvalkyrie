@@ -196,21 +196,28 @@ void profile(unsigned period) {
         }
     }).detach();
 }
-// The watch starts with the process, so that a title that never presents is seen too.
-const bool names_kept = [] {
-    if (std::getenv("XV_WATCHDOG") || std::getenv("XV_THREAD_DUMP") || std::getenv("XV_PROFILE"))
-        AddVectoredExceptionHandler(1, &thread_named);
-    if (const auto *const period = std::getenv("XV_PROFILE"))
-        profile(std::max(1, std::atoi(period)));
-    if (std::getenv("XV_WATCHDOG")) {
-        last_frame = now();
-        watch();
-    }
-    return true;
-}();
 } // namespace
 
+// The watch starts before the title does, so that one that never presents is seen too; not
+// with the process, whose environment the settings of xvboot may add to before it runs.
+void start_watchdog() {
+    static const bool started = [] {
+        if (std::getenv("XV_WATCHDOG") || std::getenv("XV_THREAD_DUMP") ||
+            std::getenv("XV_PROFILE"))
+            AddVectoredExceptionHandler(1, &thread_named);
+        if (const auto *const period = std::getenv("XV_PROFILE"))
+            profile(std::max(1, std::atoi(period)));
+        if (std::getenv("XV_WATCHDOG")) {
+            last_frame = now();
+            watch();
+        }
+        return true;
+    }();
+    static_cast<void>(started);
+}
+
 void frame_watchdog() {
+    start_watchdog();
     // XV_THREAD_DUMP=<frame>: the same stacks once, at that frame, of a title that goes on
     // presenting while something in it waits
     static const char *const dump_at = std::getenv("XV_THREAD_DUMP");

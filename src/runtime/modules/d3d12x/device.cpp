@@ -3583,7 +3583,10 @@ std::span<const std::uint8_t> shader_bytes(const D3D12_SHADER_BYTECODE &code) {
 }
 // XV_D3D_DRED: the console shaders a pipeline is made of, which a list marks for the GPU
 // where it is given the pipeline, so that what the GPU stopped in is named
-const bool dred_marks = std::getenv("XV_D3D_DRED") != nullptr;
+bool dred_marks() {
+    static const bool on = std::getenv("XV_D3D_DRED") != nullptr;
+    return on;
+}
 // since the last pipeline made on this thread; plain, as the title's threads have no
 // constructors run for what threads of ours keep
 thread_local wchar_t shaders_made[64];
@@ -3595,7 +3598,7 @@ bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
     const auto container = shader_bytes(code);
     if (!code.pShaderBytecode || !modules::console_only_shader(container))
         return false;
-    if (dred_marks) {
+    if (dred_marks()) {
         const auto name = modules::host_shader_note(stage, container, false).substr(0, 10);
         if (const auto used = std::wcslen(shaders_made);
             used + name.size() + 2 < std::size(shaders_made))
@@ -3891,7 +3894,7 @@ std::map<const void *, std::string> made_pipelines;
 // n on, when the title has got further
 std::atomic<bool> lost_again{false};
 void lost_pipeline(const char *how, void *const *pipeline, const void *root) {
-    if (dred_marks && pipeline && *pipeline) {
+    if (dred_marks() && pipeline && *pipeline) {
         const std::lock_guard lock(kept_mutex);
         pipeline_marks[*pipeline] = shaders_made;
     }
@@ -4886,7 +4889,7 @@ std::set<const void *> list_proxies;
 // XV_D3D_DRED: a marker for the GPU where the list is given a pipeline, and what it is made
 // of kept with the list, so that the GPU's breadcrumbs say which pipeline it stopped in
 void mark_pipeline(ListProxy *list, ID3D12PipelineState *state) {
-    if (!dred_marks || !state)
+    if (!dred_marks() || !state)
         return;
     std::wstring text;
     {
@@ -5746,7 +5749,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->broken = false;
     list->on_memory.clear();
     list->clamp_ring_used = false;
-    if (dred_marks) {
+    if (dred_marks()) {
         const std::lock_guard lock(proxy_mutex);
         list->marks.emplace_back();
         if (list->marks.size() > 8)
@@ -6399,9 +6402,15 @@ void lost_draw(void *self, const char *method, UINT count) {
                  device ? static_cast<unsigned long>(device->GetDeviceRemovedReason()) : 0ul, 10);
     std::fflush(stderr);
 }
+// XV_D3D_NO_WORK=<letters>: the work of those kinds is left out of the lists, to tell what the
+// title gets on without (d draws, m mesh dispatches, i indirect executions, c dispatches)
+bool skipped_work(char kind) {
+    static const char *const kinds = std::getenv("XV_D3D_NO_WORK");
+    return kinds && std::strchr(kinds, kind);
+}
 void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances, UINT first,
                                       UINT first_instance) {
-    if (static_cast<ListProxy *>(self)->no_pipeline)
+    if (static_cast<ListProxy *>(self)->no_pipeline || skipped_work('d'))
         return;
     count_draw(self);
     capture_call(self, "DrawInstanced", vertices, instances, first, 0);
@@ -6445,7 +6454,7 @@ void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances,
 }
 void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT instances, UINT first,
                                               INT base, UINT first_instance) {
-    if (static_cast<ListProxy *>(self)->no_pipeline)
+    if (static_cast<ListProxy *>(self)->no_pipeline || skipped_work('d'))
         return;
     count_draw(self);
     capture_call(self, "DrawIndexedInstanced", indices, instances, first, base);
@@ -6750,7 +6759,7 @@ void STDMETHODCALLTYPE dispatch(void *self, UINT x, UINT y, UINT z) {
                      static_cast<void *>(static_cast<ListProxy *>(self)->pipeline),
                      static_cast<ListProxy *>(self)->no_pipeline ? " NO PIPELINE" : "",
                      static_cast<ListProxy *>(self)->heap_uses ? " (heaps)" : "");
-    if (static_cast<ListProxy *>(self)->no_pipeline)
+    if (static_cast<ListProxy *>(self)->no_pipeline || skipped_work('c'))
         return;
     prepare_dispatch(static_cast<ListProxy *>(self));
     host_of(self)->Dispatch(x, y, z);
@@ -6949,7 +6958,7 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[21] = reinterpret_cast<Slot>(&set_viewports);
     vtable[25] = reinterpret_cast<Slot>(&set_pipeline_state);
     // XV_D3D_DRED: the title's own markers left out, so that the GPU's are only ours
-    if (dred_marks)
+    if (dred_marks())
         vtable[56] = reinterpret_cast<Slot>(&ignored_list_marker);
     vtable[22] = reinterpret_cast<Slot>(&set_scissors);
     vtable[26] = reinterpret_cast<Slot>(&resource_barrier);
@@ -7056,7 +7065,7 @@ void STDMETHODCALLTYPE begin_render_pass(void *self, UINT count,
 // a count and nothing else, has a host method
 void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UINT64 arguments,
                                        UINT64 payload) {
-    if (static_cast<ListProxy *>(self)->no_pipeline)
+    if (static_cast<ListProxy *>(self)->no_pipeline || skipped_work('m'))
         return;
     ID3D12GraphicsCommandList6 *host = nullptr;
     if (flags || arguments || payload ||
@@ -7192,7 +7201,7 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
                                         ID3D12Resource *arguments, UINT64 offset,
                                         ID3D12Resource *counts, UINT64 counts_offset) {
     auto *const list = static_cast<ListProxy *>(self);
-    if (list->no_pipeline)
+    if (list->no_pipeline || skipped_work('i'))
         return;
     const auto kinds = argument_kinds(signature);
     if (capturing()) // XV_CAPTURE: as many records as at most, of the kinds in the signature
@@ -7278,7 +7287,7 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
 }
 // DispatchMesh (127), the desktop's: what it draws with is made ready as for a draw
 void STDMETHODCALLTYPE dispatch_mesh(void *self, UINT x, UINT y, UINT z) {
-    if (static_cast<ListProxy *>(self)->no_pipeline)
+    if (static_cast<ListProxy *>(self)->no_pipeline || skipped_work('m'))
         return;
     ID3D12GraphicsCommandList6 *host = nullptr;
     if (FAILED(host_of(self)->QueryInterface(IID_PPV_ARGS(&host))))
@@ -9497,7 +9506,7 @@ ID3D12PipelineState *made_pipeline(DeferredPipeline &pipeline) {
         pipeline.host = SUCCEEDED(result) ? static_cast<ID3D12PipelineState *>(made) : nullptr;
         if (pipeline.host && !pipeline.name.empty())
             pipeline.host->SetName(pipeline.name.c_str());
-        if (pipeline.host && dred_marks) {
+        if (pipeline.host && dred_marks()) {
             const std::lock_guard lock(kept_mutex);
             pipeline_marks[pipeline.host] += pipeline.name;
         }
@@ -10006,7 +10015,7 @@ void report_failure() {
                  ++i)
                 std::fprintf(stderr, " %s%d", i == done ? ">" : "",
                              static_cast<int>(node->pCommandHistory[i]));
-            if (dred_marks && done)
+            if (dred_marks() && done)
                 std::fprintf(stderr, ", with pipeline %ls",
                              marked_pipeline(node->pCommandList, node->pCommandHistory,
                                              node->BreadcrumbCount, done)

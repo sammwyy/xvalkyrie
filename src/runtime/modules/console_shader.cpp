@@ -1261,7 +1261,28 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
     // value, the letters of the stages that are still translated (v, p, c)
     static const char *const stand_ins = std::getenv("XV_SHADER_STAND_INS");
     const char stage_letter = "vpc123m"[static_cast<int>(stage)];
-    const bool stand_ins_only = stand_ins && !std::strchr(stand_ins, stage_letter);
+    // XV_SHADER_FORCE=<hash>-<stage>[,...]: those shaders alone get a stand-in, each named by
+    // its hash or the start of it and its stage's letter (as XV_D3D_DRED names them)
+    static const auto forced = [] {
+        std::vector<std::pair<std::string, char>> list;
+        const std::string text =
+            std::getenv("XV_SHADER_FORCE") ? std::getenv("XV_SHADER_FORCE") : "";
+        for (std::size_t at = 0; at < text.size();) {
+            const auto end = std::min(text.find(',', at), text.size());
+            const auto entry = text.substr(at, end - at);
+            if (const auto dash = entry.rfind('-');
+                dash != std::string::npos && dash + 2 == entry.size())
+                list.emplace_back(entry.substr(0, dash), entry.back());
+            at = end + 1;
+        }
+        return list;
+    }();
+    const bool forced_stand_in = std::any_of(forced.begin(), forced.end(), [&](const auto &entry) {
+        return entry.second == stage_letter && !entry.first.empty() &&
+               hash.starts_with(entry.first);
+    });
+    const bool stand_ins_only =
+        forced_stand_in || (stand_ins && !std::strchr(stand_ins, stage_letter));
     // XV_SHADER_SOLID: every translated pixel shader writes one colour to its first target,
     // to tell whether what is drawn with them gets to the screen at all
     static const bool solid = std::getenv("XV_SHADER_SOLID") != nullptr;
@@ -1602,6 +1623,77 @@ std::shared_ptr<Precompile> precompile_shaders(const std::filesystem::path &cach
     }).detach();
     return work;
 }
+
+std::vector<JournalShader> journal_shaders(const std::filesystem::path &cache,
+                                           const std::filesystem::path &folder) {
+    std::vector<JournalShader> shaders;
+    const auto known = read_index(folder);
+    std::error_code error;
+    for (const auto &item : std::filesystem::directory_iterator(folder, error)) {
+        if (item.path().extension() != ".xvsj")
+            continue;
+        JournalShader shader;
+        shader.file = item.path();
+        shader.bytes = item.file_size(error);
+        if (const auto found = known.find(item.path().stem().string()); found != known.end()) {
+            const auto &noted = found->second;
+            shader.stage = noted.stage;
+            shader.model = noted.model;
+            shader.heaps = noted.heaps;
+            shader.signed_inputs = noted.signed_inputs;
+            shader.hash = noted.container;
+            shader.root = noted.root;
+        } else {
+            const auto bytes = read_file(item.path());
+            const auto header = journal_header(bytes);
+            if (!header)
+                continue;
+            const Bytes all(bytes);
+            const auto root = all.subspan(32 + (*header)[6]);
+            shader.stage = static_cast<ShaderStage>((*header)[2]);
+            shader.model = static_cast<HostShaderModel>((*header)[3]);
+            shader.heaps = (*header)[4] != 0;
+            shader.signed_inputs = (*header)[5];
+            shader.hash = hash_name(all.subspan(32, (*header)[6]));
+            shader.root = root.empty() ? std::string{} : hash_name(root).substr(0, 12);
+        }
+        const auto name = cache_name(shader.stage, shader.hash, shader.model, shader.signed_inputs,
+                                     shader.root, shader.heaps) +
+                          ".dxbc";
+        if (std::filesystem::exists(cache / name, error)) {
+            shader.state = JournalShader::State::made;
+        } else if (std::filesystem::exists(cache / (name + ".none"), error)) {
+            shader.state = JournalShader::State::failed;
+            const auto why = read_file(cache / (name + ".none"));
+            shader.why.assign(why.begin(), why.end());
+        }
+        shaders.push_back(std::move(shader));
+    }
+    return shaders;
+}
+
+std::optional<std::string> journal_shader_source(const JournalShader &shader, std::string *why) {
+    const auto bytes = read_file(shader.file);
+    const auto header = journal_header(bytes);
+    if (!header) {
+        if (why)
+            *why = "not a journal entry";
+        return std::nullopt;
+    }
+    const Bytes all(bytes);
+    const bool before = heap_shaders;
+    heap_shaders = (*header)[4] != 0;
+    std::optional<std::string> source;
+    on_large_stack([&] {
+        source =
+            translated_source(static_cast<ShaderStage>((*header)[2]), all.subspan(32, (*header)[6]),
+                              why, nullptr, nullptr, (*header)[5], all.subspan(32 + (*header)[6]));
+    });
+    heap_shaders = before;
+    return source;
+}
+
+int shader_translator_version() { return translator_version; }
 
 std::string host_shader_note(ShaderStage stage, Bytes container, bool heaps) {
     const auto name = hash_name(container) + "-" + "vpc123m"[static_cast<int>(stage)];

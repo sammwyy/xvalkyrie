@@ -1,5 +1,6 @@
 #include "app/gui/properties.hpp"
 #include "app/gui/widgets.hpp"
+#include "launcher/debug.hpp"
 #include "launcher/launch.hpp"
 #include <algorithm>
 #include <cctype>
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <imgui.h>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace xv::ui {
@@ -70,8 +72,23 @@ void Properties::show(const std::filesystem::path &path, const std::string &name
     if (loading_.valid())
         return; // one at a time; the one being read is shown when it is
     name_ = name;
+    path_ = path;
     report_ = nullptr;
     raw_.clear();
+    notice_.clear();
+    fields_.clear();
+    try {
+        title_ = load_title_debug_settings(path);
+        all_ = load_debug_settings();
+    } catch (const std::exception &e) {
+        notice_ = e.what();
+    }
+    shaders_.clear();
+    shaders_read_ = false;
+    selected_.clear();
+    checked_.clear();
+    source_text_.clear();
+    source_of_.clear();
     loading_ = std::async(std::launch::async, [path] { return title_properties(path); });
 }
 
@@ -251,7 +268,272 @@ void Properties::imports() {
     ImGui::EndTable();
 }
 
-void Properties::draw(const Fonts &) {
+void Properties::save_title() {
+    try {
+        save_title_debug_settings(path_, title_);
+        notice_.clear();
+    } catch (const std::exception &e) {
+        notice_ = std::string("Not saved: ") + e.what();
+    }
+}
+
+// The title's own debug settings, over those of Settings > Debug.
+void Properties::debug(const Fonts &fonts) {
+    note(fonts, "This title's own debug settings. Default is what Settings > Debug has for "
+                "every title. They apply from its next start.");
+    if (!notice_.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(color::scarlet), "%s", notice_.c_str());
+    ImGui::Dummy({0, 4});
+    if (ImGui::Button("All to default")) {
+        title_.debug.clear();
+        fields_.clear();
+        save_title();
+    }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%zu of its own, %zu shaders with a stand-in", title_.debug.size(),
+                        title_.stand_ins.size());
+    if (debug_options_ui(fonts, title_.debug, fields_, &all_))
+        save_title();
+    ImGui::Dummy({0, 4});
+    const auto file = title_settings_file(path_).u8string();
+    note(fonts, ("Kept in " + std::string(file.begin(), file.end())).c_str());
+}
+
+namespace {
+constexpr const char *stage_names[] = {"Vertex", "Pixel",    "Compute", "Hull",
+                                       "Domain", "Geometry", "Mesh"};
+std::string shader_key(const runtime::modules::JournalShader &shader) {
+    return shader.hash + "-" + "vpc123m"[static_cast<int>(shader.stage)];
+}
+} // namespace
+
+// The shaders the title's earlier runs asked for, from its journal in the shader cache: what
+// became of each with this version of the translator, and a stand-in for the ones picked.
+void Properties::shaders() {
+    using State = Shader::State;
+    if (reading_.valid() &&
+        reading_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        auto read = reading_.get();
+        // of another title, if another was shown meanwhile: this one's is read again
+        if (reading_for_ == path_) {
+            shaders_ = std::move(read);
+            std::sort(shaders_.begin(), shaders_.end(), [](const Shader &a, const Shader &b) {
+                return std::tie(a.stage, a.hash) < std::tie(b.stage, b.hash);
+            });
+        } else {
+            shaders_read_ = false;
+        }
+    }
+    if (!shaders_read_ && !reading_.valid()) {
+        shaders_read_ = true;
+        reading_for_ = path_;
+        reading_ = std::async(std::launch::async, [path = path_] {
+            return runtime::modules::journal_shaders(shader_cache_folder(),
+                                                     title_shader_journal(path));
+        });
+    }
+    if (check_.valid() && check_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        for (auto &[file, why] : check_.get())
+            checked_[file] = std::move(why);
+    if (source_.valid() && source_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        source_text_ = source_.get();
+    if (reading_.valid()) {
+        const auto at = ImGui::GetCursorScreenPos();
+        spinner(ImGui::GetWindowDrawList(), {at.x + 12, at.y + 12}, 8);
+        ImGui::SetCursorScreenPos({at.x + 32, at.y + 4});
+        ImGui::TextDisabled("Reading the shaders of earlier runs");
+        return;
+    }
+    if (shaders_.empty()) {
+        ImGui::TextDisabled("No shaders yet: a run of the title notes the ones it asks for.");
+        return;
+    }
+    // what each has come to: made, not made, or not tried by this version; for the last,
+    // what a translation here said
+    const auto state_of = [&](const Shader &shader) {
+        if (shader.state != State::untried)
+            return shader.state;
+        const auto found = checked_.find(shader.file.string());
+        return found == checked_.end() ? State::untried
+               : found->second.empty() ? State::made
+                                       : State::failed;
+    };
+    const auto why_of = [&](const Shader &shader) -> std::string {
+        if (shader.state == State::failed)
+            return shader.why;
+        const auto found = checked_.find(shader.file.string());
+        return found == checked_.end() ? std::string() : found->second;
+    };
+    std::size_t made = 0, failed = 0, untried = 0;
+    for (const auto &shader : shaders_) {
+        const auto state = state_of(shader);
+        ++(state == State::made ? made : state == State::failed ? failed : untried);
+    }
+    ImGui::Text("%zu shaders: %zu translated, %zu not, %zu not tried by translator v%d; %zu with "
+                "a stand-in",
+                shaders_.size(), made, failed, untried,
+                runtime::modules::shader_translator_version(), title_.stand_ins.size());
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputTextWithHint("##shader filter", "Hash or reason", shader_filter_,
+                             sizeof shader_filter_);
+    ImGui::SameLine();
+    static constexpr const char *stages[] = {"All stages", "Vertex", "Pixel", "Compute", "Mesh"};
+    ImGui::SetNextItemWidth(120);
+    ImGui::Combo("##stage", &stage_shown_, stages, IM_ARRAYSIZE(stages));
+    ImGui::SameLine();
+    static constexpr const char *states[] = {"Any state", "Translated", "Not translated",
+                                             "Not tried", "With a stand-in"};
+    ImGui::SetNextItemWidth(150);
+    ImGui::Combo("##state", &state_shown_, states, IM_ARRAYSIZE(states));
+    ImGui::SameLine();
+    if (check_.valid()) {
+        ImGui::TextDisabled("Translating %zu of %zu", checking_->done.load(),
+                            checking_->total.load());
+    } else {
+        if (ImGui::Button("Translate the rest")) {
+            // the ones neither made nor noted, translated here for what stops them
+            std::vector<Shader> wanted;
+            for (const auto &shader : shaders_)
+                if (shader.state == State::untried && !checked_.count(shader.file.string()))
+                    wanted.push_back(shader);
+            checking_ = std::make_shared<Checking>();
+            checking_->total = wanted.size();
+            check_ = std::async(std::launch::async, [wanted, checking = checking_] {
+                std::map<std::string, std::string> results;
+                for (const auto &shader : wanted) {
+                    std::string why;
+                    const auto source = runtime::modules::journal_shader_source(shader, &why);
+                    results[shader.file.string()] = source        ? std::string()
+                                                    : why.empty() ? std::string("?")
+                                                                  : why;
+                    ++checking->done;
+                }
+                return results;
+            });
+        }
+        ImGui::SetItemTooltip("Translates those this version has not tried yet, without "
+                              "compiling them, to tell what stops the ones that are not");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload"))
+        shaders_read_ = false;
+    std::vector<const Shader *> shown;
+    const std::string_view wanted = shader_filter_;
+    static constexpr runtime::modules::ShaderStage by_choice[] = {
+        runtime::modules::ShaderStage::vertex, runtime::modules::ShaderStage::pixel,
+        runtime::modules::ShaderStage::compute, runtime::modules::ShaderStage::mesh};
+    for (const auto &shader : shaders_) {
+        const auto state = state_of(shader);
+        const bool stood_in = title_.stand_ins.count(shader_key(shader)) != 0;
+        if (stage_shown_ && shader.stage != by_choice[stage_shown_ - 1])
+            continue;
+        if ((state_shown_ == 1 && state != State::made) ||
+            (state_shown_ == 2 && state != State::failed) ||
+            (state_shown_ == 3 && state != State::untried) || (state_shown_ == 4 && !stood_in))
+            continue;
+        if (!wanted.empty() && !contains(shader.hash, wanted) && !contains(why_of(shader), wanted))
+            continue;
+        shown.push_back(&shader);
+    }
+    const Shader *picked = nullptr;
+    for (const auto &shader : shaders_)
+        if (shader.file.string() == selected_)
+            picked = &shader;
+    if (ImGui::BeginTable("shaders", 6, grid, {0, picked ? -220.f : 0.f})) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Stand-in", ImGuiTableColumnFlags_WidthFixed, 64);
+        ImGui::TableSetupColumn("Stage", 0, .8f);
+        ImGui::TableSetupColumn("Hash", 0, 1.6f);
+        ImGui::TableSetupColumn("Heaps", 0, .6f);
+        ImGui::TableSetupColumn("State", 0, 1.1f);
+        ImGui::TableSetupColumn("What stops it", 0, 4);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(shown.size()));
+        while (clipper.Step())
+            for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                const auto &shader = *shown[static_cast<std::size_t>(index)];
+                const auto key = shader_key(shader), file = shader.file.string();
+                const auto state = state_of(shader);
+                ImGui::TableNextRow();
+                ImGui::PushID(file.c_str());
+                ImGui::TableNextColumn();
+                bool stood_in = title_.stand_ins.count(key) != 0;
+                if (ImGui::Checkbox("##stand-in", &stood_in)) {
+                    if (stood_in)
+                        title_.stand_ins.insert(key);
+                    else
+                        title_.stand_ins.erase(key);
+                    save_title();
+                }
+                ImGui::SetItemTooltip("A stand-in that draws nothing in its place, from the "
+                                      "title's next start");
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable(
+                        stage_names[static_cast<int>(shader.stage)], selected_ == file,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                    selected_ = selected_ == file ? std::string() : file;
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(shader.hash.substr(0, 16).c_str());
+                ImGui::SetItemTooltip("%s", key.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(shader.heaps ? "yes" : "");
+                ImGui::TableNextColumn();
+                if (state == State::failed)
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(color::scarlet),
+                                       "Not translated");
+                else
+                    ImGui::TextUnformatted(state == State::made ? "Translated" : "Not tried");
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(why_of(shader).c_str());
+                ImGui::PopID();
+            }
+        ImGui::EndTable();
+    }
+    if (picked)
+        shader_details(*picked);
+}
+
+// the one picked in the list: what it is, and the HLSL made for it
+void Properties::shader_details(const Shader &shader) {
+    ImGui::BeginChild("shader", {0, 0}, ImGuiChildFlags_Borders);
+    const auto key = shader_key(shader), file = shader.file.string();
+    const char *const model = shader.model == runtime::modules::HostShaderModel::sm6 ? "SM 6"
+                              : shader.model == runtime::modules::HostShaderModel::automatic
+                                  ? "SM 5 or 6"
+                                  : "SM 5";
+    ImGui::Text("%s shader %s, %s, %ju bytes%s%s%s", stage_names[static_cast<int>(shader.stage)],
+                key.c_str(), model, shader.bytes, shader.heaps ? ", reads the heaps" : "",
+                shader.root.empty() ? "" : ", root signature ", shader.root.c_str());
+    if (ImGui::Button("Copy hash"))
+        ImGui::SetClipboardText(key.c_str());
+    ImGui::SameLine();
+    if (ImGui::Button("Copy entry path"))
+        ImGui::SetClipboardText(file.c_str());
+    ImGui::SameLine();
+    ImGui::BeginDisabled(source_.valid());
+    if (ImGui::Button(source_.valid() ? "Translating..." : "Show HLSL")) {
+        source_of_ = file;
+        source_text_.clear();
+        source_ = std::async(std::launch::async, [shader] {
+            std::string why;
+            const auto source = runtime::modules::journal_shader_source(shader, &why);
+            return source ? *source : "// not translated: " + why;
+        });
+    }
+    ImGui::EndDisabled();
+    if (source_of_ == file && !source_text_.empty()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Copy HLSL"))
+            ImGui::SetClipboardText(source_text_.c_str());
+        ImGui::InputTextMultiline("##hlsl", source_text_.data(), source_text_.size() + 1,
+                                  ImGui::GetContentRegionAvail(), ImGuiInputTextFlags_ReadOnly);
+    }
+    ImGui::EndChild();
+}
+
+void Properties::draw(const Fonts &fonts) {
     if (loading_.valid() &&
         loading_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
@@ -295,6 +577,16 @@ void Properties::draw(const Fonts &) {
             }
             if (ImGui::BeginTabItem("Imports")) {
                 imports();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Debug")) {
+                ImGui::BeginChild("debug");
+                debug(fonts);
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Shaders")) {
+                shaders();
                 ImGui::EndTabItem();
             }
             // everything above and the manifest as it was read, to select and copy

@@ -21,6 +21,7 @@ constexpr std::array pages{PageEntry{Settings::Page::input, "Input"},
                            PageEntry{Settings::Page::profiles, "Profiles"},
                            PageEntry{Settings::Page::console, "Console"},
                            PageEntry{Settings::Page::libraries, "Library"},
+                           PageEntry{Settings::Page::debug, "Debug"},
                            PageEntry{Settings::Page::about, "About"}};
 
 std::string utf8(const std::filesystem::path &path) {
@@ -189,6 +190,9 @@ void Settings::draw(const Fonts &fonts, const Host &host, Library library,
             break;
         case Page::libraries:
             libraries(fonts, host, library);
+            break;
+        case Page::debug:
+            debug(fonts);
             break;
         case Page::about:
             about(fonts, host);
@@ -751,6 +755,46 @@ void Settings::libraries(const Fonts &fonts, const Host &host, Library library) 
         }
         end_settings();
     }
+}
+
+// What is left out or looked into in a run, for every title: the runtime's XV_* variables.
+// A title's own, in its properties, take the place of these; the environment's of both.
+void Settings::debug(const Fonts &fonts) {
+    if (!debug_loaded_) {
+        debug_ = load_debug_settings();
+        debug_fields_.clear();
+        debug_loaded_ = true;
+    }
+    note(fonts, "For finding out what a title needs and what it trips over. Some make titles "
+                "slower or leave out what they draw. A title's properties can change them for "
+                "that title alone.");
+    ImGui::Dummy({0, 4});
+    if (ImGui::Button("Reset all")) {
+        debug_.clear();
+        debug_fields_.clear();
+        try {
+            save_debug_settings(debug_);
+            debug_notice_.clear();
+        } catch (const std::exception &e) {
+            debug_notice_ = std::string("Not saved: ") + e.what();
+        }
+    }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%zu set", debug_.size());
+    if (debug_options_ui(fonts, debug_, debug_fields_)) {
+        try {
+            save_debug_settings(debug_);
+            debug_notice_.clear();
+        } catch (const std::exception &e) {
+            debug_notice_ = std::string("Not saved: ") + e.what();
+        }
+    }
+    ImGui::Dummy({0, 4});
+    note(fonts, "Applies to the next title started. A variable already set in the environment "
+                "is kept over these.");
+    if (!debug_notice_.empty())
+        ImGui::TextWrapped("%s", debug_notice_.c_str());
 }
 
 void Settings::about(const Fonts &fonts, const Host &host) {

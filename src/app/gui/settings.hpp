@@ -1,4 +1,5 @@
 #pragma once
+#include "app/gui/debug_options.hpp"
 #include "app/gui/theme.hpp"
 #include "launcher/config.hpp"
 #include <cstddef>
@@ -12,7 +13,7 @@ namespace xv::ui {
 // page is an entry in `pages` (settings.cpp) and a function that draws it.
 class Settings {
   public:
-    enum class Page { input, graphics, profiles, console, libraries, about };
+    enum class Page { input, graphics, profiles, console, libraries, debug, about };
     // What the settings need done by whoever owns the window. All of them are called
     // from draw().
     // what the about page shows of updates
@@ -46,6 +47,7 @@ class Settings {
         open_ = true;
         raise_ = true;
         profile_loaded_ = false;
+        debug_loaded_ = false;
     }
     bool shown() const { return open_; }
     // While the input page is up the keyboard is for choosing keys, not for the title.
@@ -62,6 +64,7 @@ class Settings {
     void new_profile(const Fonts &fonts, const Host &host, ConsoleSettings &settings);
     void console(const Fonts &fonts, const Host &host, ConsoleSettings &settings);
     void libraries(const Fonts &fonts, const Host &host, Library library);
+    void debug(const Fonts &fonts);
     void about(const Fonts &fonts, const Host &host);
 
     bool open_ = false, raise_ = false;
@@ -77,5 +80,10 @@ class Settings {
     };
     ProfileForm profile_, new_;
     bool profile_loaded_ = false; // profile_ is of the profile in use
+    // the debug settings for all titles, as debug.ini has them when the page is shown
+    DebugValues debug_;
+    DebugFields debug_fields_;
+    bool debug_loaded_ = false;
+    std::string debug_notice_;
 };
 } // namespace xv::ui

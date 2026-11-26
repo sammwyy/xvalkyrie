@@ -7,10 +7,12 @@
 #include "host/files.hpp"
 #include "host/usage.hpp"
 #include "launcher/config.hpp"
+#include "launcher/debug.hpp"
 #include "launcher/launch.hpp"
 #include "launcher/library.hpp"
 #include "runtime/console.hpp"
 #include "runtime/modules/console_shader.hpp"
+#include "runtime/modules/watchdog.hpp"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -165,17 +167,13 @@ void precompile(const std::filesystem::path &cache, const std::filesystem::path 
                      .count()
               << " s" << std::endl;
 }
-// a title's folder in the shader cache: by its title ID, or by its name's characters
-std::string journal_name(const std::string &id, const std::string &name) {
-    std::string folder = id.empty() ? name : id;
-    for (auto &c : folder)
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.')
-            c = '_';
-    return folder.empty() ? "title" : folder;
-}
 } // namespace
 
 std::uint32_t run(const std::filesystem::path &path, runtime::ExecuteOptions options) {
+    // the debug settings, for all titles and this one's, before the runtime reads any
+    for (const auto &set : apply_debug_environment(path))
+        std::cerr << "[Boot] debug setting " << set << std::endl;
+    runtime::modules::start_watchdog();
     const auto file = title_executable(path);
     const auto bytes = host::read_snapshot(file, 256 * 1024 * 1024);
     options.save_directory = title_save_directory(path);
@@ -209,8 +207,7 @@ std::uint32_t run(const std::filesystem::path &path, runtime::ExecuteOptions opt
     read_commands();
     std::cerr << "[Boot] " << name << std::endl;
     precompile(options.shader_cache_directory,
-               options.shader_cache_directory / "titles" / journal_name(id, title_name(path)),
-               name);
+               options.shader_cache_directory / "titles" / title_folder_name(path), name);
     std::cerr << "[Boot] starting " << app::text(file) << ", saves in "
               << app::text(options.save_directory) << std::endl;
     return runtime::execute(file, bytes, runtime::title_registry(bytes), options);

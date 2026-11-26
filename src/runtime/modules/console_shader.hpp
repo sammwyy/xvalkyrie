@@ -132,6 +132,24 @@ struct Precompile {
 std::shared_ptr<Precompile> precompile_shaders(const std::filesystem::path &cache,
                                                const std::filesystem::path &folder,
                                                unsigned threads);
+// A shader of a title's journal, and what the shader cache has of it by this version of the
+// translator: made, noted as not made (with what stopped it), or neither yet.
+struct JournalShader {
+    std::filesystem::path file; // the journal's entry
+    ShaderStage stage = ShaderStage::vertex;
+    HostShaderModel model = HostShaderModel::sm5;
+    bool heaps = false;
+    std::uint32_t signed_inputs = 0;
+    std::string hash, root; // hash names of the shader and of the root signature it came with
+    std::uintmax_t bytes = 0;
+    enum class State { made, failed, untried } state = State::untried;
+    std::string why;
+};
+std::vector<JournalShader> journal_shaders(const std::filesystem::path &cache,
+                                           const std::filesystem::path &folder);
+// the HLSL made for one, as a run of the title makes it; nothing, and `why`, if it is not
+std::optional<std::string> journal_shader_source(const JournalShader &shader, std::string *why);
+int shader_translator_version();
 // A compute shader that does nothing, for a pipeline whose own shader the host's driver
 // cannot make. Empty if the host's compiler gives none.
 std::span<const std::uint8_t> empty_compute_shader();
