@@ -215,8 +215,10 @@ TEST_CASE("a register picked by M0 and bytes picked by a selector") {
     // v_movreld_b32 v18, v55; v_perm_b32 v1, v1, v2, v3
     const auto source =
         translated({0x7e248537, 0x35u << 26 | 0x344 << 16 | 1, v1 | v2 << 9 | v3 << 18});
-    CHECK(source.find("switch (s124) {") != std::string::npos);
-    CHECK(source.find("v19 = v55;") != std::string::npos);
+    // from v18 on the registers are an array, which M0 indexes
+    CHECK(source.find("uint vr[238];") != std::string::npos);
+    CHECK(source.find("vr[min(0u + s124, 237u)] = vr[37];") != std::string::npos);
+    CHECK(source.find("switch (s124)") == std::string::npos);
     CHECK(source.find("v1 = perm_bytes(v1, v2, v3);") != std::string::npos);
 }
 

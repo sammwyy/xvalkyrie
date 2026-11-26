@@ -356,6 +356,7 @@ class Translator {
         decode();
         find_blocks();
         analyse();
+        find_relative();
         prepare_registers();
         // an Xbox One vertex shader with nothing to fetch calls no fetch shader
         if (older_ && stage_ == Stage::vertex && code_list_[0].name != "s_swappc_b64")
@@ -1057,9 +1058,27 @@ class Translator {
         used_s_.insert(reg);
         return "s" + std::to_string(reg);
     }
+    // A vector register from the first one an instruction picks by M0 on is an element of an
+    // array, which the instruction indexes: as one variable each, it would take a case for
+    // every register it may pick, and the host's compiler a long time over them.
+    std::string v_name(std::uint32_t reg) const {
+        reg &= 0xff;
+        return reg >= relative_first_ ? "vr[" + std::to_string(reg - relative_first_) + "]"
+                                      : "v" + std::to_string(reg);
+    }
     std::string v(std::uint32_t reg) {
         used_v_.insert(reg & 0xff);
-        return "v" + std::to_string(reg & 0xff);
+        return v_name(reg);
+    }
+    void find_relative() {
+        for (const auto &ins : code_list_)
+            if (starts(ins.name, "v_movrel") && ins.format == F::vop1) {
+                const auto source = ins.w0 & 0x1ff, destination = (ins.w0 >> 17) & 0xff;
+                if (ins.name != "v_movrels_b32")
+                    relative_first_ = std::min(relative_first_, destination);
+                if (ins.name != "v_movreld_b32" && source >= 256)
+                    relative_first_ = std::min(relative_first_, source - 256);
+            }
     }
     static std::string hex(std::uint32_t value) {
         char text[16];
@@ -2917,15 +2936,16 @@ class Translator {
             if (name == "v_movrelsd_2_b32" || ins.form != Ins::Form::plain ||
                 (from && source < 256))
                 give_up(std::string(name));
-            const auto last = std::max(to ? destination : 0u, from ? source - 256 : 0u);
-            line("switch (" + s(124) + ") {");
-            for (std::uint32_t n = 0; n < std::min(256 - last, 128u); ++n) {
-                line("case " + std::to_string(n) + "u:");
-                set_v(to ? destination + n : destination,
-                      from ? v(source - 256 + n) : operand(ins, source));
-                line("break;");
-            }
-            line("}");
+            // the registers past the last are none: the index stays in the array
+            const auto picked = [&](std::uint32_t first) {
+                used_v_.insert(first);
+                return "vr[min(" + std::to_string(first - relative_first_) + "u + " + s(124) +
+                       ", " + std::to_string(255 - relative_first_) + "u)]";
+            };
+            const auto value = from ? picked(source - 256) : operand(ins, source);
+            const auto target = to ? picked(destination) : v(destination);
+            line((exec_changes_ ? "if " + active() + " " : std::string()) + target + " = " + value +
+                 ";");
             return;
         }
         std::string a, b;
@@ -4179,7 +4199,7 @@ class Translator {
                 address.push_back(v((ins.extra[n / 4] >> (8 * (n % 4))) & 0xff));
         else
             for (std::uint32_t n = 1; n < 12; ++n)
-                address.push_back("v" + std::to_string(((ins.w1 & 0xff) + n) & 0xff));
+                address.push_back(v_name((ins.w1 & 0xff) + n));
         std::size_t next = 0;
         const auto take = [&] {
             if (!more && next)
@@ -5091,7 +5111,12 @@ class Translator {
             registers += "    uint s" + std::to_string(reg) + " = " +
                          (reg == 126 || reg == 127 ? "0xffffffffu" : "0u") + ";\n";
         for (const auto reg : used_v_)
-            registers += "    uint v" + std::to_string(reg) + " = 0u;\n";
+            if (reg < relative_first_)
+                registers += "    uint v" + std::to_string(reg) + " = 0u;\n";
+        if (relative_first_ < 256)
+            registers += "    uint vr[" + std::to_string(256 - relative_first_) +
+                         "];\n    for (uint i = 0u; i < " + std::to_string(256 - relative_first_) +
+                         "u; ++i) vr[i] = 0u;\n";
         registers += "    bool scc = false;\n    uint next = 0u;\n";
         if (!left_.empty())
             registers += "    bool back = false;\n";
@@ -5250,6 +5275,7 @@ class Translator {
     std::set<std::uint32_t> wanted_;
     std::map<std::uint32_t, std::uint32_t> attributes_;
     std::set<std::uint32_t> used_s_, used_v_;
+    std::uint32_t relative_first_ = 256; // the first vector register of `vr` (v_name)
     std::map<std::string, std::string> declared_;
     std::string declarations_, prologue_, body_, indent_ = "    ";
     int temporaries_ = 0;
