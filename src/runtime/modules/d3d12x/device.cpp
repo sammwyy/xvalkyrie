@@ -4867,6 +4867,7 @@ struct ListProxy {
     // XV_D3D_DRED: the markers of the pipelines it was given (mark_pipeline), of each of its
     // last recordings, as a list may be recorded again while the GPU still runs the last one
     std::deque<std::vector<std::wstring>> marks;
+    bool clamp_ring_used = false; // the ring of bounded indirect records moved out of common
     RootArgument &argument(UINT parameter, bool compute = false) {
         auto &arguments = compute ? compute_arguments : graphics_arguments;
         if (arguments.size() <= parameter)
@@ -5738,6 +5739,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->waits_memory = false;
     list->broken = false;
     list->on_memory.clear();
+    list->clamp_ring_used = false;
     if (dred_marks) {
         const std::lock_guard lock(proxy_mutex);
         list->marks.emplace_back();
@@ -7028,6 +7030,115 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
     host->Release();
 }
 std::uint32_t argument_kinds(const void *signature);
+struct RecordLayout {
+    UINT stride, kind, at; // the record's bytes, its draw's or dispatch's type and place
+};
+bool record_layout(const void *signature, RecordLayout &layout);
+// The records of an indirect execution are copied and bounded on the GPU before they are
+// executed, as VIctory does (crates/victory-gpu/src/indirect.rs): the title's own passes write
+// them, and one left out or made wrong leaves what the memory held, a draw or a dispatch the
+// host's GPU runs until the device is reset. Out of bounds (vertices, instances, groups) a
+// record does nothing. XV_D3D_INDIRECT_CLAMP=0 executes the title's records as they are.
+constexpr char clamp_source[] = R"(
+cbuffer C : register(b0) { uint records; uint stride; uint at; uint kind; uint counted; };
+ByteAddressBuffer src : register(t0);
+ByteAddressBuffer cnt : register(t1);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint r = id.x;
+    if (r >= records) return;
+    uint n = counted != 0 ? min(records, cnt.Load(0)) : records;
+    uint base = r * stride;
+    for (uint w = 0; w < stride; w += 4) dst.Store(base + w, src.Load(base + w));
+    if (r >= n) return;
+    uint b = base + at;
+    if (kind == 0 || kind == 1) {
+        uint v = src.Load(b), i = src.Load(b + 4);
+        if (v > (1u << 23) || i > (1u << 20) || (v != 0 && i > (1u << 26) / v)) {
+            dst.Store(b, 0u); dst.Store(b + 4, 0u);
+        }
+    } else if (kind == 2 || kind == 10) {
+        uint x = src.Load(b), y = src.Load(b + 4), z = src.Load(b + 8);
+        bool bad = x > 65535u || y > 65535u || z > 65535u;
+        if (!bad && kind == 10 && x != 0 && y != 0 && (x * y > 4194304u || z > 4194304u / (x * y)))
+            bad = true;
+        if (!bad && kind == 2 && x != 0 && y != 0 && (x * y > 16777216u || z > 16777216u / (x * y)))
+            bad = true;
+        if (bad) { dst.Store(b, 0u); dst.Store(b + 4, 0u); dst.Store(b + 8, 0u); }
+    }
+}
+)";
+struct Clamper {
+    ID3D12RootSignature *signature = nullptr;
+    ID3D12PipelineState *pipeline = nullptr;
+    ID3D12Resource *rings[2]{}; // for direct lists, for compute lists
+    std::uint64_t next[2]{};
+    bool tried = false;
+};
+std::mutex clamper_mutex;
+Clamper clamper;
+constexpr std::uint64_t clamp_ring = 64ull << 20;
+bool make_clamper(ID3D12Device *device) {
+    if (clamper.tried)
+        return clamper.pipeline != nullptr;
+    clamper.tried = true;
+    using Compile =
+        HRESULT(WINAPI *)(const void *, SIZE_T, const char *, const void *, void *, const char *,
+                          const char *, UINT, UINT, ID3DBlob **, ID3DBlob **);
+    const auto library =
+        LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto compile =
+        library ? reinterpret_cast<Compile>(GetProcAddress(library, "D3DCompile")) : nullptr;
+    ID3DBlob *code = nullptr, *errors = nullptr;
+    if (!compile || FAILED(compile(clamp_source, sizeof clamp_source - 1, "clamp", nullptr, nullptr,
+                                   "main", "cs_5_0", 0, 0, &code, &errors))) {
+        std::fprintf(stderr, "[Runtime] the bounds of indirect records do not compile: %s\n",
+                     errors ? static_cast<const char *>(errors->GetBufferPointer()) : "");
+        return false;
+    }
+    D3D12_ROOT_PARAMETER parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 5};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[1].Descriptor = {0, 0};
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[2].Descriptor = {1, 0};
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[3].Descriptor = {0, 0};
+    const D3D12_ROOT_SIGNATURE_DESC desc{4, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    using Serialize = HRESULT(WINAPI *)(const D3D12_ROOT_SIGNATURE_DESC *,
+                                        D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
+    static const auto serialize = host_d3d12<Serialize>("D3D12SerializeRootSignature");
+    ID3DBlob *blob = nullptr;
+    if (serialize && SUCCEEDED(serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)))
+        device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                    IID_PPV_ARGS(&clamper.signature));
+    if (blob)
+        blob->Release();
+    if (clamper.signature) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC state{};
+        state.pRootSignature = clamper.signature;
+        state.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        device->CreateComputePipelineState(&state, IID_PPV_ARGS(&clamper.pipeline));
+    }
+    code->Release();
+    // the card's memory, in a heap the host's buffers of the title's are not moved out of
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                                     D3D12_MEMORY_POOL_L1};
+    D3D12_RESOURCE_DESC ring{};
+    ring.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    ring.Width = clamp_ring;
+    ring.Height = ring.DepthOrArraySize = ring.MipLevels = 1;
+    ring.SampleDesc.Count = 1;
+    ring.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ring.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    for (auto *&made : clamper.rings)
+        device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &ring,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&made));
+    if (!clamper.pipeline || !clamper.rings[0] || !clamper.rings[1])
+        std::fprintf(stderr, "[Runtime] indirect records are executed unbounded\n");
+    return clamper.pipeline && clamper.rings[0] && clamper.rings[1];
+}
 // ExecuteIndirect (59): left out with the rest of what the list draws or computes while its
 // pipeline is not there, as the host turns down the list with another pipeline set. The draws
 // and dispatches its arguments ask for read what plain ones read: what they draw and dispatch
@@ -7046,6 +7157,73 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
          1u << D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)) {
         count_draw(self);
         prepare_draw(list);
+    }
+    static const bool clamping = [] {
+        const auto *const text = std::getenv("XV_D3D_INDIRECT_CLAMP");
+        return !text || *text != '0';
+    }();
+    RecordLayout layout{};
+    if (clamping && arguments && count && record_layout(signature, layout) && layout.stride &&
+        layout.stride % 4 == 0 && layout.kind <= 10) {
+        auto *const host = list->host;
+        const int which = host->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE ? 1 : 0;
+        const std::uint64_t bytes = (std::uint64_t{count} * layout.stride + 255) & ~255ull;
+        ID3D12Resource *ring = nullptr;
+        std::uint64_t at = 0;
+        {
+            const std::lock_guard lock(clamper_mutex);
+            if (bytes <= clamp_ring && make_clamper(d3d12_device.load())) {
+                if (clamper.next[which] + bytes > clamp_ring)
+                    clamper.next[which] = 0;
+                at = clamper.next[which];
+                clamper.next[which] += bytes;
+                ring = clamper.rings[which];
+            }
+        }
+        if (ring) {
+            // buffers decay to the common state after each submission: the ring is promoted
+            // to unordered access at its first write in a list, and moved after that
+            if (list->clamp_ring_used) {
+                D3D12_RESOURCE_BARRIER back{};
+                back.Transition = {ring, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                   D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+                host->ResourceBarrier(1, &back);
+            }
+            host->SetPipelineState(clamper.pipeline);
+            host->SetComputeRootSignature(clamper.signature);
+            const UINT constants[5] = {count, layout.stride, layout.at, layout.kind,
+                                       counts ? 1u : 0u};
+            host->SetComputeRoot32BitConstants(0, 5, constants, 0);
+            host->SetComputeRootShaderResourceView(1, arguments->GetGPUVirtualAddress() + offset);
+            host->SetComputeRootShaderResourceView(
+                2, counts ? counts->GetGPUVirtualAddress() + counts_offset
+                          : arguments->GetGPUVirtualAddress() + offset);
+            host->SetComputeRootUnorderedAccessView(3, ring->GetGPUVirtualAddress() + at);
+            host->Dispatch((count + 63) / 64, 1, 1);
+            D3D12_RESOURCE_BARRIER ready{};
+            ready.Transition = {ring, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT};
+            host->ResourceBarrier(1, &ready);
+            list->clamp_ring_used = true;
+            // the title's compute state back, as it was before ours
+            if (list->pipeline)
+                host->SetPipelineState(list->pipeline);
+            if (list->compute_ours_bound) {
+                host->SetComputeRootSignature(heap_signature(d3d12_device.load()));
+                list->compute_ours_bound = false;
+            } else if (list->compute_root) {
+                list->compute_ours_bound = true;
+            }
+            prepare_dispatch(list);
+            if (kinds & (1u << D3D12_INDIRECT_ARGUMENT_TYPE_DRAW |
+                         1u << D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED |
+                         1u << D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH))
+                prepare_draw(list);
+            host->ExecuteIndirect(signature, count, ring, at, counts, counts_offset);
+            return;
+        }
     }
     host_of(self)->ExecuteIndirect(signature, count, arguments, offset, counts, counts_offset);
 }
@@ -8743,6 +8921,15 @@ HRESULT STDMETHODCALLTYPE create_heap(ID3D12Device *self, const D3D12_HEAP_DESC 
 // ExecuteIndirect makes ready before it
 std::mutex argument_kinds_mutex;
 std::map<const void *, std::uint32_t> argument_kinds_of;
+std::map<const void *, RecordLayout> record_layout_of; // under argument_kinds_mutex
+bool record_layout(const void *signature, RecordLayout &layout) {
+    const std::lock_guard lock(argument_kinds_mutex);
+    const auto found = record_layout_of.find(signature);
+    if (found == record_layout_of.end())
+        return false;
+    layout = found->second;
+    return true;
+}
 std::uint32_t argument_kinds(const void *signature) {
     const std::lock_guard lock(argument_kinds_mutex);
     const auto found = argument_kinds_of.find(signature);
@@ -8779,6 +8966,32 @@ HRESULT STDMETHODCALLTYPE create_command_signature(ID3D12Device *self,
         // a signature made where one was let go of is this one now
         const std::lock_guard lock(argument_kinds_mutex);
         argument_kinds_of[*signature] = kinds;
+        // where the draw or dispatch is in each record, and what it is (the last argument)
+        UINT at = 0, kind = ~0u, where = 0;
+        for (const auto &argument : arguments) {
+            where = at;
+            kind = argument.Type;
+            switch (argument.Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+                at += 16;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+                at += 20;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+                at += 12;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                at += 4 * argument.Constant.Num32BitValuesToSet;
+                break;
+            default:
+                at += 8;
+            }
+        }
+        record_layout_of[*signature] = {desc ? desc->ByteStride : 0, kind, where};
     }
     if (FAILED(result) && desc) {
         std::string types;
