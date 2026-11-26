@@ -1,12 +1,16 @@
 #include "runtime/modules/watchdog.hpp"
 #include "runtime/common/runtime.hpp"
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <thread>
+#include <vector>
 #include <windows.h>
 
 #include <tlhelp32.h> // after windows.h
@@ -21,21 +25,16 @@ std::int64_t now() {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-void dump_thread(DWORD id) {
-    auto *const thread = OpenThread(
-        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
-    if (!thread)
-        return;
-    if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
-        CloseHandle(thread);
-        return;
-    }
+// The return addresses of a suspended thread, from where it is, into `frames`: nothing is
+// allocated while it is suspended, as it may hold the heap's lock.
+template <std::size_t Most>
+std::size_t frames_of(HANDLE thread, std::array<DWORD64, Most> &frames) {
+    std::size_t count = 0;
     CONTEXT context{};
     context.ContextFlags = CONTEXT_FULL;
-    std::string frames;
     if (GetThreadContext(thread, &context))
-        for (int depth = 0; depth < 32 && context.Rip; ++depth) {
-            frames += " " + detail::guest_location(reinterpret_cast<void *>(context.Rip));
+        for (; count < Most && context.Rip; ++count) {
+            frames[count] = context.Rip;
             DWORD64 base = 0;
             auto *const function = RtlLookupFunctionEntry(context.Rip, &base, nullptr);
             if (!function) { // a leaf: the return address is on top of the stack
@@ -48,7 +47,23 @@ void dump_thread(DWORD id) {
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, function, &context,
                              &handler_data, &frame, nullptr);
         }
+    return count;
+}
+void dump_thread(DWORD id) {
+    auto *const thread = OpenThread(
+        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
+    if (!thread)
+        return;
+    if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+        CloseHandle(thread);
+        return;
+    }
+    std::array<DWORD64, 32> at{};
+    const auto count = frames_of(thread, at);
     ResumeThread(thread);
+    std::string frames;
+    for (std::size_t n = 0; n < count; ++n)
+        frames += " " + detail::guest_location(reinterpret_cast<void *>(at[n]));
     wchar_t *description = nullptr;
     std::string name;
     if (SUCCEEDED(GetThreadDescription(thread, &description)) && description) {
@@ -114,10 +129,79 @@ void watch() {
         }
     }).detach();
 }
+// XV_PROFILE=<ms>: every so many milliseconds, the stack of each thread that has run since the
+// last look, and every 10 seconds the 30 stacks seen most (their first 12 frames), with how
+// many looks found each: where the process spends its time.
+void profile(unsigned period) {
+    std::thread([period] {
+        std::map<DWORD, std::pair<HANDLE, ULONG64>> threads; // the cycles each had run
+        std::map<std::vector<DWORD64>, unsigned> seen;
+        unsigned looks = 0;
+        const auto self = GetCurrentThreadId();
+        for (auto last = now();;) {
+            Sleep(period);
+            if (auto *const snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                snapshot != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 entry{sizeof entry};
+                for (auto more = Thread32First(snapshot, &entry); more;
+                     more = Thread32Next(snapshot, &entry))
+                    if (entry.th32OwnerProcessID == GetCurrentProcessId() &&
+                        entry.th32ThreadID != self && !threads.contains(entry.th32ThreadID))
+                        if (auto *const thread =
+                                OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                               THREAD_QUERY_INFORMATION,
+                                           FALSE, entry.th32ThreadID))
+                            threads[entry.th32ThreadID] = {thread, 0};
+                CloseHandle(snapshot);
+            }
+            ++looks;
+            for (auto at = threads.begin(); at != threads.end();) {
+                auto &[thread, cycles] = at->second;
+                ULONG64 now_cycles = 0;
+                if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0 ||
+                    !QueryThreadCycleTime(thread, &now_cycles)) {
+                    CloseHandle(thread);
+                    at = threads.erase(at);
+                    continue;
+                }
+                // a thread that has run for a hundredth of the period at least
+                const bool ran = cycles && now_cycles - cycles > 30000ull * period;
+                cycles = now_cycles;
+                if (ran && SuspendThread(thread) != static_cast<DWORD>(-1)) {
+                    std::array<DWORD64, 12> frames{};
+                    const auto count = frames_of(thread, frames);
+                    ResumeThread(thread);
+                    ++seen[{frames.begin(), frames.begin() + static_cast<std::ptrdiff_t>(count)}];
+                }
+                ++at;
+            }
+            if (now() - last < 10000)
+                continue;
+            last = now();
+            std::vector<std::pair<unsigned, const std::vector<DWORD64> *>> most;
+            for (const auto &[frames, count] : seen)
+                most.emplace_back(count, &frames);
+            std::sort(most.begin(), most.end(),
+                      [](const auto &a, const auto &b) { return a.first > b.first; });
+            std::fprintf(stderr, "[Profile] %u looks, %zu stacks:\n", looks, seen.size());
+            for (std::size_t n = 0; n < most.size() && n < 30; ++n) {
+                std::string text;
+                for (const auto at : *most[n].second)
+                    text += " " + detail::guest_location(reinterpret_cast<void *>(at));
+                std::fprintf(stderr, "[Profile] %u:%s\n", most[n].first, text.c_str());
+            }
+            std::fflush(stderr);
+            seen.clear();
+            looks = 0;
+        }
+    }).detach();
+}
 // The watch starts with the process, so that a title that never presents is seen too.
 const bool names_kept = [] {
-    if (std::getenv("XV_WATCHDOG") || std::getenv("XV_THREAD_DUMP"))
+    if (std::getenv("XV_WATCHDOG") || std::getenv("XV_THREAD_DUMP") || std::getenv("XV_PROFILE"))
         AddVectoredExceptionHandler(1, &thread_named);
+    if (const auto *const period = std::getenv("XV_PROFILE"))
+        profile(std::max(1, std::atoi(period)));
     if (std::getenv("XV_WATCHDOG")) {
         last_frame = now();
         watch();
