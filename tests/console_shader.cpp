@@ -318,6 +318,75 @@ TEST_CASE("a pixel DPP8 move can rearrange the four lanes of each quad") {
     CHECK_FALSE(needs_sm6);
 }
 
+TEST_CASE("a pixel DPP16 move reads the lane of its quad that quad_perm names") {
+    bool needs_sm6 = false;
+    std::string why;
+    // v_mov_b32_dpp v24, v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+    auto source = pixel_move(0x7e3002fa, 0xff00b114, why, needs_sm6);
+    INFO(why);
+    REQUIRE(source);
+    CHECK(needs_sm6);
+    CHECK(source->find("QuadReadAcrossX(v20)") != std::string::npos);
+    // quad_perm:[0,0,2,2]: each lane finds its place in the quad
+    source = pixel_move(0x7e3002fa, 0xff00a014, why, needs_sm6);
+    REQUIRE(source);
+    CHECK(count(*source, "QuadReadLaneAt(") == 7);
+    // a row left out is not taken
+    CHECK_FALSE(pixel_move(0x7e3002fa, 0x0f00b114, why, needs_sm6));
+}
+
+namespace {
+// a program of these words in an FSSM file of its own, with nothing in its tables
+std::vector<std::uint8_t> program(std::initializer_list<std::uint32_t> words) {
+    std::vector<std::uint32_t> code(words);
+    code.push_back(end_program);
+    constexpr std::size_t region = 0x140, header = 0x28;
+    std::vector<std::uint8_t> file(region + header + 4 * code.size());
+    const auto put = [&](std::size_t offset, std::uint32_t value) {
+        std::memcpy(file.data() + offset, &value, sizeof value);
+    };
+    std::memcpy(file.data(), "FSSM", 4);
+    put(0xc0, region);
+    put(0xc8, static_cast<std::uint32_t>(header + 4 * code.size()));
+    std::memcpy(file.data() + region + header, code.data(), 4 * code.size());
+    return file;
+}
+} // namespace
+
+TEST_CASE("16-bit inputs and outputs are packed two to a word, a register from a word of its own") {
+    const std::uint32_t root[] = {1, 0, 24, 0, 0, 0};
+    const std::span<const std::uint8_t> signature{reinterpret_cast<const std::uint8_t *>(root),
+                                                  sizeof root};
+    // two registers of four halves, which share one attribute: x and y in its first word, z and
+    // w in the next, then the second register's
+    const std::vector<rdna::Element> halves{{"TEXCOORD", 0, 6, 4, false, 1, 15, 15},
+                                            {"TEXCOORD", 1, 6, 4, false, 2, 15, 15}};
+    // v_interp_p1ll_f16 v2, v0, attr0.z high; v_interp_p2_f16 v2, v1, attr0.z, v2 high;
+    // exp mrt0 v2, off, off, off done
+    const auto pixel = program({0xd7420002, 0x00020180, 0xd75a0002, 0x040a0380, 0xf8001801, 2});
+    const rdna::Shader shader{pixel, signature, halves, {{"SV_Target", 0, 3, 4, true, 0, 15, 0}}};
+    std::string why;
+    auto source = rdna::translate(ShaderStage::pixel, shader, &why);
+    INFO(why);
+    REQUIRE(source);
+    INFO(*source);
+    CHECK(last_set(*source, "v2") == "f32tof16(input.f1.y)");
+    CHECK(console_shader_errors(ShaderStage::pixel, *source).empty());
+
+    // exp pos0 v0, v0, v0, v0; exp param0 v4, v5, v6, v7 done
+    const auto vertex = program({0xf80000cf, 0x00000000, 0xf800020f, 0x07060504});
+    std::vector<rdna::Element> outputs{{"SV_Position", 0, 3, 4, true, 0, 15, 0}};
+    outputs.insert(outputs.end(), halves.begin(), halves.end());
+    const rdna::Shader exporting{vertex, signature, {}, outputs};
+    source = rdna::translate(ShaderStage::vertex, exporting, &why);
+    INFO(why);
+    REQUIRE(source);
+    INFO(*source);
+    CHECK(source->find("output.f1.y = f16tof32((v4 >> 16 & 0xffffu));") != std::string::npos);
+    CHECK(source->find("output.f2.w = f16tof32((v7 >> 16 & 0xffffu));") != std::string::npos);
+    CHECK(console_shader_errors(ShaderStage::vertex, *source).empty());
+}
+
 TEST_CASE("a swizzle outside a pixel quad reads the lane its offset names") {
     // ds_swizzle_b32 v3, v2 offset:swizzle(SWAP,16), the value in its address field; exp mrt0
     // v3, off, off, off done

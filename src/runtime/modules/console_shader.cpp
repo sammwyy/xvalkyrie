@@ -37,7 +37,7 @@
 namespace xv::runtime::modules {
 namespace {
 // Bumped whenever what is made for a shader changes: the cache keeps one file per version.
-constexpr int translator_version = 23;
+constexpr int translator_version = 24;
 
 using Bytes = std::span<const std::uint8_t>;
 std::uint32_t word(Bytes bytes, std::size_t at) {
@@ -333,8 +333,11 @@ std::vector<Element> signature(Bytes container, const char *name) {
     return elements;
 }
 // The fields of a signature as an HLSL struct: element n is the field fn. The values the
-// pipeline makes up itself are declared after everything else, as the compiler wants.
-std::string hlsl_struct(const char *name, const std::vector<Element> &elements, bool interpolated) {
+// pipeline makes up itself are declared after everything else, as the compiler wants. The
+// position of a pixel shader whose depth only goes one way (`centroid`) is taken at the
+// centroid, as the host's validator wants.
+std::string hlsl_struct(const char *name, const std::vector<Element> &elements, bool interpolated,
+                        bool centroid = false) {
     const auto generated = [](const Element &element) {
         for (const auto *made : {"SV_VertexID", "SV_InstanceID", "SV_PrimitiveID", "SV_IsFrontFace",
                                  "SV_SampleIndex", "SV_Coverage"})
@@ -353,6 +356,8 @@ std::string hlsl_struct(const char *name, const std::vector<Element> &elements, 
             text += "    ";
             if (interpolated && integer && !named)
                 text += "nointerpolation ";
+            if (interpolated && centroid && !_stricmp(element.name.c_str(), "SV_Position"))
+                text += "linear noperspective centroid ";
             text += std::string(element.type == 1   ? "uint"
                                 : element.type == 2 ? "int"
                                                     : "float") +
@@ -406,8 +411,13 @@ std::string stand_in(ShaderStage stage, Bytes container) {
                // one vertex makes no triangle, and gives the shader its output signature
                "    Output output = (Output)0;\n    stream.Append(output);\n}\n";
     }
+    const bool one_way_depth = std::any_of(outputs.begin(), outputs.end(), [](const Element &one) {
+        return !_stricmp(one.name.c_str(), "SV_DepthGreaterEqual") ||
+               !_stricmp(one.name.c_str(), "SV_DepthLessEqual");
+    });
     std::string text =
-        inputs.empty() ? "" : hlsl_struct("Input", inputs, stage == ShaderStage::pixel);
+        inputs.empty() ? ""
+                       : hlsl_struct("Input", inputs, stage == ShaderStage::pixel, one_way_depth);
     if (outputs.empty())
         text += "void main(Input input) {}\n";
     else

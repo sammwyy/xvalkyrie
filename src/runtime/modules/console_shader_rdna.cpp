@@ -2599,8 +2599,111 @@ class Translator {
             line(v(3) + " = input.xv_instance;");
         fetched_ = true;
     }
+    static bool sixteen(const Element &element) { return element.type >= 4 && element.type <= 6; }
+    static bool sixteen_at(const std::vector<Element> &elements, std::uint32_t reg) {
+        for (const auto &element : elements)
+            if (element.reg == reg)
+                return sixteen(element);
+        return false;
+    }
+    // Registers of 16-bit components are packed into one attribute, two components a word:
+    // a register starts at a word of its own, components x and y in the first, z and w in
+    // the next, and the 16-bit registers after it go on in the words left while they fit,
+    // unless one has an attribute of its own (`own`). Each half of the attribute's four
+    // words, the field and the component in it there; -1 for a half nothing is in.
+    static std::array<std::pair<int, int>, 8> packed(const std::vector<Element> &elements,
+                                                     std::uint32_t first,
+                                                     const std::set<std::uint32_t> &own) {
+        std::array<std::pair<int, int>, 8> halves;
+        halves.fill({-1, 0});
+        std::uint32_t base = 0;
+        for (auto reg = first;
+             base < 8 && sixteen_at(elements, reg) && (reg == first || !own.count(reg)); ++reg) {
+            std::uint32_t mask = 0;
+            for (const auto &element : elements)
+                if (element.reg == reg)
+                    mask |= element.mask;
+            const auto size = static_cast<std::uint32_t>(std::bit_width(mask) + 1) & ~1u;
+            if (reg != first && base + size > 8)
+                break;
+            for (std::size_t field = 0; field < elements.size(); ++field) {
+                const auto &element = elements[field];
+                if (element.reg != reg)
+                    continue;
+                for (std::uint32_t c = 0; c < 4 && base + c < 8; ++c)
+                    if (element.mask >> c & 1)
+                        halves[base + c] = {
+                            static_cast<int>(field),
+                            std::popcount(static_cast<unsigned>(element.mask & ((1u << c) - 1)))};
+            }
+            base += size;
+        }
+        return halves;
+    }
+    // the registers of a stage's outputs or inputs that another 16-bit one before it packs
+    static std::set<std::uint32_t> packed_after(const std::vector<Element> &elements,
+                                                const std::set<std::uint32_t> &own) {
+        std::set<std::uint32_t> after;
+        std::set<std::uint32_t> registers;
+        for (const auto &element : elements)
+            if (!element.system_value)
+                registers.insert(element.reg);
+        for (const auto reg : registers) {
+            if (after.count(reg) || !sixteen_at(elements, reg))
+                continue;
+            for (const auto &[field, component] : packed(elements, reg, own))
+                if (field >= 0 && elements[field].reg != reg)
+                    after.insert(elements[field].reg);
+        }
+        return after;
+    }
+    // half `half` of an attribute from register `first` of the input, as bits
+    std::string input_half(std::uint32_t first, std::uint32_t half) {
+        std::set<std::uint32_t> own;
+        for (const auto &[attribute, reg] : attributes_)
+            own.insert(reg);
+        const auto [field, component] = packed(shader_.inputs, first, own)[half];
+        if (field < 0)
+            return "0u";
+        const auto &element = shader_.inputs[field];
+        const auto name = "input.f" + std::to_string(field) +
+                          (element.width > 1 ? std::string(".") + "xyzw"[component] : "");
+        return element.type == 6 ? "f32tof16(" + name + ")" : "((uint)" + name + " & 0xffffu)";
+    }
+    // the input register attribute `attribute` starts at
+    std::uint32_t attribute_register(std::uint32_t attribute) {
+        if (const auto found = attributes_.find(attribute); found != attributes_.end())
+            return found->second;
+        // without the table, attribute n is the nth register that is not a system value's
+        // nor packed with one before it
+        const auto after = packed_after(shader_.inputs, {});
+        std::vector<std::uint32_t> registers;
+        for (const auto &element : shader_.inputs)
+            if (!element.system_value && !after.count(element.reg) &&
+                (registers.empty() || registers.back() != element.reg))
+                registers.push_back(element.reg);
+        if (attribute >= registers.size())
+            give_up("an attribute the signature does not have");
+        return registers[attribute];
+    }
+    // VOP3's interpolations of a 16-bit half: v_interp_p1ll_f16, v_interp_p1lv_f16 and
+    // v_interp_p2_f16 (the attribute in bits 5:0 of the second word, its channel in 7:6 and
+    // the half in 8). Both steps leave the interpolated half in the low half of the register.
+    void emit_half_interpolation(const Ins &ins) {
+        if (stage_ != Stage::pixel)
+            give_up("interpolation outside a pixel shader");
+        const auto attribute = ins.w1 & 0x3f, channel = (ins.w1 >> 6) & 3, high = (ins.w1 >> 8) & 1;
+        const auto reg = attribute_register(attribute);
+        set_v(ins.w0 & 0xff, sixteen_at(shader_.inputs, reg)
+                                 ? input_half(reg, channel * 2 + high)
+                                 : "(" + input_channel(reg, channel) + " >> " +
+                                       std::to_string(16 * high) + " & 0xffffu)");
+    }
     // component `channel` of the input in register `reg`, as bits
     std::string input_channel(std::uint32_t reg, std::uint32_t channel) {
+        if (sixteen_at(shader_.inputs, reg))
+            return "(" + input_half(reg, channel * 2) + " | " + input_half(reg, channel * 2 + 1) +
+                   " << 16)";
         const auto &inputs = shader_.inputs;
         for (std::size_t i = 0; i < inputs.size(); ++i) {
             const auto &element = inputs[i];
@@ -2619,25 +2722,70 @@ class Translator {
             give_up("interpolation outside a pixel shader");
         const auto destination = (ins.w0 >> 18) & 0xff, attribute = (ins.w0 >> 10) & 0x3f,
                    channel = (ins.w0 >> 8) & 3;
-        const auto found = attributes_.find(attribute);
-        // without the table, attribute n is the nth register that is not a system value's
-        std::uint32_t reg = attribute;
-        if (found != attributes_.end()) {
-            reg = found->second;
-        } else {
-            std::vector<std::uint32_t> registers;
-            for (const auto &element : shader_.inputs)
-                if (!element.system_value && (registers.empty() || registers.back() != element.reg))
-                    registers.push_back(element.reg);
-            if (attribute >= registers.size())
-                give_up("an attribute the signature does not have");
-            reg = registers[attribute];
-        }
         // the two steps of an interpolation both leave the interpolated value
-        set_v(destination, input_channel(reg, channel));
+        set_v(destination, input_channel(attribute_register(attribute), channel));
+    }
+
+    // What lane `perm[i]` of each quad holds, for lane i of it, as a variable. A pixel shader
+    // reads its quad's lanes to take differences between neighbouring pixels: the console's
+    // lanes 0 to 3 of a quad are the top left, top right, bottom left and bottom right
+    // pixels, as the host's quad indices are. The read is not under the guard of a lane's
+    // EXEC bit, so that the lanes it reads take part in it as on the console, where it
+    // reads the registers of inactive lanes too.
+    std::string quad_read(const std::string &source, const std::array<std::uint32_t, 4> &perm) {
+        needs_sm6_ = true;
+        const auto id = "x" + std::to_string(temporaries_++);
+        const auto is = [&](std::array<std::uint32_t, 4> other) { return perm == other; };
+        if (is({0, 1, 2, 3}))
+            line("uint " + id + " = " + source + ";");
+        else if (is({1, 0, 3, 2}))
+            line("uint " + id + " = QuadReadAcrossX(" + source + ");");
+        else if (is({2, 3, 0, 1}))
+            line("uint " + id + " = QuadReadAcrossY(" + source + ");");
+        else if (is({3, 2, 1, 0}))
+            line("uint " + id + " = QuadReadAcrossDiagonal(" + source + ");");
+        else if (perm[0] == perm[1] && perm[1] == perm[2] && perm[2] == perm[3])
+            line("uint " + id + " = QuadReadLaneAt(" + source + ", " + std::to_string(perm[0]) +
+                 "u);");
+        else {
+            // this lane's place in its quad: the index whose lane has its own number
+            line("uint " + id + "s = " + source + ", " + id + "n = WaveGetLaneIndex();");
+            line("uint " + id + "i = " + id + "n == QuadReadLaneAt(" + id + "n, 1u) ? 1u : " + id +
+                 "n == QuadReadLaneAt(" + id + "n, 2u) ? 2u : " + id + "n == QuadReadLaneAt(" + id +
+                 "n, 3u) ? 3u : 0u;");
+            for (std::uint32_t k = 0; k < 4; ++k)
+                line("uint " + id + "q" + std::to_string(k) + " = QuadReadLaneAt(" + id + "s, " +
+                     std::to_string(perm[k]) + "u);");
+            line("uint " + id + " = " + id + "i < 2u ? (" + id + "i == 0u ? " + id + "q0 : " + id +
+                 "q1) : (" + id + "i == 2u ? " + id + "q2 : " + id + "q3);");
+        }
+        return id;
+    }
+    // A pixel shader's DPP16 instruction that permutes its quads (quad_perm), with every
+    // row and bank enabled and no modifier on the lane read: a move, or an operation with
+    // the lane read as its first source.
+    bool emit_quad_dpp(const Ins &ins) {
+        const auto modifier = ins.modifier, control = (modifier >> 8) & 0x1ff;
+        if ((ins.w0 & 0x1ff) != 250 || control >= 0x100 || (modifier >> 20 & 0xf) ||
+            (modifier >> 24 & 0xff) != 0xff || (ins.format != F::vop1 && ins.format != F::vop2))
+            return false;
+        const auto name = ins.name;
+        if (name != "v_mov_b32" && ins.format == F::vop1)
+            return false;
+        const std::array<std::uint32_t, 4> perm{control & 3, (control >> 2) & 3, (control >> 4) & 3,
+                                                (control >> 6) & 3};
+        const auto destination = (ins.w0 >> 17) & 0xff;
+        const auto a = quad_read(v(modifier & 0xff), perm);
+        if (name == "v_mov_b32")
+            set_v(destination, a);
+        else
+            set_v(destination, binary(name, a, v((ins.w0 >> 9) & 0xff), v(destination)));
+        return true;
     }
 
     void emit_dpp8_move(const Ins &ins) {
+        if (emit_quad_dpp(ins))
+            return;
         if (stage_ != Stage::pixel || ins.name != "v_mov_b32" || (ins.w0 & 0x1ff) != 233)
             give_up("an instruction that reads another lane");
         if (exec_changes_ || sopk_writes_exec_ || blocks_.size() != 1 || blocks_[0].opens)
@@ -2746,6 +2894,8 @@ class Translator {
         }
         std::string a, b;
         std::uint32_t mask = 106;
+        // SDWA's clamp (bit 13) and output modifier (bits 15:14) of a float result
+        std::uint32_t output = 0;
         if (is_wide(name)) {
             if (ins.form == Ins::Form::sub_dword)
                 give_up(std::string(name) + " on part of a register");
@@ -2780,7 +2930,11 @@ class Translator {
                 if (modifier >> 15 & 1)
                     mask = (modifier >> 8) & 0x7f;
             } else {
-                if (modifier >> 13 & 7)
+                output = modifier >> 13 & 7;
+                const bool float_result = (name.find("_f32") != std::string_view::npos ||
+                                           name.find("_f16") != std::string_view::npos) &&
+                                          (!starts(name, "v_cvt_") || starts(name, "v_cvt_f"));
+                if (output && (((modifier >> 8) & 7) != 6 || !float_result))
                     give_up(std::string(name) + " on part of a register, with a modifier");
                 placed_ = {(modifier >> 8) & 7, (modifier >> 11) & 3};
             }
@@ -2797,6 +2951,9 @@ class Translator {
             emit_compare(name, mask, a, b);
         }
         placed_.reset();
+        if (output)
+            finish_float(body_.size(), destination, output >> 1, output & 1,
+                         starts(name, "v_cvt_") ? starts(name, "v_cvt_f16") : ends(name, "_f16"));
     }
     // a value as the part of a register that an instruction writes
     std::string place(std::uint32_t reg, const std::string &value) {
@@ -3568,6 +3725,11 @@ class Translator {
         const std::uint32_t codes[3] = {ins.w1 & 0x1ff, (ins.w1 >> 9) & 0x1ff,
                                         (ins.w1 >> 18) & 0x1ff};
         const auto name = ins.name;
+        if (name == "v_interp_p1ll_f16" || name == "v_interp_p1lv_f16" ||
+            name == "v_interp_p2_f16") {
+            emit_half_interpolation(ins);
+            return;
+        }
         if (name == "v_writelane_b32" || name == "v_readlane_b32") {
             // A scalar kept in one lane of a vector register and taken back from it: each
             // such lane is a variable of its own.
@@ -4651,6 +4813,35 @@ class Translator {
                     channels[n] = f(v((ins.w1 >> (8 * n)) & 0xff));
         }
         const auto &outputs = shader_.outputs;
+        const auto assign = [&](const std::string &field, const std::string &value) {
+            // a mesh shader's lane writes its own vertex
+            const std::string to = stage_ == Stage::mesh ? "xv_verts[xv_flat].f" : "output.f";
+            const std::string guard =
+                stage_ == Stage::mesh ? "xv_flat < " + std::to_string(mesh_vertices_) + "u" : "";
+            line(std::string(exec_changes_ || !guard.empty()
+                                 ? "if (" + (exec_changes_ ? active() : std::string("true")) +
+                                       (guard.empty() ? "" : " && " + guard) + ") "
+                                 : "") +
+                 to + field + " = " + value + ";");
+        };
+        // a parameter of 16-bit registers: each word holds two halves (see `packed`)
+        const auto write_packed = [&](std::uint32_t row, const std::set<std::uint32_t> &own) {
+            if (compressed)
+                give_up("a compressed export of 16-bit outputs");
+            for (std::uint32_t half = 0; half < 8; ++half) {
+                const auto [field, component] = packed(outputs, row, own)[half];
+                if (field < 0 || !(enabled >> (half / 2) & 1))
+                    continue;
+                const auto &element = outputs[field];
+                const auto bits = "(" + v((ins.w1 >> (8 * (half / 2))) & 0xff) +
+                                  (half & 1 ? " >> 16" : "") + " & 0xffffu)";
+                assign(std::to_string(field) +
+                           (element.width > 1 ? std::string(".") + "xyzw"[component] : ""),
+                       element.type == 6   ? "f16tof32(" + bits + ")"
+                       : element.type == 5 ? "(float)((int)(" + bits + " << 16) >> 16)"
+                                           : "(float)" + bits);
+            }
+        };
         const auto write = [&](std::size_t field, std::uint32_t from) {
             const auto &element = outputs[field];
             std::string value;
@@ -4697,8 +4888,13 @@ class Translator {
                     write(i, 0), written = true;
         } else if (stage_ == Stage::mesh && target >= 32) {
             // parameter n: the row the stage data gives it
+            std::set<std::uint32_t> own;
             for (const auto &[parameter, row] : mesh_outputs_)
-                if (parameter == target - 32)
+                own.insert(row);
+            for (const auto &[parameter, row] : mesh_outputs_)
+                if (parameter == target - 32 && sixteen_at(outputs, row))
+                    write_packed(row, own), written = true;
+                else if (parameter == target - 32)
                     for (std::size_t i = 0; i < outputs.size(); ++i)
                         if (outputs[i].reg == row &&
                             _stricmp(outputs[i].name.c_str(), "SV_Position"))
@@ -4718,14 +4914,18 @@ class Translator {
                 if (!_stricmp(outputs[i].name.c_str(), "SV_Position"))
                     write(i, 0), written = true;
         } else if (stage_ == Stage::vertex && target >= 32) {
-            // parameter n: the nth register that is not the position's
+            // parameter n: the nth register that is not the position's, nor packed with a
+            // 16-bit one before it
+            const auto after = packed_after(outputs, {});
             std::vector<std::uint32_t> registers;
             for (const auto &element : outputs)
-                if (_stricmp(element.name.c_str(), "SV_Position") &&
+                if (_stricmp(element.name.c_str(), "SV_Position") && !after.count(element.reg) &&
                     std::find(registers.begin(), registers.end(), element.reg) == registers.end())
                     registers.push_back(element.reg);
             std::sort(registers.begin(), registers.end());
-            if (target - 32 < registers.size())
+            if (target - 32 < registers.size() && sixteen_at(outputs, registers[target - 32]))
+                write_packed(registers[target - 32], {}), written = true;
+            else if (target - 32 < registers.size())
                 for (std::size_t i = 0; i < outputs.size(); ++i)
                     if (outputs[i].reg == registers[target - 32] &&
                         _stricmp(outputs[i].name.c_str(), "SV_Position"))
