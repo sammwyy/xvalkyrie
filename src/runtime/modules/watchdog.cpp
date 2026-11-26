@@ -14,6 +14,9 @@
 #include <windows.h>
 
 #include <tlhelp32.h> // after windows.h
+#include <wct.h>
+
+#pragma comment(lib, "advapi32.lib")
 
 // XV_WATCHDOG: when no frame has been presented for 5 seconds, the stack of every thread of
 // the process goes to the log, three times per stall, to see what the title is waiting on.
@@ -54,7 +57,9 @@ void dump_thread(DWORD id) {
         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
     if (!thread)
         return;
-    if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+    // how many times it was suspended already: one that is, and holds a lock, holds it for good
+    const auto suspended = SuspendThread(thread);
+    if (suspended == static_cast<DWORD>(-1)) {
         CloseHandle(thread);
         return;
     }
@@ -72,7 +77,29 @@ void dump_thread(DWORD id) {
         LocalFree(description);
     }
     CloseHandle(thread);
-    std::fprintf(stderr, "[Runtime] thread %lu (%s):%s\n", id, name.c_str(), frames.c_str());
+    // What it waits on, as far as Windows follows it (critical sections, mutexes, other
+    // threads): the thread at the end of the chain is the one that holds things up.
+    std::string chain;
+    if (static auto *const session = OpenThreadWaitChainSession(0, nullptr); session) {
+        WAITCHAIN_NODE_INFO nodes[WCT_MAX_NODE_COUNT];
+        DWORD count = WCT_MAX_NODE_COUNT;
+        BOOL cycle = FALSE;
+        if (GetThreadWaitChain(session, 0, 0, id, &count, nodes, &cycle) && count > 1) {
+            chain = cycle ? " [wait chain, a cycle:" : " [wait chain:";
+            for (DWORD n = 1; n < count; ++n) {
+                const auto &node = nodes[n];
+                if (node.ObjectType == WctThreadType)
+                    chain += " thread " + std::to_string(node.ThreadObject.ThreadId);
+                else
+                    chain += " object " + std::to_string(node.ObjectType) +
+                             (node.ObjectStatus == WctStatusOwned ? " owned" : "");
+            }
+            chain += "]";
+        }
+    }
+    std::fprintf(stderr, "[Runtime] thread %lu (%s%s):%s%s\n", id, name.c_str(),
+                 suspended ? (name.empty() ? "suspended" : ", suspended") : "", frames.c_str(),
+                 chain.c_str());
 }
 void dump_threads() {
     const auto self = GetCurrentThreadId();
