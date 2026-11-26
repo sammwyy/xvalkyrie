@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <execution>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <vector>
 #include <windows.h>
 
@@ -25,6 +27,12 @@ struct Placement {
     D3D12_RESOURCE_DESC desc{};
     bool series = false;          // laid out as the Series console's xg_xs.dll says, from `layout`
     D3D12_RESOURCE_DESC layout{}; // the description the title gave, with its swizzle mode
+    // its memory is read-only, so that a write is seen; one already writable is not made so
+    // again: the title's storage queues write a placement's memory a page at a time
+    mutable bool guarded = false;
+    std::uint64_t uploaded_at = 0, uploads = 0;
+    bool looked = false;   // waiting for its memory, and looked at once since (take_d3d12_uploads)
+    bool streamed = false; // written since its upload by the host for the title, not by the title
 };
 void release(Placement &placement) {
     if (placement.resource)
@@ -61,6 +69,7 @@ void protect(std::uintptr_t start, std::uintptr_t end, DWORD protection) {
 // the placement's memory at every address the title sees it at: a physical page may be mapped
 // at several, and a write through any of them is one to the placement
 void protect(const Placement &placement, DWORD protection) {
+    placement.guarded = protection == PAGE_READONLY;
     protect(placement.start, placement.end, protection);
     for (const auto &[start, end] : other_views(placement.start, placement.end))
         protect(start, end, protection);
@@ -104,6 +113,7 @@ LONG CALLBACK written(EXCEPTION_POINTERS *exception) {
                 if (!placement.dirty)
                     dirty.push_back(placement.start);
                 placement.dirty = true;
+                placement.streamed = false;
                 protect(placement, PAGE_READWRITE);
             }
         }
@@ -383,9 +393,10 @@ void unguard(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>> &range
             if (placement.end <= first || placement.start >= last)
                 continue;
             if (!placement.dirty)
-                dirty.push_back(placement.start);
+                dirty.push_back(placement.start), placement.streamed = true;
             placement.dirty = true;
-            protect(placement, PAGE_READWRITE);
+            if (placement.guarded)
+                protect(placement, PAGE_READWRITE);
         }
 }
 } // namespace
@@ -719,8 +730,30 @@ bool let_go_of(const Placement &placement, bool taken) {
 }
 } // namespace
 
+// The placements to upload are taken under the lock, and read out of their tiling after it,
+// side by side: that takes long for many large textures, and the threads that write the title's
+// memory (a title's storage queues) would all wait on it meanwhile.
+std::vector<Placement> take_d3d12_placements();
 std::vector<PlacementUpload> take_d3d12_uploads() {
     std::vector<PlacementUpload> uploads;
+    auto taken = take_d3d12_placements();
+    std::vector<PlacementUpload> read(taken.size());
+    std::vector<char> ok(taken.size());
+    std::vector<std::size_t> order(taken.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::for_each(std::execution::par, order.begin(), order.end(), [&](std::size_t n) {
+        read[n] = {taken[n].d3d12, {}, {}, taken[n].desc.Format};
+        ok[n] = linear_subresources(taken[n], read[n]);
+    });
+    for (std::size_t n = 0; n < read.size(); ++n)
+        if (ok[n])
+            uploads.push_back(std::move(read[n]));
+        else
+            taken[n].d3d12->Release();
+    return uploads;
+}
+std::vector<Placement> take_d3d12_placements() {
+    std::vector<Placement> uploads;
     const std::lock_guard lock(mutex);
     // every so many submissions, the placements the title has let go of
     if (static unsigned submissions = 0; ++submissions % 64 == 0) {
@@ -757,30 +790,52 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
             return true;
         });
     }
-    for (auto waiting = pending.begin(); waiting != pending.end();) {
-        if (!readable(waiting->start, waiting->end - waiting->start)) {
-            ++waiting;
-            continue;
-        }
+    // Those waiting for memory are looked at again where the title has mapped some since, and
+    // once when they are new: there are thousands, and a look at memory is a call to the host.
+    auto mapped = take_newly_mapped();
+    std::sort(mapped.begin(), mapped.end());
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> merged;
+    for (const auto &range : mapped)
+        if (!merged.empty() && range.first <= merged.back().second)
+            merged.back().second = std::max(merged.back().second, range.second);
+        else
+            merged.push_back(range);
+    const auto touched = [&](const Placement &waiting) {
+        const auto after = std::upper_bound(merged.begin(), merged.end(),
+                                            std::pair{waiting.start, ~std::uintptr_t{0}});
+        return (after != merged.begin() && std::prev(after)->second > waiting.start) ||
+               (after != merged.end() && after->first < waiting.end);
+    };
+    std::erase_if(pending, [&](Placement &waiting) {
+        const bool look = !waiting.looked || touched(waiting);
+        waiting.looked = true;
+        if (!look || !readable(waiting.start, waiting.end - waiting.start))
+            return false;
         if (!handler)
             handler = AddVectoredExceptionHandler(1, &written);
-        if (const auto old = placements.find(waiting->start); old != placements.end()) {
+        if (const auto old = placements.find(waiting.start); old != placements.end()) {
             protect(old->second, PAGE_READWRITE);
             release(old->second);
             placements.erase(old);
         }
-        largest = std::max<std::uintptr_t>(largest, waiting->end - waiting->start);
-        placements[waiting->start] = *waiting;
-        dirty.push_back(waiting->start);
-        waiting = pending.erase(waiting);
-    }
+        largest = std::max<std::uintptr_t>(largest, waiting.end - waiting.start);
+        placements[waiting.start] = waiting;
+        dirty.push_back(waiting.start);
+        return true;
+    });
     std::vector<std::uintptr_t> kept;
     for (const auto start : dirty) {
         const auto found = placements.find(start);
         if (found == placements.end() || !found->second.dirty)
             continue;
         auto &placement = found->second;
-        if (!placement.d3d12 || being_written(placement)) {
+        // One uploaded a moment ago waits a little: the title's storage queues write a texture
+        // a piece at a time over several submissions, and each upload is of all of it.
+        // What the title writes itself (a video's frames) is not held back.
+        constexpr std::uint64_t again_after = 250; // ms
+        if (!placement.d3d12 || being_written(placement) ||
+            (placement.streamed && placement.uploads &&
+             GetTickCount64() - placement.uploaded_at < again_after)) {
             kept.push_back(start);
             continue;
         }
@@ -798,11 +853,10 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
         // the placement dirty for the next upload
         placement.dirty = false;
         guard(placement);
-        PlacementUpload upload{placement.d3d12, {}, {}, placement.desc.Format};
-        if (linear_subresources(placement, upload)) {
-            placement.d3d12->AddRef();
-            uploads.push_back(std::move(upload));
-        }
+        ++placement.uploads;
+        placement.uploaded_at = GetTickCount64();
+        placement.d3d12->AddRef();
+        uploads.push_back(placement);
     }
     dirty = std::move(kept);
     return uploads;

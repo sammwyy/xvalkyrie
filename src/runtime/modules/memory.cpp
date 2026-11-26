@@ -136,6 +136,23 @@ void unmap(Physical &state, Reservation &reservation, std::uintptr_t address) {
         }
     reservation.views.erase(view);
 }
+// the title's memory mapped or committed since take_newly_mapped, a page's run at a time
+std::mutex newly_mutex;
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> newly;
+void note_mapped(std::uintptr_t start, std::uintptr_t end) {
+    const std::lock_guard lock(newly_mutex);
+    if (!newly.empty() && newly.back().second == start)
+        newly.back().second = end;
+    else
+        newly.emplace_back(start, end);
+    // one that nothing takes is kept as all it spans
+    if (newly.size() > 65536) {
+        std::uintptr_t first = ~std::uintptr_t{0}, last = 0;
+        for (const auto &[from, to] : newly)
+            first = std::min(first, from), last = std::max(last, to);
+        newly.assign(1, {first, last});
+    }
+}
 bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULONG_PTR number,
          DWORD protect, bool owned) {
     unmap(state, reservation, address);
@@ -162,6 +179,7 @@ bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULON
         state.where.emplace(number, address);
     }
     state.mapped_at.emplace(number, address);
+    note_mapped(address, address + page);
     return true;
 }
 // The console's addresses have 40 bits, and a title may count on it: its GPU takes no more (a
@@ -270,6 +288,9 @@ void *WINAPI virtual_alloc_ex(HANDLE process, void *address, SIZE_T size, DWORD 
     if (!result)
         result =
             VirtualAllocEx(process, address, size, type & allocation_types, protect & protections);
+    if (result && type & MEM_COMMIT)
+        note_mapped(reinterpret_cast<std::uintptr_t>(result),
+                    reinterpret_cast<std::uintptr_t>(result) + size);
     if (!result && type & MEM_COMMIT && GetLastError() == ERROR_COMMITMENT_LIMIT)
         tell_short("VirtualAlloc", size);
     if (!result && (type & ~(allocation_types | page_sizes) || protect & ~protections)) {
@@ -314,6 +335,8 @@ BOOL WINAPI virtual_free(void *address, SIZE_T size, DWORD type) {
     return virtual_free_ex(GetCurrentProcess(), address, size, type);
 }
 BOOL WINAPI virtual_protect(void *address, SIZE_T size, DWORD protect, DWORD *previous) {
+    note_mapped(reinterpret_cast<std::uintptr_t>(address),
+                reinterpret_cast<std::uintptr_t>(address) + size);
     return VirtualProtect(address, size, protect & protections, previous);
 }
 
@@ -718,6 +741,12 @@ bool map_alias(std::uintptr_t to, std::uintptr_t from, std::uintptr_t size) {
     // what a texture placed there shows has changed
     prepare_title_write(reinterpret_cast<const void *>(to), size);
     return mapped;
+}
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> take_newly_mapped() {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> taken;
+    const std::lock_guard lock(newly_mutex);
+    taken.swap(newly);
+    return taken;
 }
 std::vector<std::pair<std::uintptr_t, std::uintptr_t>> other_views(std::uintptr_t start,
                                                                    std::uintptr_t end) {

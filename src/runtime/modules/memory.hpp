@@ -34,6 +34,9 @@ bool copy_physical_pages(const ULONG_PTR *pages, std::size_t offset, std::uint8_
 // the page holds. Empty for memory that is no physical page of the title's.
 std::vector<std::pair<std::uintptr_t, std::uintptr_t>> other_views(std::uintptr_t start,
                                                                    std::uintptr_t end);
+// The ranges of the title's memory mapped, committed or given another protection since the
+// last call, for what waits for memory to be there (placement.cpp's pending textures)
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> take_newly_mapped();
 // The physical pages the title has mapped at [from, from + size) mapped at `to` as well, in
 // place of what is there, as the console's GPU maps its pages; `from` 0 leaves `to` unmapped.
 // False if `to` is not in a reservation of physical pages or a page at `from` is not mapped.
