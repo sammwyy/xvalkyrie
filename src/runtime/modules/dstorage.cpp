@@ -179,17 +179,25 @@ struct FactoryInterface : IUnknown {
 
 class File final : public Object<FileInterface> {
   public:
-    explicit File(HANDLE handle) : Object({file_iid}), handle_(handle) {}
+    File(HANDLE handle, HANDLE overlapped)
+        : Object({file_iid}), handle_(handle), overlapped_(overlapped) {}
     ~File() override { Close(); }
     void Close() override {
-        if (const auto handle = handle_.exchange(INVALID_HANDLE_VALUE);
-            handle != INVALID_HANDLE_VALUE)
-            CloseHandle(handle);
+        for (auto *const kept : {&handle_, &overlapped_})
+            if (const auto handle = kept->exchange(INVALID_HANDLE_VALUE);
+                handle != INVALID_HANDLE_VALUE)
+                CloseHandle(handle);
     }
     HANDLE GetHandle() override { return handle_; }
+    // The same file opened for overlapped reads, which the queues read it through: the host
+    // does one read at a time of a handle that is not, and a queue reads many at once.
+    HANDLE overlapped() const {
+        const auto handle = overlapped_.load();
+        return handle != INVALID_HANDLE_VALUE ? handle : handle_.load();
+    }
 
   private:
-    std::atomic<HANDLE> handle_;
+    std::atomic<HANDLE> handle_, overlapped_;
 };
 
 class Status final : public Object<StatusInterface> {
@@ -226,14 +234,23 @@ class Status final : public Object<StatusInterface> {
 };
 
 HRESULT read_file(const Request &request, void *target) {
+    // an event of the thread's own, for its reads to wait on
+    thread_local HANDLE event = nullptr;
+    if (!event)
+        event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     OVERLAPPED at{};
     at.Offset = static_cast<DWORD>(request.file_offset);
     at.OffsetHigh = static_cast<DWORD>(request.file_offset >> 32);
+    at.hEvent = event;
+    const auto handle =
+        static_cast<File *>(static_cast<FileInterface *>(request.source))->overlapped();
     DWORD done = 0;
-    if (!ReadFile(static_cast<FileInterface *>(request.source)->GetHandle(), target,
-                  request.source_size, &done, &at) ||
-        done != request.source_size)
+    SetLastError(ERROR_SUCCESS);
+    if (!ReadFile(handle, target, request.source_size, &done, &at) &&
+        (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(handle, &at, &done, TRUE)))
         return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF);
+    if (done != request.source_size)
+        return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
     return S_OK;
 }
 // where a request's data comes from: a file, the title's memory or its physical pages
@@ -640,7 +657,13 @@ class Factory final : public Object<FactoryInterface> {
         if (static std::atomic<int> shown{0}; std::getenv("XV_FILE_TRACE") && shown++ < 40)
             std::fprintf(stderr, "[Runtime] DirectStorage: opened %ls (%zu characters) from %s\n",
                          path, wcslen(path), detail::guest_location(_ReturnAddress()).c_str());
-        auto *const made = new File(handle);
+        auto *const made =
+            new File(handle, CreateFileW(console_file_path(path).c_str(), GENERIC_READ,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr, OPEN_EXISTING,
+                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS |
+                                             FILE_FLAG_OVERLAPPED,
+                                         nullptr));
         const auto result = made->QueryInterface(iid, file);
         made->Release();
         return result;
