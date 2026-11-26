@@ -3071,12 +3071,40 @@ void back_texture(ID3D12CommandQueue *queue, ID3D12Device *device, ID3D12Resourc
     device->GetResourceTiling(texture, &tiles, &packed, nullptr, nullptr, 0, nullptr);
     if (!tiles)
         return;
-    const D3D12_HEAP_DESC heap_desc{std::uint64_t{tiles} * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
-                                    {D3D12_HEAP_TYPE_DEFAULT},
-                                    0,
-                                    D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
+    // Its tiles from a heap that many share, in order: a heap made for each of the thousands
+    // a title streams in takes the host longer than all else it does for them. A heap goes
+    // when the last texture with tiles of it does; a texture larger than one has its own.
+    constexpr UINT shared_tiles = 256;
+    static ID3D12Heap *shared = nullptr; // under the uploader's lock, with a reference of ours
+    static UINT used = shared_tiles;
+    const auto make = [&](UINT count) -> ID3D12Heap * {
+        const D3D12_HEAP_DESC heap_desc{std::uint64_t{count} *
+                                            D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
+                                        {D3D12_HEAP_TYPE_DEFAULT},
+                                        0,
+                                        D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
+        ID3D12Heap *made = nullptr;
+        return SUCCEEDED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&made))) ? made : nullptr;
+    };
     ID3D12Heap *heap = nullptr;
-    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap))))
+    UINT offset = 0;
+    if (tiles > shared_tiles / 4) {
+        heap = make(tiles);
+    } else {
+        if (used + tiles > shared_tiles) {
+            if (shared)
+                shared->Release();
+            shared = make(shared_tiles);
+            used = 0;
+        }
+        if (shared) {
+            heap = shared;
+            heap->AddRef();
+            offset = used;
+            used += tiles;
+        }
+    }
+    if (!heap)
         return;
     // the standard mips' tiles in order, then the packed ones
     const UINT standard = tiles - packed.NumTilesForPackedMips;
@@ -3089,7 +3117,6 @@ void back_texture(ID3D12CommandQueue *queue, ID3D12Device *device, ID3D12Resourc
         starts[regions].Subresource = packed.NumStandardMips;
         sizes[regions++].NumTiles = packed.NumTilesForPackedMips;
     }
-    const UINT offset = 0;
     queue->UpdateTileMappings(texture, regions, starts, sizes, heap, 1, nullptr, &offset, &tiles,
                               D3D12_TILE_MAPPING_FLAG_NONE);
     static constexpr GUID backing{
