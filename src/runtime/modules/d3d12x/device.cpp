@@ -7033,6 +7033,22 @@ void STDMETHODCALLTYPE begin_render_pass(void *self, UINT count,
         host_depth = *depth;
         host_depth.cpuDescriptor = host_view(depth->cpuDescriptor);
     }
+    // XV_CAPTURE: what the pass draws into, as for OMSetRenderTargets
+    if (capturing()) {
+        ID3D12Resource *first = nullptr;
+        const std::lock_guard lock(target_mutex);
+        for (const auto &target : host_targets)
+            if (const auto found = target_of.find(target.cpuDescriptor.ptr);
+                found != target_of.end()) {
+                capture_bound(found->second, false);
+                first = first ? first : found->second;
+            }
+        if (depth)
+            if (const auto found = target_of.find(host_depth.cpuDescriptor.ptr);
+                found != target_of.end())
+                capture_bound(found->second, true);
+        static_cast<ListProxy *>(self)->target = first;
+    }
     host->BeginRenderPass(count, host_targets.data(), depth ? &host_depth : nullptr, flags);
     host->Release();
 }
@@ -7053,6 +7069,7 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
         return;
     }
     count_draw(self);
+    capture_call(self, "DispatchMeshX", groups, 1, 0, 0);
     prepare_draw(static_cast<ListProxy *>(self));
     host->DispatchMesh(groups, 1, 1);
     host->Release();
@@ -7178,6 +7195,10 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
     if (list->no_pipeline)
         return;
     const auto kinds = argument_kinds(signature);
+    if (capturing()) // XV_CAPTURE: as many records as at most, of the kinds in the signature
+        std::fprintf(
+            stderr, "[Capture] ExecuteIndirect %u records of kinds 0x%x, pipeline %p, target %p\n",
+            count, kinds, static_cast<void *>(list->pipeline), static_cast<void *>(list->target));
     if (kinds & 1u << D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)
         prepare_dispatch(list);
     if (kinds &
@@ -7263,6 +7284,7 @@ void STDMETHODCALLTYPE dispatch_mesh(void *self, UINT x, UINT y, UINT z) {
     if (FAILED(host_of(self)->QueryInterface(IID_PPV_ARGS(&host))))
         return;
     count_draw(self);
+    capture_call(self, "DispatchMesh", x * y * z, 1, 0, 0);
     prepare_draw(static_cast<ListProxy *>(self));
     host->DispatchMesh(x, y, z);
     host->Release();
