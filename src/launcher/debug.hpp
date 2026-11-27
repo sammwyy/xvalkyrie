@@ -13,19 +13,27 @@ namespace xv {
 // a title's own file, where a setting of the title's takes the place of the one for all.
 // xvboot gives them to the runtime as its environment; one that is already there is kept.
 struct DebugOption {
-    enum class Kind { flag, number, text };
+    enum class Kind { flag, number, text, choice };
     const char *key;   // in the files
     const char *group; // the heading it is shown under
     const char *name, *hint;
     Kind kind;
     const char *variable; // XV_...
     // A flag sets the variable to `value`. Flags that share a variable with a `letter` each
-    // make it a list of the letters of those on, or with `inverse` of those off.
+    // make it a list of the letters of those on, or with `inverse` of those off. A choice's
+    // `value` is its choices, separated by '|', and the variable is the number of the one
+    // chosen.
     const char *value = "1";
     char letter = 0;
     bool inverse = false;
 };
 std::span<const DebugOption> debug_options();
+// The groups of settings for playing rather than for looking into a title: what it draws
+// (Render) and what it reaches of the machine (Game). The others are debug settings.
+inline constexpr const char *render_group = "Render", *game_group = "Game";
+bool user_group(const char *group);
+// a choice's choices, in order
+std::vector<std::string> option_choices(const DebugOption &option);
 // by key, the value as typed: "true" or "false" for a flag, digits for a number; what is not
 // there is not set
 using DebugValues = std::map<std::string, std::string>;

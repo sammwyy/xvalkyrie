@@ -414,6 +414,10 @@ class Desktop {
                 settings_.show(ui::Settings::Page::input);
             if (ImGui::MenuItem("Graphics..."))
                 settings_.show(ui::Settings::Page::graphics);
+            if (ImGui::MenuItem("Render..."))
+                settings_.show(ui::Settings::Page::render);
+            if (ImGui::MenuItem("Game..."))
+                settings_.show(ui::Settings::Page::game);
             if (ImGui::MenuItem("Profiles..."))
                 settings_.show(ui::Settings::Page::profiles);
             if (ImGui::MenuItem("Console..."))

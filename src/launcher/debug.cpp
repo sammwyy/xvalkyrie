@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string_view>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -13,8 +15,21 @@ namespace xv {
 namespace {
 using Kind = DebugOption::Kind;
 constexpr const char *graphics = "Graphics", *shaders = "Shaders", *gpu = "GPU diagnostics",
-                     *traces = "Traces", *title = "Title";
+                     *traces = "Traces";
 constexpr DebugOption options[] = {
+    // for playing: what is drawn
+    {"texture_quality", render_group, "Texture quality",
+     "Textures the title streams in are kept on the GPU without their most detailed levels: "
+     "a quarter of the video memory for each level left out, softer textures up close.",
+     Kind::choice, "XV_TEXTURE_LOD", "Full|Half|Quarter|Eighth"},
+    // for playing: what the title reaches of the machine
+    {"mute", game_group, "Mute", "The title plays no sound.", Kind::flag, "XV_MUTE"},
+    {"no_network", game_group, "No network",
+     "The title's sockets and WinHTTP fail as with no connection.", Kind::flag, "XV_NETWORK", "0"},
+    {"patches", game_group, "Code patches",
+     "Bytes of the title's code changed as it starts, where they are the expected ones: "
+     "rva:old:new in hexadecimal, separated by commas.",
+     Kind::text, "XV_PATCH"},
     // what is drawn
     {"skip_draws", graphics, "Skip draws",
      "Draws (DrawInstanced, DrawIndexedInstanced) do nothing.", Kind::flag, "XV_D3D_NO_WORK", "",
@@ -122,14 +137,6 @@ constexpr DebugOption options[] = {
      Kind::number, "XV_THREAD_DUMP"},
     {"profile", traces, "Profile", "Samples the stacks of the threads that run every so many ms.",
      Kind::number, "XV_PROFILE"},
-    // the title itself
-    {"mute", title, "Mute", "The title plays no sound.", Kind::flag, "XV_MUTE"},
-    {"no_network", title, "No network",
-     "The title's sockets and WinHTTP fail as with no connection.", Kind::flag, "XV_NETWORK", "0"},
-    {"patches", title, "Code patches",
-     "Bytes of the title's code changed as it starts, where they are the expected ones: "
-     "rva:old:new in hexadecimal, separated by commas.",
-     Kind::text, "XV_PATCH"},
 };
 
 std::string trim(std::string value) {
@@ -149,10 +156,14 @@ const DebugOption *find_option(const std::string &key) {
 bool valid(const DebugOption &option, const std::string &value) {
     if (option.kind == Kind::flag)
         return value == "true" || value == "false";
-    if (option.kind == Kind::number)
-        return !value.empty() && value.size() <= 9 &&
-               std::all_of(value.begin(), value.end(),
-                           [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
+    if (option.kind == Kind::number || option.kind == Kind::choice) {
+        if (value.empty() || value.size() > 9 ||
+            !std::all_of(value.begin(), value.end(),
+                         [](char c) { return std::isdigit(static_cast<unsigned char>(c)); }))
+            return false;
+        return option.kind == Kind::number ||
+               static_cast<std::size_t>(std::stoi(value)) < option_choices(option).size();
+    }
     return value.find_first_of("\r\n") == std::string::npos;
 }
 // The [debug] section of a file, and the stand-ins of its [shaders]. What is not known or
@@ -209,6 +220,21 @@ std::filesystem::path debug_file() { return config_directory() / "debug.ini"; }
 } // namespace
 
 std::span<const DebugOption> debug_options() { return options; }
+bool user_group(const char *group) {
+    return !std::strcmp(group, render_group) || !std::strcmp(group, game_group);
+}
+std::vector<std::string> option_choices(const DebugOption &option) {
+    std::vector<std::string> choices;
+    if (option.kind != Kind::choice || !option.value)
+        return choices;
+    std::string_view rest(option.value);
+    while (!rest.empty()) {
+        const auto bar = rest.find('|');
+        choices.emplace_back(rest.substr(0, bar));
+        rest = bar == rest.npos ? std::string_view{} : rest.substr(bar + 1);
+    }
+    return choices;
+}
 
 DebugValues load_debug_settings() {
     DebugValues values;

@@ -3,14 +3,18 @@
 #include <cstdio>
 #include <cstring>
 #include <imgui.h>
+#include <string>
+#include <vector>
 
 namespace xv::ui {
 bool debug_options_ui(const Fonts &fonts, DebugValues &values, DebugFields &fields,
-                      const DebugValues *defaults) {
+                      const DebugValues *defaults, OptionGroups groups) {
     bool changed = false;
     const char *group = nullptr;
     bool open = false;
     for (const auto &option : debug_options()) {
+        if (groups.only ? std::strcmp(option.group, groups.only) != 0 : user_group(option.group))
+            continue;
         if (!group || std::strcmp(group, option.group)) {
             if (open)
                 end_settings();
@@ -27,7 +31,28 @@ bool debug_options_ui(const Fonts &fonts, DebugValues &values, DebugFields &fiel
             if (const auto other = defaults->find(option.key); other != defaults->end())
                 inherited = &other->second;
         setting(fonts, option.name, option.hint);
-        if (option.kind == DebugOption::Kind::flag) {
+        if (option.kind == DebugOption::Kind::choice) {
+            // one of its choices, or (a title's) the one for all titles
+            const auto choices = option_choices(option);
+            std::vector<std::string> names;
+            if (defaults) {
+                const std::size_t all = inherited ? std::stoul(*inherited) : 0;
+                names.push_back("Default (" + (all < choices.size() ? choices[all] : "") + ")");
+            }
+            names.insert(names.end(), choices.begin(), choices.end());
+            std::vector<const char *> labels;
+            for (const auto &name : names)
+                labels.push_back(name.c_str());
+            const int first = defaults ? 1 : 0;
+            int chosen = found != values.end() ? first + std::stoi(found->second) : 0;
+            if (segmented("choice", labels, chosen)) {
+                if (defaults && chosen == 0)
+                    values.erase(option.key);
+                else
+                    values[option.key] = std::to_string(chosen - first);
+                changed = true;
+            }
+        } else if (option.kind == DebugOption::Kind::flag) {
             const bool on = found != values.end() && found->second == "true";
             if (defaults) {
                 // for all titles, on, or off

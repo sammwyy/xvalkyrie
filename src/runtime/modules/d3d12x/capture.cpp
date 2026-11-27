@@ -229,7 +229,49 @@ void save(ID3D12Resource *resource, D3D12_RESOURCE_STATES state, std::uint64_t f
 }
 } // namespace
 
-bool capturing() { return !wanted().empty() && wanted().count(frames_shown() + 1); }
+// XV_CAPTURE_AUTO=<draws>[,<frames>]: the frame after one with that many mesh draws (direct or
+// indirect) is captured, as many times as asked (once without), a frame apart at least: a
+// title's 3D shots, whose frame numbers differ from run to run.
+struct AutoCapture {
+    std::uint64_t draws = 0, left = 0;
+    std::atomic<std::uint64_t> meshes{0}, frame{~0ull};
+};
+AutoCapture &auto_capture() {
+    static AutoCapture state;
+    static const bool read = [] {
+        if (const auto *const text = std::getenv("XV_CAPTURE_AUTO")) {
+            char *end = nullptr;
+            state.draws = std::strtoull(text, &end, 10);
+            state.left = end && *end == ',' ? std::strtoull(end + 1, nullptr, 10) : 1;
+        }
+        return true;
+    }();
+    static_cast<void>(read);
+    return state;
+}
+void count_mesh_draw() {
+    if (auto_capture().draws)
+        ++auto_capture().meshes;
+}
+bool capturing() {
+    const auto next = frames_shown() + 1;
+    return (!wanted().empty() && wanted().count(next)) || auto_capture().frame == next;
+}
+// at each present: whether the next frame is one to capture
+void arm_auto_capture() {
+    auto &state = auto_capture();
+    if (!state.draws)
+        return;
+    const auto meshes = state.meshes.exchange(0);
+    if (state.left && meshes >= state.draws && state.frame != frames_shown() + 1) {
+        --state.left;
+        state.frame = frames_shown() + 2;
+        std::fprintf(stderr, "[Capture] %llu mesh draws in frame %llu: the next is captured\n",
+                     static_cast<unsigned long long>(meshes),
+                     static_cast<unsigned long long>(frames_shown() + 1));
+        std::fflush(stderr);
+    }
+}
 
 void capture_bound(ID3D12Resource *resource, bool depth) {
     if (!resource || !capturing())
@@ -252,7 +294,9 @@ void capture_draw(ID3D12Resource *target) {
 }
 
 void capture_frame(ID3D12Resource *picture) {
-    if (!capturing())
+    const bool now = capturing();
+    arm_auto_capture();
+    if (!now)
         return;
     const auto frame = frames_shown() + 1;
     std::vector<Captured> taken;

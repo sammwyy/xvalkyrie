@@ -13,7 +13,7 @@ namespace xv::ui {
 // page is an entry in `pages` (settings.cpp) and a function that draws it.
 class Settings {
   public:
-    enum class Page { input, graphics, profiles, console, libraries, debug, about };
+    enum class Page { input, graphics, render, game, profiles, console, libraries, debug, about };
     // What the settings need done by whoever owns the window. All of them are called
     // from draw().
     // what the about page shows of updates
@@ -64,7 +64,7 @@ class Settings {
     void new_profile(const Fonts &fonts, const Host &host, ConsoleSettings &settings);
     void console(const Fonts &fonts, const Host &host, ConsoleSettings &settings);
     void libraries(const Fonts &fonts, const Host &host, Library library);
-    void debug(const Fonts &fonts);
+    void options(const Fonts &fonts, OptionGroups groups, const char *intro);
     void about(const Fonts &fonts, const Host &host);
 
     bool open_ = false, raise_ = false;

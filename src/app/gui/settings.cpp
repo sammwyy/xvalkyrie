@@ -9,6 +9,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <exception>
+#include <string_view>
 
 namespace xv::ui {
 namespace {
@@ -18,6 +19,8 @@ struct PageEntry {
 };
 constexpr std::array pages{PageEntry{Settings::Page::input, "Input"},
                            PageEntry{Settings::Page::graphics, "Graphics"},
+                           PageEntry{Settings::Page::render, "Render"},
+                           PageEntry{Settings::Page::game, "Game"},
                            PageEntry{Settings::Page::profiles, "Profiles"},
                            PageEntry{Settings::Page::console, "Console"},
                            PageEntry{Settings::Page::libraries, "Library"},
@@ -191,8 +194,21 @@ void Settings::draw(const Fonts &fonts, const Host &host, Library library,
         case Page::libraries:
             libraries(fonts, host, library);
             break;
+        case Page::render:
+            options(fonts, {render_group},
+                    "How the titles are drawn: less detail for less of the GPU's memory. A "
+                    "title's properties can change these for that title alone.");
+            break;
+        case Page::game:
+            options(fonts, {game_group},
+                    "What the titles reach of the machine: sound, the network, and patches of "
+                    "their own code. A title's properties can change these for that title alone.");
+            break;
         case Page::debug:
-            debug(fonts);
+            options(fonts, {},
+                    "For finding out what a title needs and what it trips over. Some make "
+                    "titles slower or leave out what they draw. A title's properties can change "
+                    "them for that title alone.");
             break;
         case Page::about:
             about(fonts, host);
@@ -757,21 +773,30 @@ void Settings::libraries(const Fonts &fonts, const Host &host, Library library) 
     }
 }
 
-// What is left out or looked into in a run, for every title: the runtime's XV_* variables.
-// A title's own, in its properties, take the place of these; the environment's of both.
-void Settings::debug(const Fonts &fonts) {
+// The settings of the runtime's XV_* variables for every title, those of a page's groups: a
+// title's own, in its properties, take the place of these; the environment's of both.
+void Settings::options(const Fonts &fonts, OptionGroups groups, const char *intro) {
     if (!debug_loaded_) {
         debug_ = load_debug_settings();
         debug_fields_.clear();
         debug_loaded_ = true;
     }
-    note(fonts, "For finding out what a title needs and what it trips over. Some make titles "
-                "slower or leave out what they draw. A title's properties can change them for "
-                "that title alone.");
+    note(fonts, intro);
     ImGui::Dummy({0, 4});
+    // the settings of this page's groups, which Reset all puts back and the count counts
+    const auto here = [&](const DebugOption &option) {
+        return groups.only ? std::string_view(option.group) == groups.only
+                           : !user_group(option.group);
+    };
+    std::size_t set = 0;
+    for (const auto &option : debug_options())
+        set += here(option) && debug_.contains(option.key);
     if (ImGui::Button("Reset all")) {
-        debug_.clear();
-        debug_fields_.clear();
+        for (const auto &option : debug_options())
+            if (here(option)) {
+                debug_.erase(option.key);
+                debug_fields_.erase(option.key);
+            }
         try {
             save_debug_settings(debug_);
             debug_notice_.clear();
@@ -781,8 +806,8 @@ void Settings::debug(const Fonts &fonts) {
     }
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("%zu set", debug_.size());
-    if (debug_options_ui(fonts, debug_, debug_fields_)) {
+    ImGui::TextDisabled("%zu set", set);
+    if (debug_options_ui(fonts, debug_, debug_fields_, nullptr, groups)) {
         try {
             save_debug_settings(debug_);
             debug_notice_.clear();

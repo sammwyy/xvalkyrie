@@ -33,7 +33,7 @@ class Properties {
     void mapping() const;
     void libraries() const;
     void imports();
-    void debug(const Fonts &fonts);
+    void options(const Fonts &fonts, OptionGroups groups, const char *page);
     void shaders();
     void shader_details(const runtime::modules::JournalShader &shader);
     void save_title();

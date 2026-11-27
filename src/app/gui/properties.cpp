@@ -277,23 +277,38 @@ void Properties::save_title() {
     }
 }
 
-// The title's own debug settings, over those of Settings > Debug.
-void Properties::debug(const Fonts &fonts) {
-    note(fonts, "This title's own debug settings. Default is what Settings > Debug has for "
-                "every title. They apply from its next start.");
+// The title's own settings of a page's groups, over those of the same page of Settings.
+void Properties::options(const Fonts &fonts, OptionGroups groups, const char *page) {
+    note(fonts, (std::string("This title's own settings. Default is what Settings > ") + page +
+                 " has for every title. They apply from its next start.")
+                    .c_str());
     if (!notice_.empty())
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(color::scarlet), "%s", notice_.c_str());
     ImGui::Dummy({0, 4});
+    // the settings of this tab's groups, which All to default puts back and the count counts
+    const auto here = [&](const DebugOption &option) {
+        return groups.only ? std::string_view(option.group) == groups.only
+                           : !user_group(option.group);
+    };
+    std::size_t own = 0;
+    for (const auto &option : debug_options())
+        own += here(option) && title_.debug.contains(option.key);
     if (ImGui::Button("All to default")) {
-        title_.debug.clear();
-        fields_.clear();
+        for (const auto &option : debug_options())
+            if (here(option)) {
+                title_.debug.erase(option.key);
+                fields_.erase(option.key);
+            }
         save_title();
     }
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("%zu of its own, %zu shaders with a stand-in", title_.debug.size(),
-                        title_.stand_ins.size());
-    if (debug_options_ui(fonts, title_.debug, fields_, &all_))
+    if (groups.only)
+        ImGui::TextDisabled("%zu of its own", own);
+    else
+        ImGui::TextDisabled("%zu of its own, %zu shaders with a stand-in", own,
+                            title_.stand_ins.size());
+    if (debug_options_ui(fonts, title_.debug, fields_, &all_, groups))
         save_title();
     ImGui::Dummy({0, 4});
     const auto file = title_settings_file(path_).u8string();
@@ -567,6 +582,18 @@ void Properties::draw(const Fonts &fonts) {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+            // what is drawn and what the title reaches, for playing; then its make-up after
+            const struct {
+                const char *tab;
+                OptionGroups groups;
+            } pages[] = {{"Render", {render_group}}, {"Game", {game_group}}};
+            for (const auto &page : pages)
+                if (ImGui::BeginTabItem(page.tab)) {
+                    ImGui::BeginChild(page.tab);
+                    options(fonts, page.groups, page.tab);
+                    ImGui::EndChild();
+                    ImGui::EndTabItem();
+                }
             if (ImGui::BeginTabItem("Mapping")) {
                 mapping();
                 ImGui::EndTabItem();
@@ -580,8 +607,8 @@ void Properties::draw(const Fonts &fonts) {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Debug")) {
-                ImGui::BeginChild("debug");
-                debug(fonts);
+                ImGui::BeginChild("Debug");
+                options(fonts, {}, "Debug");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }

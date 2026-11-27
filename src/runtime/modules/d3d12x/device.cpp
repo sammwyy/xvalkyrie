@@ -2406,6 +2406,80 @@ D3D12_SHADER_RESOURCE_VIEW_DESC whole_shader_view(const D3D12_RESOURCE_DESC &of,
     return view;
 }
 template <class View> const View *null_view(View &view, const D3D12_RESOURCE_DESC *of);
+// XV_TEXTURE_LOD=<n> (the texture quality of the settings): a title's textures that only
+// shaders read are the host's without their first n levels, a quarter of the memory each level
+// left out. The title keeps them whole in its memory; what it gives as a level the host has
+// not is left out, and its views start at the first level there is. Only textures of more
+// than n levels whose sides stay a multiple of 4 texels (block formats') are made smaller.
+struct DroppedLevels {
+    UINT levels, title_mips;
+};
+std::mutex dropped_mutex;
+std::map<const void *, DroppedLevels> dropped_textures;
+UINT texture_lod() {
+    static const UINT levels = [] {
+        const auto *const text = std::getenv("XV_TEXTURE_LOD");
+        return text ? std::min<UINT>(static_cast<UINT>(std::atoi(text)), 3u) : 0u;
+    }();
+    return levels;
+}
+// the levels to leave out of a host's description, which is made smaller for them
+UINT drop_levels(D3D12_RESOURCE_DESC &host) {
+    const auto levels = texture_lod();
+    if (!levels || host.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        host.SampleDesc.Count > 1 || host.Width % (4u << levels) || host.Height % (4u << levels))
+        return 0;
+    UINT mips = host.MipLevels;
+    if (!mips)
+        mips = std::bit_width(std::max<UINT64>(host.Width, host.Height));
+    if (mips <= levels)
+        return 0;
+    host.Width >>= levels;
+    host.Height >>= levels;
+    host.MipLevels = static_cast<UINT16>(mips - levels);
+    return levels;
+}
+void note_dropped(void *resource, UINT levels, UINT title_mips) {
+    if (!levels)
+        return;
+    if (ID3DDestructionNotifier *notifier = nullptr;
+        SUCCEEDED(static_cast<IUnknown *>(resource)->QueryInterface(IID_PPV_ARGS(&notifier)))) {
+        UINT id = 0;
+        notifier->RegisterDestructionCallback(
+            [](void *gone) {
+                const std::lock_guard lock(dropped_mutex);
+                dropped_textures.erase(gone);
+            },
+            resource, &id);
+        notifier->Release();
+    }
+    const std::lock_guard lock(dropped_mutex);
+    dropped_textures[resource] = {levels, title_mips};
+    if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+        std::fprintf(stderr,
+                     "[Runtime] textures the title streams in are kept without their first %u "
+                     "levels (the texture quality setting)\n",
+                     levels);
+        std::fflush(stderr);
+    }
+}
+DroppedLevels dropped_of(const void *resource) {
+    const std::lock_guard lock(dropped_mutex);
+    const auto found = dropped_textures.find(resource);
+    return found == dropped_textures.end() ? DroppedLevels{} : found->second;
+}
+// the host's subresource of a title's, or no_subresource for a level the host has not (not
+// ~0u, which is all of them in a barrier)
+constexpr UINT no_subresource = 0xfffffffeu;
+UINT host_subresource(const void *resource, UINT index) {
+    const auto dropped = dropped_of(resource);
+    if (!dropped.levels || index == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+        return index;
+    const UINT mip = index % dropped.title_mips, rest = index / dropped.title_mips;
+    return mip < dropped.levels
+               ? no_subresource
+               : rest * (dropped.title_mips - dropped.levels) + mip - dropped.levels;
+}
 void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, const void *desc,
                                   Handle handle) {
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -2451,6 +2525,32 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
     } else if (resource && of.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
                typed_format(of.Format) != of.Format) {
         view = whole_shader_view(of, typed_format(of.Format));
+        desc = &view;
+    }
+    // a texture without its first levels (texture_lod): the view from the first there is
+    if (const auto dropped = resource && desc ? dropped_of(resource) : DroppedLevels{};
+        dropped.levels) {
+        if (desc != &view)
+            std::memcpy(&view, desc, sizeof view);
+        const auto fit = [&](UINT &first, UINT &count, FLOAT &clamp) {
+            const UINT skipped = first < dropped.levels ? dropped.levels - first : 0;
+            first = first > dropped.levels ? first - dropped.levels : 0;
+            if (count != ~0u)
+                count = count > skipped ? count - skipped : 1;
+            clamp = std::max(0.f, clamp - static_cast<FLOAT>(dropped.levels));
+        };
+        if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+            fit(view.Texture2D.MostDetailedMip, view.Texture2D.MipLevels,
+                view.Texture2D.ResourceMinLODClamp);
+        else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+            fit(view.Texture2DArray.MostDetailedMip, view.Texture2DArray.MipLevels,
+                view.Texture2DArray.ResourceMinLODClamp);
+        else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+            fit(view.TextureCube.MostDetailedMip, view.TextureCube.MipLevels,
+                view.TextureCube.ResourceMinLODClamp);
+        else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)
+            fit(view.TextureCubeArray.MostDetailedMip, view.TextureCubeArray.MipLevels,
+                view.TextureCubeArray.ResourceMinLODClamp);
         desc = &view;
     }
     // The console views a multisampled texture as a plain one and a typeless one without a
@@ -3095,6 +3195,9 @@ HRESULT unbacked_texture(ID3D12Device *self, std::uint64_t address, const D3D12_
     auto host = host_resource_desc(self, *desc);
     host.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
     host.Alignment = 0;
+    const UINT title_mips =
+        host.MipLevels ? host.MipLevels : std::bit_width(std::max<UINT64>(host.Width, host.Height));
+    const auto dropped = drop_levels(host);
     using Create =
         HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
                                      const D3D12_CLEAR_VALUE *, REFIID, void **);
@@ -3102,6 +3205,7 @@ HRESULT unbacked_texture(ID3D12Device *self, std::uint64_t address, const D3D12_
         original<Create>(self, 30)(self, &host, host_state(state), nullptr, iid, resource);
     if (FAILED(result))
         return result;
+    note_dropped(*resource, dropped, title_mips);
     // its address is where it was placed, as a committed one's
     console_resource(*resource);
     mappable_resource(*resource);
@@ -5366,6 +5470,13 @@ void STDMETHODCALLTYPE resource_barrier(void *self, UINT count,
                     if (*state & D3D12_RESOURCE_STATE_DEPTH_WRITE)
                         *state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
                 }
+            // a level the host has not (texture_lod) is a transition of nothing, left out below
+            if (const auto sub =
+                    host_subresource(barrier.Transition.pResource, barrier.Transition.Subresource);
+                sub == no_subresource)
+                barrier.Transition.StateAfter = barrier.Transition.StateBefore;
+            else
+                barrier.Transition.Subresource = sub;
             if (barrier.Transition.StateAfter & D3D12_RESOURCE_STATE_RENDER_TARGET ||
                 barrier.Transition.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) {
                 const std::lock_guard lock(state_mutex);
@@ -5445,10 +5556,14 @@ constexpr auto known_access = static_cast<D3D12_BARRIER_ACCESS>(0x807fffff);
 // index already (all of them at 0xffffffff, as in a legacy barrier).
 std::vector<UINT> range_subresources(ID3D12Resource *resource,
                                      const D3D12_BARRIER_SUBRESOURCE_RANGE &range) {
-    if (!range.NumMipLevels)
-        return {range.IndexOrFirstMipLevel};
+    const auto dropped = dropped_of(resource);
+    if (!range.NumMipLevels) {
+        const auto sub = host_subresource(resource, range.IndexOrFirstMipLevel);
+        return sub == no_subresource ? std::vector<UINT>{} : std::vector<UINT>{sub};
+    }
     const auto desc = resource->GetDesc();
-    const UINT mips = std::max<UINT>(desc.MipLevels, 1);
+    // in the title's levels, which a texture without its first levels has more of
+    const UINT mips = dropped.levels ? dropped.title_mips : std::max<UINT>(desc.MipLevels, 1);
     const UINT slices = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
                             ? 1
                             : std::max<UINT>(desc.DepthOrArraySize, 1);
@@ -5472,7 +5587,10 @@ std::vector<UINT> range_subresources(ID3D12Resource *resource,
     for (UINT plane = range.FirstPlane; plane < plane_end; ++plane)
         for (UINT slice = range.FirstArraySlice; slice < slice_end; ++slice)
             for (UINT mip = range.IndexOrFirstMipLevel; mip < mip_end; ++mip)
-                indices.push_back(mip + (slice + plane * slices) * mips);
+                if (const auto sub =
+                        host_subresource(resource, mip + (slice + plane * slices) * mips);
+                    sub != no_subresource)
+                    indices.push_back(sub);
     return indices;
 }
 void STDMETHODCALLTYPE enhanced_barriers(void *self, UINT32 count,
@@ -5719,6 +5837,19 @@ void STDMETHODCALLTYPE copy_texture_region(void *self, const D3D12_TEXTURE_COPY_
                                            const D3D12_BOX *box) {
     if (foreign_footprint(target, source) || foreign_footprint(source, target))
         return;
+    // a texture without its first levels (texture_lod): the host's level of the title's, and
+    // no copy into or out of a level it has not
+    D3D12_TEXTURE_COPY_LOCATION ends[2];
+    for (auto *const end : {&target, &source})
+        if (*end && (*end)->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+            dropped_of((*end)->pResource).levels) {
+            auto &copy = ends[end == &target ? 0 : 1];
+            copy = **end;
+            copy.SubresourceIndex = host_subresource(copy.pResource, copy.SubresourceIndex);
+            if (copy.SubresourceIndex == no_subresource)
+                return;
+            *end = &copy;
+        }
     auto *const host = host_of(self);
     if (!x && !y && !z && copy_feedback_map(host, target, source))
         return;
@@ -7461,6 +7592,8 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
     if (list->no_pipeline || skipped_work('i'))
         return;
     const auto kinds = argument_kinds(signature);
+    if (kinds & 1u << D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)
+        count_mesh_draw();
     if (capturing()) // XV_CAPTURE: as many records as at most, of the kinds in the signature
         std::fprintf(
             stderr, "[Capture] ExecuteIndirect %u records of kinds 0x%x, pipeline %p, target %p\n",
@@ -7550,6 +7683,7 @@ void STDMETHODCALLTYPE dispatch_mesh(void *self, UINT x, UINT y, UINT z) {
     if (FAILED(host_of(self)->QueryInterface(IID_PPV_ARGS(&host))))
         return;
     count_draw(self);
+    count_mesh_draw();
     capture_call(self, "DispatchMesh", x * y * z, 1, 0, 0);
     prepare_draw(static_cast<ListProxy *>(self));
     host->DispatchMesh(x, y, z);
@@ -7902,10 +8036,25 @@ void STDMETHODCALLTYPE dma_copy_texture(void *self, const D3D12_TEXTURE_COPY_LOC
                                         UINT x, UINT y, UINT z,
                                         const D3D12_TEXTURE_COPY_LOCATION *source,
                                         const D3D12_BOX *box) {
+    // as copy_texture_region, for a texture without its first levels
+    D3D12_TEXTURE_COPY_LOCATION ends[2];
+    for (auto *const end : {&target, &source})
+        if (*end && (*end)->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+            dropped_of((*end)->pResource).levels) {
+            auto &copy = ends[end == &target ? 0 : 1];
+            copy = **end;
+            copy.SubresourceIndex = host_subresource(copy.pResource, copy.SubresourceIndex);
+            if (copy.SubresourceIndex == no_subresource)
+                return;
+            *end = &copy;
+        }
     host_of(self)->CopyTextureRegion(target, x, y, z, source, box);
 }
 void STDMETHODCALLTYPE dma_copy_resource(void *self, ID3D12Resource *target,
                                          ID3D12Resource *source) {
+    // the host copies only between textures of one size
+    if (dropped_of(target).levels != dropped_of(source).levels)
+        return;
     host_of(self)->CopyResource(target, source);
 }
 // the copy engine's memory methods are the list's: done when the list is run
@@ -8149,9 +8298,15 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
     for (auto &upload : uploads) {
         const auto desc = upload.resource->GetDesc();
         UINT64 bytes = 0;
+        // as many of the host's subresources as it has, fewer than the title's for a texture
+        // without its first levels
+        const UINT host_count =
+            std::max<UINT>(desc.MipLevels, 1) *
+            (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1u : desc.DepthOrArraySize);
         if (convertible(upload, desc))
-            device->GetCopyableFootprints(&desc, 0, static_cast<UINT>(upload.subresources.size()),
-                                          0, nullptr, nullptr, nullptr, &bytes);
+            device->GetCopyableFootprints(
+                &desc, 0, std::min(static_cast<UINT>(upload.subresources.size()), host_count), 0,
+                nullptr, nullptr, nullptr, &bytes);
         total += aligned(bytes);
     }
     if (total > turn.size) {
@@ -8197,7 +8352,25 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
             upload.resource->Release();
             continue;
         }
-        const auto count = static_cast<UINT>(upload.subresources.size());
+        // the title's subresource each of the host's is, the same but for a texture that has
+        // not its first levels (texture_lod)
+        std::vector<UINT> title_of;
+        if (const auto dropped = dropped_of(upload.resource); dropped.levels) {
+            const UINT host_mips = dropped.title_mips - dropped.levels;
+            for (UINT title = 0; title < upload.subresources.size(); ++title)
+                if (title % dropped.title_mips >= dropped.levels)
+                    title_of.push_back(title);
+            if (title_of.size() % host_mips)
+                title_of.clear();
+        } else {
+            for (UINT title = 0; title < upload.subresources.size(); ++title)
+                title_of.push_back(title);
+        }
+        const auto count = static_cast<UINT>(title_of.size());
+        if (!count) {
+            upload.resource->Release();
+            continue;
+        }
         back_texture(queue, device, upload.resource);
         what += " [dimension " + std::to_string(desc.Dimension) + " " + std::to_string(desc.Width) +
                 "x" + std::to_string(desc.Height) + "x" + std::to_string(desc.DepthOrArraySize) +
@@ -8223,8 +8396,8 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
         auto *const mapped = turn.mapped;
         {
             for (UINT i = 0; i < count; ++i) {
-                const auto &source = upload.subresources[i];
-                const auto pitch = upload.pitches[i];
+                const auto &source = upload.subresources[title_of[i]];
+                const auto pitch = upload.pitches[title_of[i]];
                 // each slice of a volume after the one before it, in both
                 const auto plane = std::size_t{pitch} * rows[i];
                 for (UINT slice = 0; slice < footprints[i].Footprint.Depth; ++slice)

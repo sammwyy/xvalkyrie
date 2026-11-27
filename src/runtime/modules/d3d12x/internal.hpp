@@ -16,6 +16,8 @@ bool capturing();
 void capture_bound(ID3D12Resource *resource, bool depth);
 void capture_draw(ID3D12Resource *target);
 void capture_frame(ID3D12Resource *picture);
+// a mesh draw, direct or indirect, for XV_CAPTURE_AUTO
+void count_mesh_draw();
 // the textures the title writes through memory of ours (scratch_memory), a reference each
 std::vector<ID3D12Resource *> written_textures();
 // ID3D12CommandQueue::PresentX on the host's queue
