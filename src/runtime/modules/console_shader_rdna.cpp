@@ -969,7 +969,8 @@ class Translator {
                     (ins.format == F::sop2 && mask((ins.w0 >> 8) & 0xff)))
                     wave64_ = true;
             }
-            if (ins.format == F::ds && ins.name != "ds_swizzle_b32" && ins.name != "ds_nop")
+            if (ins.format == F::ds && ins.name != "ds_swizzle_b32" &&
+                ins.name != "ds_bpermute_b32" && ins.name != "ds_nop")
                 uses_shared_ = true;
             if (stage_ == Stage::compute &&
                 (ins.form == Ins::Form::lanes || starts(ins.name, "v_permlane")))
@@ -2372,7 +2373,7 @@ class Translator {
         const char letter = "tubs"[resource.type];
         if (resource.loaded) {
             const auto [known, added] = facts_.types.emplace(resource.origin, type);
-            if (!added && known->second != type && resource.dynamic < 0)
+            if (!added && known->second != type && resource.dynamic < 0 && !resource.heap)
                 throw Unsupported{"a descriptor as " + known->second + " and as " + type, ~0u,
                                   true};
         }
@@ -2387,12 +2388,22 @@ class Translator {
         }
         if (resource.heap && heap_parameter_.count(resource.parameter)) {
             // a descriptor of a heap itself at a place known now
-            const auto name = std::string("hh") + letter + std::to_string(resource.reg);
+            auto name = std::string("hh") + letter + std::to_string(resource.reg);
             const auto found = declared_.find(name);
             if (found != declared_.end()) {
-                if (found->second != type)
-                    throw Unsupported{name + " as " + found->second + " and as " + type, ~0u, true};
-                return name;
+                if (found->second == type)
+                    return name;
+                const auto alt_key = name + "@" + type;
+                if (const auto alt = declared_.find(alt_key); alt != declared_.end())
+                    return alt->second;
+                const auto alt_name = name + "_" + std::to_string(temporaries_++);
+                declared_[alt_key] = alt_name;
+                uses_heap_ = needs_sm6_ = true;
+                prologue_ +=
+                    "    " + type + " " + alt_name + " = " +
+                    (resource.type == 3 ? "SamplerDescriptorHeap[" : "ResourceDescriptorHeap[") +
+                    std::to_string(resource.reg) + "u];\n";
+                return alt_name;
             }
             declared_[name] = type;
             uses_heap_ = needs_sm6_ = true;
@@ -2404,13 +2415,21 @@ class Translator {
         }
         if (resource.heap) {
             const auto slot = table_register_[resource.parameter] - user_first();
-            const auto name = std::string("h") + letter + std::to_string(slot) + "_" +
-                              std::to_string(resource.reg);
+            auto name = std::string("h") + letter + std::to_string(slot) + "_" +
+                        std::to_string(resource.reg);
             const auto found = declared_.find(name);
             if (found != declared_.end()) {
-                if (found->second != type)
-                    throw Unsupported{name + " as " + found->second + " and as " + type, ~0u, true};
-                return name;
+                if (found->second == type)
+                    return name;
+                const auto alt_key = name + "@" + type;
+                if (const auto alt = declared_.find(alt_key); alt != declared_.end())
+                    return alt->second;
+                const auto alt_name = name + "_" + std::to_string(temporaries_++);
+                declared_[alt_key] = alt_name;
+                uses_heap_ = needs_sm6_ = true;
+                prologue_ += "    " + type + " " + alt_name + " = ResourceDescriptorHeap[xv_ud" +
+                             std::to_string(slot) + " + " + std::to_string(resource.reg) + "u];\n";
+                return alt_name;
             }
             declared_[name] = type;
             uses_heap_ = needs_sm6_ = true;
@@ -2915,7 +2934,9 @@ class Translator {
     void emit_lanes(const Ins &ins) {
         const auto name = ins.name;
         const bool known = name == "v_mov_b32" || name == "v_add_nc_u32" || name == "v_or_b32" ||
-                           name == "v_xor_b32" || name == "v_max_u32";
+                           name == "v_xor_b32" || name == "v_max_u32" || name == "v_min_u32" ||
+                           name == "v_max_i32" || name == "v_min_i32" || name == "v_max_f32" ||
+                           name == "v_min_f32" || name == "v_add_f32" || name == "v_and_b32";
         if (stage_ != Stage::compute || !known)
             give_up("an instruction that reads another lane");
         const auto destination = (ins.w0 >> 17) & 0xff, modifier = ins.modifier;
@@ -2943,11 +2964,20 @@ class Translator {
         }
         if (!enabled || (!own && !there && !bound))
             return;
-        const auto a = own ? v(modifier & 0xff) : std::string("0u");
-        if (name == "v_mov_b32")
-            set_v(destination, a);
-        else
-            set_v(destination, binary(name, a, v((ins.w0 >> 9) & 0xff), v(destination)));
+        const bool zero_identity = name == "v_mov_b32" || name == "v_add_nc_u32" ||
+                                   name == "v_or_b32" || name == "v_xor_b32" ||
+                                   name == "v_max_u32" || name == "v_add_f32";
+        if (!own && !zero_identity) {
+            // In a single-lane wave, combining with an inactive lane leaves this lane's value
+            // unchanged (identity for min/max_i32/max_f32/and).
+            set_v(destination, v((ins.w0 >> 9) & 0xff));
+        } else {
+            const auto a = own ? v(modifier & 0xff) : std::string("0u");
+            if (name == "v_mov_b32")
+                set_v(destination, a);
+            else
+                set_v(destination, binary(name, a, v((ins.w0 >> 9) & 0xff), v(destination)));
+        }
     }
     // The wave operation an instruction that reduces a register over its lanes stands for, as
     // HLSL has it with the type it is of, if it is one.
@@ -3332,6 +3362,14 @@ class Translator {
         // a swizzle has no data operand: the value it moves is in its address field (LLVM's
         // AMDGPU DS_1A_RET form)
         const auto source = ins.w1 & 0xff, destination = ins.w1 >> 24;
+        if (name == "ds_bpermute_b32") {
+            const auto data0 = (ins.w1 >> 8) & 0xff;
+            needs_sm6_ = true;
+            set_v(destination, "WaveReadLaneAt(" + v(data0) + ", ((" + v(source) + " + " +
+                                   std::to_string(offset) +
+                                   "u) >> 2) & (WaveGetLaneCount() - 1u))");
+            return;
+        }
         if (name != "ds_swizzle_b32") {
             emit_group_memory(ins);
             return;
