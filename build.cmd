@@ -1,5 +1,7 @@
 @echo off
 setlocal
+rem the script's folder, before shift moves %0 to the arguments
+set "ROOT=%~dp0"
 set "CONFIG=Release"
 set "RUN_TESTS=0"
 set "VULKAN=OFF"
@@ -55,7 +57,7 @@ echo Usage: build.cmd [Debug^|Release] [--test] [--vulkan] [--reconfigure] [--ta
 exit /b 0
 
 :build
-pushd "%~dp0"
+pushd "%ROOT%"
 if errorlevel 1 exit /b 1
 set "CACHE=build\win\CMakeCache.txt"
 if not exist "%CACHE%" set "RECONFIGURE=1"
