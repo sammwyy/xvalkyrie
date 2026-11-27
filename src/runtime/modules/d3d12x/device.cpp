@@ -1743,8 +1743,12 @@ struct TableRange {
 };
 std::mutex signature_mutex;
 std::map<const void *, std::vector<std::vector<TableRange>>> tables_of; // per parameter
-std::map<const void *, std::string> signature_text;         // XV_D3D_LOST: its parameters, in words
-std::map<const void *, std::vector<bool>> table_parameters; // which parameters are tables
+std::map<const void *, std::string> signature_text; // XV_D3D_LOST: its parameters, in words
+struct RootParameter {
+    D3D12_ROOT_PARAMETER_TYPE type;
+    UINT constants; // how many words, for constants
+};
+std::map<const void *, std::vector<RootParameter>> root_parameters;
 void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
     using Create = HRESULT(WINAPI *)(const void *, SIZE_T, REFIID, void **);
     static const auto create = host_d3d12<Create>("D3D12CreateVersionedRootSignatureDeserializer");
@@ -1799,23 +1803,43 @@ void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
                     std::to_string(parameter.Descriptor.Flags);
         text += " visibility " + std::to_string(parameter.ShaderVisibility);
     }
-    std::vector<bool> is_table(desc->Desc_1_1.NumParameters);
-    for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i)
-        is_table[i] = desc->Desc_1_1.pParameters[i].ParameterType ==
-                      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    std::vector<RootParameter> parameters(desc->Desc_1_1.NumParameters);
+    for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+        const auto &parameter = desc->Desc_1_1.pParameters[i];
+        parameters[i] = {parameter.ParameterType,
+                         parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
+                             ? parameter.Constants.Num32BitValues
+                             : 0};
+    }
     reader->Release();
     const std::lock_guard lock(signature_mutex);
     signature_text[signature] = std::move(text);
     tables_of[signature] = std::move(tables);
-    table_parameters[signature] = std::move(is_table);
+    root_parameters[signature] = std::move(parameters);
 }
 // Whether a root signature has a table at a parameter, as far as it is known: the host's
 // driver faults when a list is given a table for a parameter that is not one.
 bool table_parameter(const void *signature, UINT parameter) {
     const std::lock_guard lock(signature_mutex);
-    const auto found = table_parameters.find(signature);
-    return found == table_parameters.end() ||
-           (parameter < found->second.size() && found->second[parameter]);
+    const auto found = root_parameters.find(signature);
+    return found == root_parameters.end() ||
+           (parameter < found->second.size() &&
+            found->second[parameter].type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE);
+}
+// How many of a parameter's root constants there are from `offset` on (all asked for if the
+// signature is not known, none if the parameter holds no constants). The host's driver does
+// not check: words past the parameter's go over the next parameter's, which may be a root
+// view's address.
+UINT constants_room(const void *signature, UINT parameter, UINT offset, UINT count) {
+    const std::lock_guard lock(signature_mutex);
+    const auto found = root_parameters.find(signature);
+    if (found == root_parameters.end())
+        return count;
+    if (parameter >= found->second.size() ||
+        found->second[parameter].type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+        offset >= found->second[parameter].constants)
+        return 0;
+    return std::min(count, found->second[parameter].constants - offset);
 }
 
 UINT element_bytes(DXGI_FORMAT format);
@@ -5954,33 +5978,56 @@ void keep_constants(ListProxy *list, bool compute, UINT parameter, UINT count, c
         std::memcpy(argument.words.data() + offset, data, 4 * std::size_t{count});
     }
 }
+// The title's root constants to the host's list under the title's signature, as many as the
+// parameter has room for: a title may give more words than a parameter has, which the host's
+// driver writes over the next parameter's.
+void host_constants(ListProxy *list, bool compute, UINT parameter, UINT count, const void *data,
+                    UINT offset, void *from) {
+    const auto room = constants_room(compute ? list->compute_root : list->graphics_root, parameter,
+                                     offset, count);
+    if (room < count)
+        if (static std::atomic<int> told{0}; told++ < 4) {
+            std::fprintf(stderr,
+                         "[Runtime] %u root constants from %u for %s parameter %u, which has room "
+                         "for %u of them, from %s: the rest are left out\n",
+                         count, offset, compute ? "compute" : "graphics", parameter, room,
+                         detail::guest_location(from).c_str());
+            std::fflush(stderr);
+        }
+    if (!room)
+        return;
+    if (compute)
+        list->host->SetComputeRoot32BitConstants(parameter, room, data, offset);
+    else
+        list->host->SetGraphicsRoot32BitConstants(parameter, room, data, offset);
+}
 void STDMETHODCALLTYPE set_graphics_root_constant(void *self, UINT parameter, UINT value,
                                                   UINT offset) {
     auto *const list = static_cast<ListProxy *>(self);
     keep_constants(list, false, parameter, 1, &value, offset);
     if (!list->ours_bound)
-        host_of(self)->SetGraphicsRoot32BitConstant(parameter, value, offset);
+        host_constants(list, false, parameter, 1, &value, offset, _ReturnAddress());
 }
 void STDMETHODCALLTYPE set_graphics_root_constants(void *self, UINT parameter, UINT count,
                                                    const void *data, UINT offset) {
     auto *const list = static_cast<ListProxy *>(self);
     keep_constants(list, false, parameter, count, data, offset);
     if (!list->ours_bound)
-        host_of(self)->SetGraphicsRoot32BitConstants(parameter, count, data, offset);
+        host_constants(list, false, parameter, count, data, offset, _ReturnAddress());
 }
 void STDMETHODCALLTYPE set_compute_root_constant(void *self, UINT parameter, UINT value,
                                                  UINT offset) {
     auto *const list = static_cast<ListProxy *>(self);
     keep_constants(list, true, parameter, 1, &value, offset);
     if (!list->compute_ours_bound)
-        host_of(self)->SetComputeRoot32BitConstant(parameter, value, offset);
+        host_constants(list, true, parameter, 1, &value, offset, _ReturnAddress());
 }
 void STDMETHODCALLTYPE set_compute_root_constants(void *self, UINT parameter, UINT count,
                                                   const void *data, UINT offset) {
     auto *const list = static_cast<ListProxy *>(self);
     keep_constants(list, true, parameter, count, data, offset);
     if (!list->compute_ours_bound)
-        host_of(self)->SetComputeRoot32BitConstants(parameter, count, data, offset);
+        host_constants(list, true, parameter, count, data, offset, _ReturnAddress());
 }
 void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64_t address);
 void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64_t address);
@@ -6068,6 +6115,27 @@ void fill_user(ListProxy *list, const HeapUses::Stage &stage,
             }
     }
 }
+// The title's compute signature and what it set under it back on the host's list
+void title_compute_back(ListProxy *list) {
+    list->compute_ours_bound = false;
+    list->host->SetComputeRootSignature(const_cast<ID3D12RootSignature *>(
+        static_cast<const ID3D12RootSignature *>(list->compute_root)));
+    const auto arguments = list->compute_arguments;
+    for (UINT parameter = 0; parameter < arguments.size(); ++parameter) {
+        const auto &argument = arguments[parameter];
+        if (argument.kind == 1)
+            set_compute_root_table(list, parameter, {argument.value});
+        else if (argument.kind == 2)
+            set_compute_root_cbv(list, parameter, argument.value);
+        else if (argument.kind == 3)
+            set_compute_root_srv(list, parameter, argument.value);
+        else if (argument.kind == 4)
+            set_compute_root_uav(list, parameter, argument.value);
+        else if (argument.kind == 5 && !argument.words.empty())
+            host_constants(list, true, parameter, static_cast<UINT>(argument.words.size()),
+                           argument.words.data(), 0, _ReturnAddress());
+    }
+}
 // Before a dispatch, as prepare_draw before a draw: a compute pipeline that reads the heaps
 // itself gets heap_signature and its user registers (from s0) in the first root constants;
 // any other gets the title's signature and arguments back if ours was on.
@@ -6075,26 +6143,8 @@ void prepare_dispatch(ListProxy *list) {
     const CopyingFor copying(list);
     const bool ours = list->heap_uses && list->heap_uses->compute;
     if (!ours) {
-        if (!list->compute_ours_bound)
-            return;
-        list->compute_ours_bound = false;
-        list->host->SetComputeRootSignature(const_cast<ID3D12RootSignature *>(
-            static_cast<const ID3D12RootSignature *>(list->compute_root)));
-        const auto arguments = list->compute_arguments;
-        for (UINT parameter = 0; parameter < arguments.size(); ++parameter) {
-            const auto &argument = arguments[parameter];
-            if (argument.kind == 1)
-                set_compute_root_table(list, parameter, {argument.value});
-            else if (argument.kind == 2)
-                set_compute_root_cbv(list, parameter, argument.value);
-            else if (argument.kind == 3)
-                set_compute_root_srv(list, parameter, argument.value);
-            else if (argument.kind == 4)
-                set_compute_root_uav(list, parameter, argument.value);
-            else if (argument.kind == 5 && !argument.words.empty())
-                list->host->SetComputeRoot32BitConstants(
-                    parameter, static_cast<UINT>(argument.words.size()), argument.words.data(), 0);
-        }
+        if (list->compute_ours_bound)
+            title_compute_back(list);
         return;
     }
     auto *const signature = heap_signature(d3d12_device.load());
@@ -6142,8 +6192,8 @@ void prepare_draw(ListProxy *list) {
             else if (argument.kind == 4)
                 set_graphics_root_uav(list, parameter, argument.value);
             else if (argument.kind == 5 && !argument.words.empty())
-                list->host->SetGraphicsRoot32BitConstants(
-                    parameter, static_cast<UINT>(argument.words.size()), argument.words.data(), 0);
+                host_constants(list, false, parameter, static_cast<UINT>(argument.words.size()),
+                               argument.words.data(), 0, _ReturnAddress());
         }
         return;
     }
@@ -7365,12 +7415,12 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
             // the title's compute state back, as it was before ours
             if (list->pipeline)
                 host->SetPipelineState(list->pipeline);
-            if (list->compute_ours_bound) {
+            // ours is under the host's list's compute signature now: the one that was there
+            // goes back, with what was set under it (prepare_dispatch fills ours again)
+            if (list->compute_ours_bound)
                 host->SetComputeRootSignature(heap_signature(d3d12_device.load()));
-                list->compute_ours_bound = false;
-            } else if (list->compute_root) {
-                list->compute_ours_bound = true;
-            }
+            else if (list->compute_root)
+                title_compute_back(list);
             prepare_dispatch(list);
             if (kinds & (1u << D3D12_INDIRECT_ARGUMENT_TYPE_DRAW |
                          1u << D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED |
@@ -10106,9 +10156,21 @@ void report_failure() {
     ID3D12DeviceRemovedExtendedData *dred = nullptr;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))))
         return;
-    if (D3D12_DRED_PAGE_FAULT_OUTPUT fault{}; SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)))
+    if (D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+        SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault))) {
         std::fprintf(stderr, "[Runtime] GPU page fault at 0x%llx\n",
                      static_cast<unsigned long long>(fault.PageFaultVA));
+        // the objects that held that address, alive and just let go of: a list that reads
+        // what was freed under it is told from one that reads where nothing ever was
+        const auto list = [](const char *what, const D3D12_DRED_ALLOCATION_NODE *node) {
+            for (int n = 0; node && n < 8; node = node->pNext, ++n)
+                std::fprintf(stderr, "[Runtime] %s there: type %d %ls\n", what,
+                             static_cast<int>(node->AllocationType),
+                             node->ObjectNameW ? node->ObjectNameW : L"");
+        };
+        list("alive", fault.pHeadExistingAllocationNode);
+        list("let go of", fault.pHeadRecentFreedAllocationNode);
+    }
     if (D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs{};
         SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs)))
         for (auto *node = crumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
