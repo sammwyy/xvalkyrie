@@ -2468,6 +2468,9 @@ DroppedLevels dropped_of(const void *resource) {
     const auto found = dropped_textures.find(resource);
     return found == dropped_textures.end() ? DroppedLevels{} : found->second;
 }
+// set while create_placed_resource_x makes a texture only shaders read with
+// create_committed_resource, which then leaves its first levels out
+thread_local bool placed_for_reading = false;
 // the host's subresource of a title's, or no_subresource for a level the host has not (not
 // ~0u, which is all of them in a barrier)
 constexpr UINT no_subresource = 0xfffffffeu;
@@ -3318,9 +3321,18 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
     }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     auto result = unbacked_texture(self, address, desc, state, iid, resource);
-    if (FAILED(result))
+    if (FAILED(result)) {
+        // one only shaders read, which the title fills in its memory, is made as the texture
+        // quality setting has it
+        placed_for_reading = desc && address &&
+                             desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                             !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
         result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state, clear,
                                            iid, resource);
+        placed_for_reading = false;
+    }
     if (SUCCEEDED(result) && resource && *resource && desc && address &&
         desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         note_placed_texture(static_cast<ID3D12Resource *>(*resource), address, *desc);
@@ -4995,6 +5007,15 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
         host_rules(heap, host_desc.Flags, state);
         host_resource_format(self, host_desc);
     }
+    // a texture the title fills in its memory (see create_placed_resource_x), which shaders
+    // only read: as the texture quality setting has it
+    UINT title_mips = 0, dropped = 0;
+    if (placed_for_reading && desc && heap && heap->Type == D3D12_HEAP_TYPE_DEFAULT) {
+        title_mips = host_desc.MipLevels
+                         ? host_desc.MipLevels
+                         : std::bit_width(std::max<UINT64>(host_desc.Width, host_desc.Height));
+        dropped = drop_levels(host_desc);
+    }
     D3D12_CLEAR_VALUE cleared{}, cleared_host{};
     clear = host_clear_value(self, host_clear(clear, cleared), host_desc.Flags, cleared_host);
     // All of the console's memory is the CPU's as well: a title maps a buffer of the default
@@ -5024,6 +5045,7 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
             original<Create>(self, 27)(self, heap, flags, &host_desc, state, clear, iid, resource);
     }
     if (SUCCEEDED(result) && resource && *resource) {
+        note_dropped(*resource, dropped, title_mips);
         console_resource(*resource);
         track_buffer(static_cast<ID3D12Resource *>(*resource), console == Target::scarlett);
         if (console == Target::scarlett)
