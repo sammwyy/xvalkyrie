@@ -245,10 +245,6 @@ constexpr Row rows[] = {
      guid("b4f23a93-7fc6-4a50-b153-950016389e50"),
      9,
      {Inert::shared_list, L"Windows.Xbox.System.User"}},
-    {L"Windows.Xbox.Networking.SecureDeviceAssociationTemplate",
-     guid("46745a18-697a-47e1-bb62-cc71de0fdd8c"),
-     6,
-     {Inert::lookup, L"Windows.Xbox.Networking.SecureDeviceAssociationTemplate"}},
     {L"Windows.Xbox.System.User",
      guid("b4f23a93-7fc6-4a50-b153-950016389e50"),
      18,
@@ -834,8 +830,6 @@ constexpr Row rows[] = {
     {speech_recognizer, direct, 29, {Inert::event_add}},
     {speech_recognizer, direct, 31, {Inert::event_add}},
     {transport, game_transport_controls, 26, {Inert::accept}}, // button pressed, removed
-    // ISecureDeviceAssociationTemplateStatics::Templates: none
-    {association_template, guid("46745a18-697a-47e1-bb62-cc71de0fdd8c"), 7, {Inert::empty_list}},
     // IUserStatics::GetUserById(id, User **): the one user there is
     {user, user_statics, 14, {Inert::shared2, user}},
     // KinectSensor's method 9, by a title's call of it (image+0x9fd9d4): no argument, and
