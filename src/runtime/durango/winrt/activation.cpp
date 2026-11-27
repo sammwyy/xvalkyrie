@@ -5,6 +5,7 @@
 
 #include "runtime/durango/winrt/application.hpp"
 #include "runtime/durango/winrt/gamepad.hpp"
+#include "runtime/durango/winrt/networking.hpp"
 #include "runtime/durango/winrt/placeholder.hpp"
 #include "runtime/durango/winrt/storage.hpp"
 #include "runtime/durango/winrt/system_ui.hpp"
@@ -103,6 +104,11 @@ HRESULT __cdecl activation_factory(const wchar_t *name, const GUID &iid, void **
         return own->QueryInterface(iid, factory);
     if (auto *const own = winrt::input_class(name))
         return own->QueryInterface(iid, factory);
+    if (auto *const own = winrt::networking_class(name)) {
+        const auto result = own->QueryInterface(iid, factory);
+        own->Release();
+        return result;
+    }
     if (auto *const own = winrt::storage_class(name))
         return own->QueryInterface(iid, factory);
     if (auto *const own = winrt::system_ui_class(name))

@@ -3,7 +3,10 @@
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace xv::appx {
 namespace {
@@ -13,6 +16,91 @@ json attribute(pugi::xml_node node, const char *name) {
     return attr ? json(attr.value()) : json(nullptr);
 }
 json text(pugi::xml_node node) { return node ? json(node.text().get()) : json(nullptr); }
+
+bool named(pugi::xml_node node, std::string_view local) {
+    const std::string_view name = node.name();
+    const auto colon = name.rfind(':');
+    return (colon == std::string_view::npos ? name : name.substr(colon + 1)) == local;
+}
+pugi::xml_node child_named(pugi::xml_node node, std::string_view local) {
+    for (auto child : node.children())
+        if (named(child, local))
+            return child;
+    return {};
+}
+// <AllowedUsages><SecureDevice...Usage Type="..."/>...</AllowedUsages>, as written
+json usages(pugi::xml_node node) {
+    auto result = json::array();
+    for (auto usage : child_named(node, "AllowedUsages").children())
+        if (*usage.attribute("Type").value() && result.size() < 32)
+            result.push_back(usage.attribute("Type").value());
+    return result;
+}
+// BoundPort="N" or "N-M", 1 to 65535 and N <= M
+std::pair<unsigned, unsigned> port_range(std::string_view text) {
+    const auto number = [](std::string_view part) {
+        if (part.empty() || part.size() > 5 ||
+            part.find_first_not_of("0123456789") != std::string_view::npos)
+            throw std::runtime_error("Package manifest socket has a malformed BoundPort");
+        const auto value = static_cast<unsigned>(std::stoul(std::string(part)));
+        if (value < 1 || value > 65535)
+            throw std::runtime_error("Package manifest socket BoundPort is out of range");
+        return value;
+    };
+    const auto dash = text.find('-');
+    const auto lower = number(text.substr(0, dash));
+    const auto upper = dash == std::string_view::npos ? lower : number(text.substr(dash + 1));
+    if (upper < lower)
+        throw std::runtime_error("Package manifest socket BoundPort range is reversed");
+    return {lower, upper};
+}
+// <Extension Category="windows.xbox.networking"><XboxNetworkingManifest>: the sockets a title
+// may use for secure device traffic and the association templates between them
+// It is one of an application's extensions in the titles seen, and may be the package's.
+json networking(pugi::xml_node root) {
+    auto sockets = json::array();
+    auto templates = json::array();
+    std::vector<pugi::xml_node> extensions;
+    for (auto application : root.child("Applications").children("Application"))
+        for (auto extension : application.child("Extensions").children())
+            extensions.push_back(extension);
+    for (auto extension : root.child("Extensions").children())
+        extensions.push_back(extension);
+    for (auto extension : extensions) {
+        if (std::string_view(extension.attribute("Category").value()) != "windows.xbox.networking")
+            continue;
+        const auto manifest = child_named(extension, "XboxNetworkingManifest");
+        for (auto socket : child_named(manifest, "SocketDescriptions").children()) {
+            if (!named(socket, "SocketDescription"))
+                continue;
+            if (sockets.size() >= 64)
+                throw std::runtime_error("Package manifest exceeds 64 socket descriptions");
+            if (!*socket.attribute("Name").value())
+                throw std::runtime_error("Package manifest socket description has no Name");
+            const auto [lower, upper] = port_range(socket.attribute("BoundPort").value());
+            sockets.push_back({{"name", socket.attribute("Name").value()},
+                               {"protocol", attribute(socket, "SecureIpProtocol")},
+                               {"port_lower", lower},
+                               {"port_upper", upper},
+                               {"usages", usages(socket)}});
+        }
+        for (auto node : child_named(manifest, "SecureDeviceAssociationTemplates").children()) {
+            if (!named(node, "SecureDeviceAssociationTemplate"))
+                continue;
+            if (templates.size() >= 64)
+                throw std::runtime_error("Package manifest exceeds 64 association templates");
+            if (!*node.attribute("Name").value())
+                throw std::runtime_error("Package manifest association template has no Name");
+            templates.push_back({{"name", node.attribute("Name").value()},
+                                 {"initiator", attribute(node, "InitiatorSocketDescription")},
+                                 {"acceptor", attribute(node, "AcceptorSocketDescription")},
+                                 {"multiplayer_session_requirement",
+                                  attribute(node, "MultiplayerSessionRequirement")},
+                                 {"usages", usages(node)}});
+        }
+    }
+    return {{"sockets", std::move(sockets)}, {"templates", std::move(templates)}};
+}
 } // namespace
 
 nlohmann::json inspect_manifest(std::span<const std::uint8_t> bytes) {
@@ -117,6 +205,7 @@ nlohmann::json inspect_manifest(std::span<const std::uint8_t> bytes) {
             {"applications", std::move(applications)},
             {"xbox_live_title_id", attribute(live, "TitleId")},
             {"service_config_id", attribute(live, "PrimaryServiceConfigId")},
-            {"activatable_classes", std::move(classes)}};
+            {"activatable_classes", std::move(classes)},
+            {"networking", networking(root)}};
 }
 } // namespace xv::appx
