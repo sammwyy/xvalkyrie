@@ -947,7 +947,42 @@ LONG WINAPI missing_instruction(EXCEPTION_POINTERS *info) {
     poke(at, 0x3e);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+// XV_PATCH=<rva>:<bytes>:<bytes>[,...]: the bytes at an address of the title's image (all in
+// hexadecimal) changed from the first to the second, only where they are the first: a
+// title's own settings that no API reaches (a title's settings in titles/<id>.ini set it).
+void apply_patches(std::uint8_t *base) {
+    const char *text = std::getenv("XV_PATCH");
+    if (!text)
+        return;
+    const auto bytes = [](std::string_view hex) {
+        std::vector<std::uint8_t> out;
+        for (std::size_t at = 0; at + 1 < hex.size(); at += 2)
+            out.push_back(
+                static_cast<std::uint8_t>(std::stoul(std::string(hex.substr(at, 2)), nullptr, 16)));
+        return out;
+    };
+    std::string_view all(text);
+    while (!all.empty()) {
+        const auto one = all.substr(0, all.find(','));
+        all.remove_prefix(std::min(all.size(), one.size() + 1));
+        const auto first = one.find(':'), second = one.find(':', first + 1);
+        if (first == one.npos || second == one.npos)
+            continue;
+        const auto rva = std::strtoull(std::string(one.substr(0, first)).c_str(), nullptr, 16);
+        const auto expected = bytes(one.substr(first + 1, second - first - 1));
+        const auto wanted = bytes(one.substr(second + 1));
+        const bool matches = !expected.empty() && expected.size() == wanted.size() &&
+                             std::equal(expected.begin(), expected.end(), base + rva);
+        if (matches)
+            for (std::size_t n = 0; n < wanted.size(); ++n)
+                poke(base + rva + n, wanted[n]);
+        std::fprintf(stderr, "[Runtime] %zu bytes at image+0x%llx %s\n", wanted.size(), rva,
+                     matches ? "patched" : "left as they are: they are not the expected ones");
+    }
+    std::fflush(stderr);
+}
 void set_breakpoints(std::uint8_t *base) {
+    apply_patches(base);
     const char *text = std::getenv("XV_BREAK");
     if (!text)
         return;

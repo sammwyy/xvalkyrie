@@ -158,7 +158,21 @@ does not cover them.
 
 Some of how XValkyrie handles the console's driver containers (an `ACCC` part holding
 `FSPX`, which the console's FidelityFX upscaler makes its passes of), the pipelines of the
-console's ray tracing structures' library, and the host's 32-lane waves follows what
+console's ray tracing structures' library, the host's 32-lane waves, and the host driver's
+blobs of slow pipelines kept between runs follows what
 [xcl-dev/xcl](https://github.com/xcl-dev/xcl) (ivall and contributors) and its fork
 [zortos293/XSEmu](https://github.com/zortos293/XSEmu) found and document (`HANDOFF.md`,
 `docs/wave64-on-wave32.md`, `crates/xcl/src/gpu/recomp/pso.rs`). Credit to their authors.
+
+## Ideas and findings from the VIctory forks and ScarlettPort
+
+The switch for patching a title's own settings in its code at load (`XV_PATCH`), and the
+code patches it is used with, follow what the forks of
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory) found for the title they run
+([fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+[rorodev6/victory-nvidia-megafork](https://github.com/rorodev6/victory-nvidia-megafork),
+[DexNom/VIctory](https://github.com/DexNom/VIctory),
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
+[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)) and
+[ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort) document. No code of
+theirs is copied; credit to their authors.

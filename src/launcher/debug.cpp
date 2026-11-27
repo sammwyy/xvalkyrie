@@ -126,6 +126,10 @@ constexpr DebugOption options[] = {
     {"mute", title, "Mute", "The title plays no sound.", Kind::flag, "XV_MUTE"},
     {"no_network", title, "No network",
      "The title's sockets and WinHTTP fail as with no connection.", Kind::flag, "XV_NETWORK", "0"},
+    {"patches", title, "Code patches",
+     "Bytes of the title's code changed as it starts, where they are the expected ones: "
+     "rva:old:new in hexadecimal, separated by commas.",
+     Kind::text, "XV_PATCH"},
 };
 
 std::string trim(std::string value) {
