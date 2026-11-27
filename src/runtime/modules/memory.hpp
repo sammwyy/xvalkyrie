@@ -2,6 +2,7 @@
 #include "runtime/modules/kernel.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -41,5 +42,22 @@ std::vector<std::pair<std::uintptr_t, std::uintptr_t>> take_newly_mapped();
 // place of what is there, as the console's GPU maps its pages; `from` 0 leaves `to` unmapped.
 // False if `to` is not in a reservation of physical pages or a page at `from` is not mapped.
 bool map_alias(std::uintptr_t to, std::uintptr_t from, std::uintptr_t size);
+// A committed section backing the title's memory at an address, so that the host's GPU can
+// open a heap over it and read and write the title's own bytes without copying. `contiguous`
+// is how many bytes from `address` on lie consecutively in `section` from `offset`.
+struct SectionSpan {
+    HANDLE section = nullptr;
+    std::uint64_t section_size = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t contiguous = 0;
+    std::uint64_t id = 0;
+};
+bool title_memory_section(std::uintptr_t address, SectionSpan &span);
+// Moves the mapped physical pages covering [address, address + bytes) into one contiguous run
+// inside a single committed section chunk, preserving their bytes and any aliases, so that
+// GPU buffer views over the whole range need not copy.
+bool consolidate_title_memory(std::uintptr_t address, std::uint64_t bytes);
+// Called before a committed section previously returned by title_memory_section is closed.
+void on_section_released(std::function<void(std::uint64_t id)> callback);
 } // namespace modules
 } // namespace xv::runtime

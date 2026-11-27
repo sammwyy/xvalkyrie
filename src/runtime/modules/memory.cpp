@@ -37,15 +37,23 @@ struct Mapping {
     bool owned; // taken by a plain commit
 };
 // large or 4 MiB pages: one placeholder per 64 KiB
+struct DedicatedSection {
+    HANDLE handle = nullptr;
+    std::uint64_t size = 0;
+    std::uint64_t id = 0;
+    std::size_t live_pages = 0;
+};
 struct Reservation {
     std::uintptr_t size;
     std::map<std::uintptr_t, Mapping> views;
+    std::map<std::uintptr_t, std::uintptr_t> promoted; // va -> key in state.dedicated
 };
 struct Physical {
     std::mutex mutex;
     HANDLE section =
         CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE,
                            PAGE_READWRITE, SEC_RESERVE, physical_size, nullptr, nullptr, 0);
+    std::uint64_t next_id = 1;
     // the first page is never given out: its number, 0, is none to a title
     std::vector<bool> used = [] {
         std::vector<bool> taken(physical_size / page);
@@ -54,6 +62,7 @@ struct Physical {
     }();
     std::vector<bool> dirty = std::vector<bool>(physical_size / page);
     std::map<std::uintptr_t, Reservation> reservations;
+    std::map<std::uintptr_t, DedicatedSection> dedicated;
     // XV_MEM_CHECK: where each page is mapped, to tell of one that is at two addresses or
     // is given back while it is still mapped
     bool check = std::getenv("XV_MEM_CHECK");
@@ -62,6 +71,20 @@ struct Physical {
     std::multimap<ULONG_PTR, std::uintptr_t> mapped_at; // where each page is mapped
     std::uint8_t *view = nullptr; // the whole section, made when the host first needs it
 };
+std::mutex release_mutex;
+std::vector<std::function<void(std::uint64_t)>> release_callbacks;
+void notify_released(const std::vector<std::uint64_t> &ids) {
+    if (ids.empty())
+        return;
+    std::vector<std::function<void(std::uint64_t)>> copy;
+    {
+        const std::lock_guard lock(release_mutex);
+        copy = release_callbacks;
+    }
+    for (const auto id : ids)
+        for (const auto &cb : copy)
+            cb(id);
+}
 Physical &physical() {
     static Physical state;
     return state;
@@ -113,7 +136,22 @@ void release_page(Physical &state, ULONG_PTR number) {
     state.used[number] = false;
     state.dirty[number] = true;
 }
-void unmap(Physical &state, Reservation &reservation, std::uintptr_t address) {
+void unmap(Physical &state, Reservation &reservation, std::uintptr_t address,
+           std::vector<std::uint64_t> *released = nullptr) {
+    if (const auto prom = reservation.promoted.find(address); prom != reservation.promoted.end()) {
+        UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void *>(address),
+                         MEM_PRESERVE_PLACEHOLDER);
+        if (const auto d = state.dedicated.find(prom->second); d != state.dedicated.end()) {
+            if (d->second.live_pages > 0 && --d->second.live_pages == 0) {
+                if (released)
+                    released->push_back(d->second.id);
+                CloseHandle(d->second.handle);
+                state.dedicated.erase(d);
+            }
+        }
+        reservation.promoted.erase(prom);
+        return;
+    }
     const auto view = reservation.views.find(address);
     if (view == reservation.views.end())
         return;
@@ -195,8 +233,6 @@ MEM_ADDRESS_REQUIREMENTS console_range(const void *address, std::uintptr_t align
 }
 void *reserve(void *address, std::uintptr_t size, DWORD type) {
     auto &state = physical();
-    if (!state.section)
-        return nullptr;
     size = (size + page - 1) & ~(page - 1);
     auto requirements = console_range(address, type & mem_4mb_pages ? 4u << 20 : 0);
     MEM_EXTENDED_PARAMETER parameter{};
@@ -238,7 +274,7 @@ bool commit(std::uintptr_t address, std::uintptr_t size, DWORD protect) {
         return false;
     const auto end = std::min(address + size, base + reservation->size);
     for (auto at = address & ~(page - 1); at < end; at += page) {
-        if (reservation->views.contains(at)) {
+        if (reservation->views.contains(at) || reservation->promoted.contains(at)) {
             DWORD previous;
             VirtualProtect(reinterpret_cast<void *>(at), page, protect & protections, &previous);
             continue;
@@ -308,26 +344,35 @@ void *WINAPI virtual_alloc(void *address, SIZE_T size, DWORD type, DWORD protect
 }
 BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD type) {
     if (GetProcessId(process) == GetCurrentProcessId()) {
-        auto &state = physical();
-        const std::lock_guard lock(state.mutex);
-        const auto at = reinterpret_cast<std::uintptr_t>(address);
-        std::uintptr_t base = 0;
-        if (auto *const reservation = reservation_at(state, at, &base)) {
-            const bool release = type & MEM_RELEASE;
-            if (release && at != base) {
-                SetLastError(ERROR_INVALID_PARAMETER);
-                return FALSE;
+        std::vector<std::uint64_t> released;
+        bool handled = false;
+        BOOL ok = TRUE;
+        {
+            auto &state = physical();
+            const std::lock_guard lock(state.mutex);
+            const auto at = reinterpret_cast<std::uintptr_t>(address);
+            std::uintptr_t base = 0;
+            if (auto *const reservation = reservation_at(state, at, &base)) {
+                handled = true;
+                const bool release = type & MEM_RELEASE;
+                if (release && at != base) {
+                    SetLastError(ERROR_INVALID_PARAMETER);
+                    ok = FALSE;
+                } else {
+                    const auto end = release || !size ? base + reservation->size : at + size;
+                    for (auto view = at & ~(page - 1); view < end; view += page)
+                        unmap(state, *reservation, view, &released);
+                    if (release) {
+                        for (auto piece = base; piece < end; piece += page)
+                            VirtualFree(reinterpret_cast<void *>(piece), 0, MEM_RELEASE);
+                        state.reservations.erase(base);
+                    }
+                }
             }
-            const auto end = release || !size ? base + reservation->size : at + size;
-            for (auto view = at & ~(page - 1); view < end; view += page)
-                unmap(state, *reservation, view);
-            if (release) {
-                for (auto piece = base; piece < end; piece += page)
-                    VirtualFree(reinterpret_cast<void *>(piece), 0, MEM_RELEASE);
-                state.reservations.erase(base);
-            }
-            return TRUE;
         }
+        notify_released(released);
+        if (handled)
+            return ok;
     }
     return VirtualFreeEx(process, address, size, type);
 }
@@ -351,7 +396,7 @@ BOOL WINAPI allocate_title_physical_pages(HANDLE, DWORD type, ULONG_PTR *count, 
     }
     auto &state = physical();
     const std::lock_guard lock(state.mutex);
-    if (!state.section || !take_pages(state, *count, type & mem_4mb_pages ? 64 : 1, pages)) {
+    if (!take_pages(state, *count, type & mem_4mb_pages ? 64 : 1, pages)) {
         tell_short("an allocation of physical pages", *count * page);
         *count = 0;
         SetLastError(ERROR_OUTOFMEMORY);
@@ -767,5 +812,227 @@ std::vector<std::pair<std::uintptr_t, std::uintptr_t>> other_views(std::uintptr_
                 views.emplace_back(it->second + (first - at), it->second + (last - at));
     }
     return views;
+}
+namespace {
+constexpr std::uint64_t promote_chunk = 2ull << 20;
+std::atomic<int> promoting_count{0};
+std::once_flag promote_veh_installed;
+LONG WINAPI promoted_fault_handler(EXCEPTION_POINTERS *info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        info->ExceptionRecord->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const auto op = info->ExceptionRecord->ExceptionInformation[0];
+    const auto address =
+        static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]);
+    if (op != 0 && op != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    auto &state = physical();
+    bool in_promoted = false;
+    {
+        const std::lock_guard lock(state.mutex);
+        std::uintptr_t base = 0;
+        if (auto *const res = reservation_at(state, address, &base))
+            in_promoted = res->promoted.contains(address & ~(page - 1));
+    }
+    if (!in_promoted)
+        return EXCEPTION_CONTINUE_SEARCH;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void *>(address), &mbi, sizeof mbi) ||
+        mbi.State != MEM_COMMIT)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD p = mbi.Protect & 0xff;
+    if (op == 0 &&
+        (p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+         p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    if (op == 1 && (p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE ||
+                    p == PAGE_EXECUTE_WRITECOPY))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+bool promote_range(Physical &state, std::uintptr_t first, std::size_t count, bool allow_unmapped) {
+    std::call_once(promote_veh_installed,
+                   [] { AddVectoredExceptionHandler(1, promoted_fault_handler); });
+    const auto total = static_cast<std::uint64_t>(count) * page;
+    const auto end = first + total;
+    if (!count || total > (512ull << 20))
+        return false;
+    if (const auto d = state.dedicated.upper_bound(first); d != state.dedicated.begin()) {
+        const auto prev = std::prev(d);
+        if (end <= prev->first + prev->second.size)
+            return true;
+        if (first < prev->first + prev->second.size)
+            return false;
+    }
+    if (const auto d = state.dedicated.lower_bound(first);
+        d != state.dedicated.end() && d->first < end)
+        return false;
+    std::vector<Reservation *> page_res(count, nullptr);
+    std::vector<ULONG_PTR> old_pages(count, 0);
+    std::vector<bool> old_mapped(count, false);
+    std::vector<bool> old_owned(count, false);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto va = first + i * page;
+        std::uintptr_t rbase = 0;
+        auto *const res = reservation_at(state, va, &rbase);
+        if (!res || res->promoted.contains(va))
+            return false;
+        page_res[i] = res;
+        if (const auto v = res->views.find(va); v != res->views.end()) {
+            if (!allow_unmapped) {
+                // Skip pages holding placement.cpp READONLY guard sub-pages (placed textures).
+                for (std::size_t k = 0; k < 16; ++k) {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(reinterpret_cast<void *>(va + k * 4096), &mbi, sizeof mbi) &&
+                        mbi.State == MEM_COMMIT && (mbi.Protect & 0xff) != PAGE_READWRITE)
+                        return false;
+                }
+            }
+            old_mapped[i] = true;
+            old_pages[i] = v->second.page;
+            old_owned[i] = v->second.owned;
+        } else if (!allow_unmapped) {
+            return false;
+        }
+    }
+    HANDLE section = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
+                                        PAGE_READWRITE, SEC_COMMIT, total, nullptr, nullptr, 0);
+    if (!section)
+        return false;
+    auto *const dst_view = static_cast<std::uint8_t *>(
+        MapViewOfFile3(section, nullptr, nullptr, 0, total, 0, PAGE_READWRITE, nullptr, 0));
+    if (!dst_view) {
+        CloseHandle(section);
+        return false;
+    }
+    std::size_t live = 0;
+    promoting_count.fetch_add(1, std::memory_order_release);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto va = first + i * page;
+        auto *const res = page_res[i];
+        std::vector<std::uintptr_t> aliases;
+        if (old_mapped[i]) {
+            for (auto [it, stop] = state.mapped_at.equal_range(old_pages[i]); it != stop; ++it)
+                aliases.push_back(it->second);
+            if (aliases.empty())
+                aliases.push_back(va);
+        } else {
+            aliases.push_back(va);
+        }
+        if (old_mapped[i]) {
+            for (const auto target_va : aliases) {
+                DWORD prev = 0;
+                VirtualProtect(reinterpret_cast<void *>(target_va), page, PAGE_READONLY, &prev);
+            }
+            std::memcpy(dst_view + i * page, reinterpret_cast<const void *>(va), page);
+        }
+        for (std::size_t a = 0; a < aliases.size(); ++a) {
+            const auto target_va = aliases[a];
+            std::uintptr_t tbase = 0;
+            auto *const tres = target_va == va ? res : reservation_at(state, target_va, &tbase);
+            if (!tres)
+                continue;
+            if (old_mapped[i]) {
+                if (const auto v = tres->views.find(target_va); v != tres->views.end()) {
+                    v->second.owned = false;
+                    unmap(state, *tres, target_va);
+                }
+            }
+            if (!MapViewOfFile3(section, nullptr, reinterpret_cast<void *>(target_va),
+                                static_cast<ULONG64>(i) * page, page, MEM_REPLACE_PLACEHOLDER,
+                                PAGE_READWRITE, nullptr, 0)) {
+                for (std::size_t b = a + 1; b < aliases.size(); ++b) {
+                    DWORD prev = 0;
+                    VirtualProtect(reinterpret_cast<void *>(aliases[b]), page, PAGE_READWRITE,
+                                   &prev);
+                }
+                promoting_count.fetch_sub(1, std::memory_order_release);
+                UnmapViewOfFile(dst_view);
+                CloseHandle(section);
+                return false;
+            }
+            tres->promoted[target_va] = first;
+            ++live;
+        }
+        if (old_mapped[i] && old_owned[i])
+            release_page(state, old_pages[i]);
+    }
+    UnmapViewOfFile(dst_view);
+    const auto id = state.next_id++;
+    state.dedicated[first] = {section, total, id, live};
+    promoting_count.fetch_sub(1, std::memory_order_release);
+    return true;
+}
+} // namespace
+bool title_memory_section(std::uintptr_t address, SectionSpan &span) {
+    if (!address)
+        return false;
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    if (const auto d = state.dedicated.upper_bound(address); d != state.dedicated.begin()) {
+        const auto entry = std::prev(d);
+        if (address < entry->first + entry->second.size) {
+            span.section = entry->second.handle;
+            span.section_size = entry->second.size;
+            span.offset = address - entry->first;
+            span.contiguous = entry->first + entry->second.size - address;
+            span.id = entry->second.id;
+            return true;
+        }
+    }
+    const auto at = address & ~(page - 1);
+    std::uintptr_t base = 0;
+    auto *const res = reservation_at(state, at, &base);
+    if (!res || !res->views.contains(at))
+        return false;
+    const auto win_start = std::max(base, at & ~(promote_chunk - 1));
+    const auto win_end = std::min(base + res->size, (at & ~(promote_chunk - 1)) + promote_chunk);
+    auto run_start = at;
+    while (run_start > win_start && res->views.contains(run_start - page) &&
+           !res->promoted.contains(run_start - page))
+        run_start -= page;
+    auto run_end = at + page;
+    while (run_end < win_end && res->views.contains(run_end) && !res->promoted.contains(run_end))
+        run_end += page;
+    const auto count = static_cast<std::size_t>((run_end - run_start) / page);
+    if (!promote_range(state, run_start, count, false))
+        return false;
+    const auto entry = state.dedicated.find(run_start);
+    if (entry == state.dedicated.end())
+        return false;
+    span.section = entry->second.handle;
+    span.section_size = entry->second.size;
+    span.offset = address - entry->first;
+    span.contiguous = entry->first + entry->second.size - address;
+    span.id = entry->second.id;
+    return true;
+}
+bool consolidate_title_memory(std::uintptr_t address, std::uint64_t bytes) {
+    if (!address || !bytes)
+        return false;
+    const auto first = address & ~(page - 1);
+    const auto end = (address + bytes + page - 1) & ~(page - 1);
+    const auto count = static_cast<std::size_t>((end - first) / page);
+    if (count < 2)
+        return false;
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    const auto before = state.next_id;
+    const bool ok = promote_range(state, first, count, true);
+    if (ok && state.next_id != before) {
+        const auto entry = state.dedicated.find(first);
+        std::fprintf(
+            stderr, "[Memory] consolidated %llx (%llu MiB) into dedicated section id=%llu\n",
+            static_cast<unsigned long long>(first),
+            static_cast<unsigned long long>((count * page) >> 20),
+            entry != state.dedicated.end() ? static_cast<unsigned long long>(entry->second.id)
+                                           : 0ull);
+        std::fflush(stderr);
+    }
+    return ok;
+}
+void on_section_released(std::function<void(std::uint64_t id)> callback) {
+    const std::lock_guard lock(release_mutex);
+    release_callbacks.push_back(std::move(callback));
 }
 } // namespace xv::runtime::modules

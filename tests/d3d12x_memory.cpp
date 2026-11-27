@@ -1,4 +1,5 @@
 #include "d3d12x_title.hpp"
+#include "runtime/modules/memory.hpp"
 
 #include <array>
 #include <cstddef>
@@ -472,4 +473,155 @@ TEST_CASE("a texture placed in the title's memory has that memory's address") {
     first->Release();
     second->Release();
     CHECK(removed_reason() == S_OK);
+}
+
+TEST_CASE("a heap opened over a committed section in a placeholder is coherent with the GPU") {
+    if (!device())
+        return;
+    ID3D12Device3 *dev3 = nullptr;
+    REQUIRE(SUCCEEDED(device()->QueryInterface(IID_PPV_ARGS(&dev3))));
+    constexpr std::size_t chunk = 2u << 20;
+    constexpr std::size_t total = 8 * chunk;
+    auto *const proc = GetCurrentProcess();
+    auto *const base = static_cast<std::uint8_t *>(VirtualAlloc2(
+        proc, nullptr, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+    REQUIRE(base);
+    auto *const slot0 = base + chunk;
+    auto *const slot1 = base + 3 * chunk;
+    REQUIRE(VirtualFree(slot0, chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER));
+    REQUIRE(VirtualFree(slot1, chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER));
+    HANDLE section = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
+                                        PAGE_READWRITE, SEC_COMMIT, chunk, nullptr, nullptr, 0);
+    REQUIRE(section);
+    REQUIRE(MapViewOfFile3(section, proc, slot0, 0, chunk, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                           nullptr, 0) == slot0);
+
+    ID3D12Heap *heap = nullptr;
+    REQUIRE(SUCCEEDED(dev3->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap))));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = chunk;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags =
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *placed = nullptr;
+    REQUIRE(SUCCEEDED(device()->CreatePlacedResource(heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                     nullptr, IID_PPV_ARGS(&placed))));
+    const auto gpu = placed->GetGPUVirtualAddress();
+    REQUIRE(gpu != 0);
+
+    const D3D12_ROOT_PARAMETER params[]{root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+                                        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const sig = root_signature({2, params});
+    auto *const pipe = compute_pipeline(sig, R"(
+        ByteAddressBuffer src : register(t0);
+        RWByteAddressBuffer dst : register(u0);
+        [numthreads(1, 1, 1)] void main() {
+            dst.Store(0, src.Load(0) ^ 0x5a5a0000u);
+        })");
+
+    const auto run_at = [&](std::uint64_t src_off, std::uint64_t dst_off) {
+        Work work;
+        work.record(33, sig);
+        work.record(25, pipe);
+        work.record(43, 0u, gpu + src_off);
+        work.record(45, 1u, gpu + dst_off);
+        work.record(14, 1u, 1u, 1u);
+        work.run();
+        CHECK(removed_reason() == S_OK);
+    };
+
+    auto *w0 = reinterpret_cast<std::uint32_t *>(slot0);
+    w0[0] = 0x12340001u;
+    run_at(0, 4096);
+    CHECK(w0[1024] == (0x12340001u ^ 0x5a5a0000u));
+
+    // a later CPU write is seen without copying, and remapping the view leaves the heap live
+    w0[0] = 0xabcd0002u;
+    DWORD old_prot = 0;
+    REQUIRE(VirtualProtect(slot0, 65536, PAGE_READONLY, &old_prot));
+    REQUIRE(VirtualProtect(slot0, 65536, PAGE_READWRITE, &old_prot));
+    REQUIRE(UnmapViewOfFile2(proc, slot0, MEM_PRESERVE_PLACEHOLDER));
+    REQUIRE(MapViewOfFile3(section, proc, slot1, 0, chunk, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                           nullptr, 0) == slot1);
+    run_at(0, 8192);
+    auto *w1 = reinterpret_cast<std::uint32_t *>(slot1);
+    CHECK(w1[2048] == (0xabcd0002u ^ 0x5a5a0000u));
+
+    pipe->Release();
+    sig->Release();
+    placed->Release();
+    heap->Release();
+    dev3->Release();
+    CHECK(UnmapViewOfFile2(proc, slot1, MEM_PRESERVE_PLACEHOLDER));
+    CHECK(CloseHandle(section));
+    // coalesce placeholders before releasing
+    CHECK(VirtualFree(base, total, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS));
+    CHECK(VirtualFree(base, 0, MEM_RELEASE));
+}
+
+TEST_CASE("title physical pages are read past 64 KiB and written directly by the GPU") {
+    if (!device())
+        return;
+    static xv::runtime::Registry xmem_reg = [] {
+        xv::runtime::Registry made;
+        xv::runtime::modules::install_xmem(made);
+        return made;
+    }();
+    const auto xmem_fn = [&](const char *name) {
+        auto *const fn = std::string_view(name).starts_with("XMem")
+                             ? xmem_reg.find("xmem.dll", name)
+                             : xmem_reg.find_api(name);
+        REQUIRE(fn);
+        return fn;
+    };
+    constexpr DWORD large_pages = 0x20000000;
+    constexpr std::size_t page = 1 << 16, count = 4; // 256 KiB (> 64 KiB)
+    ULONG_PTR pages[count]{}, got = count;
+    REQUIRE(reinterpret_cast<BOOL(WINAPI *)(ULONGLONG, ULONG_PTR *, ULONG_PTR *)>(
+        xmem_fn("XMemAllocatePhysicalPages"))(0, &got, pages));
+    REQUIRE(got == count);
+    auto *const base = static_cast<std::uint8_t *>(
+        reinterpret_cast<void *(WINAPI *)(void *, SIZE_T, DWORD, ULONGLONG, DWORD)>(
+            xmem_fn("XMemVirtualAlloc"))(nullptr, count * page, MEM_RESERVE | large_pages, 0,
+                                         PAGE_READWRITE));
+    REQUIRE(base);
+    REQUIRE(reinterpret_cast<void *(WINAPI *)(void *, ULONG_PTR, ULONG_PTR *)>(
+                xmem_fn("XMemMapPhysicalPages"))(base, count, pages) == base);
+
+    const auto addr = reinterpret_cast<std::uint64_t>(base);
+    // write a word at +192 KiB (well past 64 KiB) and let the GPU read it via root SRV and
+    // write back via root UAV into +128 KiB of the title's own physical pages
+    constexpr std::uint32_t sentinel = 0xCAFE1234u;
+    std::memcpy(base + 3 * page + 16, &sentinel, sizeof sentinel);
+
+    const D3D12_ROOT_PARAMETER params[]{root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+                                        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const sig = root_signature({2, params});
+    auto *const pipe = compute_pipeline(sig, R"(
+        ByteAddressBuffer src : register(t0);
+        RWByteAddressBuffer dst : register(u0);
+        [numthreads(1, 1, 1)] void main() {
+            dst.Store(0, src.Load(196624) ^ 0x00FF00FFu);
+        })");
+    Work work;
+    work.record(33, sig);
+    work.record(25, pipe);
+    work.record(43, 0u, addr);
+    work.record(45, 1u, addr + 2 * page);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+    CHECK(removed_reason() == S_OK);
+    std::uint32_t out = 0;
+    std::memcpy(&out, base + 2 * page, sizeof out);
+    CHECK(out == (sentinel ^ 0x00FF00FFu));
+
+    pipe->Release();
+    sig->Release();
+    CHECK(reinterpret_cast<BOOL(WINAPI *)(void *, SIZE_T, DWORD)>(xmem_fn("VirtualFree"))(
+        base, 0, MEM_RELEASE));
+    CHECK(reinterpret_cast<BOOL(WINAPI *)(ULONG_PTR, ULONG_PTR *)>(
+        xmem_fn("XMemFreePhysicalPages"))(count, pages));
 }
