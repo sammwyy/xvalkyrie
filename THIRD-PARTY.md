@@ -158,16 +158,21 @@ does not cover them.
 
 Some of how XValkyrie handles the console's driver containers (an `ACCC` part holding
 `FSPX`, which the console's FidelityFX upscaler makes its passes of), the pipelines of the
-console's ray tracing structures' library, the host's 32-lane waves, and the host driver's
-blobs of slow pipelines kept between runs follows what
+console's ray tracing structures' library, the host's 32-lane waves, the host driver's
+blobs of slow pipelines kept between runs, and opening `ID3D12Heap` objects directly over
+`SEC_COMMIT` file-mapping sections mapped into placeholders via
+`OpenExistingHeapFromFileMapping` follows what
 [xcl-dev/xcl](https://github.com/xcl-dev/xcl) (ivall and contributors) and its fork
 [zortos293/XSEmu](https://github.com/zortos293/XSEmu) found and document (`HANDOFF.md`,
 `docs/wave64-on-wave32.md`, `crates/xcl/src/gpu/recomp/pso.rs`). Credit to their authors.
 
 ## Ideas and findings from the VIctory forks and ScarlettPort
 
-The switch for patching a title's own settings in its code at load (`XV_PATCH`), and the
-code patches it is used with, follow what the forks of
+The switch for patching a title's own settings in its code at load (`XV_PATCH`), the code
+patches it is used with, masking RDNA2 mesh primitive corner indices to 9 bits (`0x1ff`)
+so console edge-flag bits 9/19/29 are not treated as vertex indices, and remapping
+`R32*_UINT`/`SINT` typed buffer views to `R32*_FLOAT` for bit-exact `Buffer<float4>` /
+`RWBuffer<float4>` loads and stores follow what the forks of
 [Marvisak/VIctory](https://github.com/Marvisak/VIctory) found for the title they run
 ([fxceless/victory-fork](https://github.com/fxceless/victory-fork),
 [rorodev6/victory-nvidia-megafork](https://github.com/rorodev6/victory-nvidia-megafork),

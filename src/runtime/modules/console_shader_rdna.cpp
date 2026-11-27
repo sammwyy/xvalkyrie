@@ -1363,7 +1363,12 @@ class Translator {
             if (destination < 128)
                 known[destination] = result;
             if (shader_.heaps && !wide && result.kind == Known::nothing &&
-                before.kind == Known::descriptor && before.part != 0)
+                before.kind == Known::descriptor && before.part != 0 &&
+                (name == "s_and_b32" || name == "s_or_b32") &&
+                (first == destination || second == destination) && destination >= before.part &&
+                known[destination - before.part].kind == Known::descriptor &&
+                known[destination - before.part].origin == before.origin &&
+                known[destination - before.part].part == 0)
                 known[destination] = before;
             if (result.kind == Known::lanes && destination + 1 < 128)
                 known[destination + 1] = result;
@@ -5046,12 +5051,12 @@ class Translator {
         if (stage_ == Stage::pixel && valid_mask && exec_changes_)
             line("if (!" + active() + ") discard;");
         if (stage_ == Stage::mesh && target == 20) {
-            // The lane's primitive: three vertex numbers of ten bits; bit 31 culls it, and so
-            // does a number past the vertices the shader makes, which the host's GPU may hang
-            // on where the console's draws nothing.
+            // The lane's primitive: three 9-bit vertex numbers (bits 9, 19, 29 are edge flags,
+            // not index bits); bit 31 culls it, and so does a number past the vertices the shader
+            // makes, which the host's GPU may hang on where the console's draws nothing.
             const auto value = v(ins.w1 & 0xff);
-            const auto corners = "uint3(" + value + " & 0x3ffu, (" + value + " >> 10) & 0x3ffu, (" +
-                                 value + " >> 20) & 0x3ffu)";
+            const auto corners = "uint3(" + value + " & 0x1ffu, (" + value + " >> 10) & 0x1ffu, (" +
+                                 value + " >> 20) & 0x1ffu)";
             line("if (" + std::string(exec_changes_ ? active() + " && " : "") + "xv_flat < " +
                  std::to_string(mesh_primitives_) + "u) { uint3 corners = " + corners +
                  "; xv_prims[xv_flat] = (" + value + " & 0x80000000u) != 0u || any(corners >= " +
