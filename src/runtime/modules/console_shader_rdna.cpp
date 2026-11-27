@@ -1112,9 +1112,11 @@ class Translator {
         if (source == 253)
             return "(scc ? 1u : 0u)";
         if (source == 251)
-            return "((" + s(106) + " | " + s(107) + ") == 0u ? 1u : 0u)";
+            return wave64_ ? "((" + s(106) + " | " + s(107) + ") == 0u ? 1u : 0u)"
+                           : "(" + s(106) + " == 0u ? 1u : 0u)";
         if (source == 252)
-            return "((" + s(126) + " | " + s(127) + ") == 0u ? 1u : 0u)";
+            return wave64_ ? "((" + s(126) + " | " + s(127) + ") == 0u ? 1u : 0u)"
+                           : "(" + s(126) + " == 0u ? 1u : 0u)";
         if (source == 125)
             return "0u";
         if (source < 128) {
@@ -1692,13 +1694,13 @@ class Translator {
         if (ins.name == "s_cbranch_scc1")
             return "scc";
         if (ins.name == "s_cbranch_vccz")
-            return "(" + s(106) + " | " + s(107) + ") == 0u";
+            return wave64_ ? "(" + s(106) + " | " + s(107) + ") == 0u" : s(106) + " == 0u";
         if (ins.name == "s_cbranch_vccnz")
-            return "(" + s(106) + " | " + s(107) + ") != 0u";
+            return wave64_ ? "(" + s(106) + " | " + s(107) + ") != 0u" : s(106) + " != 0u";
         if (ins.name == "s_cbranch_execz")
-            return "(" + s(126) + " | " + s(127) + ") == 0u";
+            return wave64_ ? "(" + s(126) + " | " + s(127) + ") == 0u" : s(126) + " == 0u";
         if (ins.name == "s_cbranch_execnz")
-            return "(" + s(126) + " | " + s(127) + ") != 0u";
+            return wave64_ ? "(" + s(126) + " | " + s(127) + ") != 0u" : s(126) + " != 0u";
         // COND_DBG_SYS and COND_DBG_USER of STATUS are clear outside a debugger
         if (ins.name == "s_cbranch_cdbgsys" || ins.name == "s_cbranch_cdbguser" ||
             ins.name == "s_cbranch_cdbgsys_or_user" || ins.name == "s_cbranch_cdbgsys_and_user")
@@ -2382,13 +2384,17 @@ class Translator {
             const auto name = "h" + std::to_string(temporaries_++);
             uses_heap_ = needs_sm6_ = true;
             line(type + " " + name + " = " +
-                 (resource.type == 3 ? "SamplerDescriptorHeap[d" : "ResourceDescriptorHeap[d") +
-                 std::to_string(resource.dynamic) + (resource.type == 3 ? " >> 4];" : " >> 5];"));
+                 (resource.type == 3 ? "SamplerDescriptorHeap[NonUniformResourceIndex(min(d"
+                                     : "ResourceDescriptorHeap[NonUniformResourceIndex(min(d") +
+                 std::to_string(resource.dynamic) +
+                 (resource.type == 3 ? " >> 4, 2047u))];" : " >> 5, 999999u))];"));
             return name;
         }
         if (resource.heap && heap_parameter_.count(resource.parameter)) {
             // a descriptor of a heap itself at a place known now
             auto name = std::string("hh") + letter + std::to_string(resource.reg);
+            const auto clamped_reg =
+                std::min<std::uint32_t>(resource.reg, resource.type == 3 ? 2047u : 999999u);
             const auto found = declared_.find(name);
             if (found != declared_.end()) {
                 if (found->second == type)
@@ -2402,7 +2408,7 @@ class Translator {
                 prologue_ +=
                     "    " + type + " " + alt_name + " = " +
                     (resource.type == 3 ? "SamplerDescriptorHeap[" : "ResourceDescriptorHeap[") +
-                    std::to_string(resource.reg) + "u];\n";
+                    std::to_string(clamped_reg) + "u];\n";
                 return alt_name;
             }
             declared_[name] = type;
@@ -2410,7 +2416,7 @@ class Translator {
             prologue_ +=
                 "    " + type + " " + name + " = " +
                 (resource.type == 3 ? "SamplerDescriptorHeap[" : "ResourceDescriptorHeap[") +
-                std::to_string(resource.reg) + "u];\n";
+                std::to_string(clamped_reg) + "u];\n";
             return name;
         }
         if (resource.heap) {
@@ -2427,14 +2433,16 @@ class Translator {
                 const auto alt_name = name + "_" + std::to_string(temporaries_++);
                 declared_[alt_key] = alt_name;
                 uses_heap_ = needs_sm6_ = true;
-                prologue_ += "    " + type + " " + alt_name + " = ResourceDescriptorHeap[xv_ud" +
-                             std::to_string(slot) + " + " + std::to_string(resource.reg) + "u];\n";
+                prologue_ += "    " + type + " " + alt_name +
+                             " = ResourceDescriptorHeap[min(xv_ud" + std::to_string(slot) + " + " +
+                             std::to_string(resource.reg) + "u, 999999u)];\n";
                 return alt_name;
             }
             declared_[name] = type;
             uses_heap_ = needs_sm6_ = true;
-            prologue_ += "    " + type + " " + name + " = ResourceDescriptorHeap[xv_ud" +
-                         std::to_string(slot) + " + " + std::to_string(resource.reg) + "u];\n";
+            prologue_ += "    " + type + " " + name + " = ResourceDescriptorHeap[min(xv_ud" +
+                         std::to_string(slot) + " + " + std::to_string(resource.reg) +
+                         "u, 999999u)];\n";
             return name;
         }
         if (resource.dynamic < 0) {
@@ -5273,7 +5281,7 @@ class Translator {
                 registers += "    uint c" + std::to_string(first) + " = 0u;\n";
         for (const auto reg : used_s_)
             registers += "    uint s" + std::to_string(reg) + " = " +
-                         (reg == 126 || reg == 127 ? "0xffffffffu" : "0u") + ";\n";
+                         (reg == 126 || (wave64_ && reg == 127) ? "0xffffffffu" : "0u") + ";\n";
         for (const auto reg : used_v_)
             if (reg < relative_first_)
                 registers += "    uint v" + std::to_string(reg) + " = 0u;\n";
