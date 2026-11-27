@@ -21,6 +21,8 @@
 #include <d3d12.h>
 #include <deque>
 #include <dxgi1_6.h>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <intrin.h>
 #include <map>
@@ -1749,7 +1751,25 @@ struct RootParameter {
     UINT constants; // how many words, for constants
 };
 std::map<const void *, std::vector<RootParameter>> root_parameters;
+std::map<const void *, std::uint64_t> signature_keys; // by what it was made of
+std::uint64_t bytes_key(const void *bytes, std::size_t size,
+                        std::uint64_t key = 0xcbf29ce484222325ull) {
+    for (const auto *at = static_cast<const std::uint8_t *>(bytes), *end = at + size; at < end;
+         ++at)
+        key = (key ^ *at) * 0x100000001b3ull;
+    return key;
+}
+// what a root signature was made of, as a key (0 when not known)
+std::uint64_t signature_key(const void *signature) {
+    const std::lock_guard lock(signature_mutex);
+    const auto found = signature_keys.find(signature);
+    return found == signature_keys.end() ? 0 : found->second;
+}
 void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
+    {
+        const std::lock_guard lock(signature_mutex);
+        signature_keys[signature] = bytes_key(blob, size);
+    }
     using Create = HRESULT(WINAPI *)(const void *, SIZE_T, REFIID, void **);
     static const auto create = host_d3d12<Create>("D3D12CreateVersionedRootSignatureDeserializer");
     ID3D12VersionedRootSignatureDeserializer *reader = nullptr;
@@ -3898,6 +3918,11 @@ ID3D12RootSignature *heap_signature(ID3D12Device *device) {
                 HRESULT(STDMETHODCALLTYPE *)(void *, UINT, const void *, SIZE_T, REFIID, void **);
             result = original<Create>(device, 16)(device, 0, blob->GetBufferPointer(),
                                                   blob->GetBufferSize(), IID_PPV_ARGS(&signature));
+            if (SUCCEEDED(result)) {
+                const std::lock_guard lock(signature_mutex);
+                signature_keys[signature] =
+                    bytes_key(blob->GetBufferPointer(), blob->GetBufferSize());
+            }
         }
         if (FAILED(result)) {
             std::fprintf(stderr,
@@ -4089,6 +4114,75 @@ struct HostClock {
     std::uint64_t started = microseconds();
     ~HostClock() { pipeline_times[kind].host += microseconds() - started; }
 };
+// The host's driver's own form of a pipeline it took long to make (GetCachedBlob), kept in
+// the shader cache's "driver" folder by what the pipeline is made of and given back to the
+// driver as its cached form the next time: a driver without a cache of its own, or whose
+// cache is full, takes as long over each pipeline in every run (a third of a second for most
+// of a title's compute pipelines here, a minute for a few). One the driver turns down, as
+// after it is updated, is made again and kept anew. After XCL's cache of driver blobs.
+struct DriverBlobs {
+    std::atomic<std::uint64_t> given{0}, kept{0}, refused{0};
+};
+DriverBlobs driver_blobs;
+std::filesystem::path driver_blob_path(std::uint64_t key) {
+    const auto &folder = shader_cache_directory();
+    if (!key || folder.empty())
+        return {};
+    char name[32];
+    std::snprintf(name, sizeof name, "%016llx.pso", static_cast<unsigned long long>(key));
+    return folder / "driver" / name;
+}
+// `create` makes the pipeline with `cached` as its cached form
+template <class Create>
+HRESULT with_driver_blob(std::uint64_t key, D3D12_CACHED_PIPELINE_STATE &cached, void **state,
+                         Create create) {
+    const auto path = driver_blob_path(key);
+    if (path.empty() || cached.pCachedBlob)
+        return create();
+    std::error_code error;
+    if (std::ifstream file(path, std::ios::binary | std::ios::ate); file) {
+        std::vector<char> blob(static_cast<std::size_t>(std::max<std::streamoff>(file.tellg(), 0)));
+        file.seekg(0);
+        if (!blob.empty() && file.read(blob.data(), static_cast<std::streamsize>(blob.size()))) {
+            cached = {blob.data(), blob.size()};
+            const auto result = create();
+            cached = {};
+            if (SUCCEEDED(result)) {
+                ++driver_blobs.given;
+                return result;
+            }
+            ++driver_blobs.refused;
+        }
+        file.close();
+        std::filesystem::remove(path, error);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = create();
+    if (FAILED(result) || !state || !*state ||
+        std::chrono::steady_clock::now() - started < std::chrono::milliseconds(250))
+        return result;
+    ID3D12PipelineState *made = nullptr;
+    ID3DBlob *blob = nullptr;
+    if (SUCCEEDED(static_cast<IUnknown *>(*state)->QueryInterface(IID_PPV_ARGS(&made)))) {
+        if (SUCCEEDED(made->GetCachedBlob(&blob)) && blob && blob->GetBufferSize()) {
+            std::filesystem::create_directories(path.parent_path(), error);
+            auto part = path;
+            part += ".part";
+            if (std::ofstream file(part, std::ios::binary); file) {
+                file.write(static_cast<const char *>(blob->GetBufferPointer()),
+                           static_cast<std::streamsize>(blob->GetBufferSize()));
+                file.close();
+                std::filesystem::rename(part, path, error);
+                if (!error)
+                    ++driver_blobs.kept;
+            }
+        }
+        if (blob)
+            blob->Release();
+        made->Release();
+    }
+    return result;
+}
 // CreateGraphicsPipelineState (10): the console's flags, as for compute pipelines
 HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
                                                    const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
@@ -4366,7 +4460,11 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     HRESULT result;
     {
         const HostClock timed{1};
-        result = original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state);
+        const auto signature = desc && !emptied ? signature_key(host.pRootSignature) : 0;
+        result = with_driver_blob(
+            signature ? bytes_key(host.CS.pShaderBytecode, host.CS.BytecodeLength, signature) : 0,
+            host.CachedPSO, state,
+            [&] { return original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state); });
     }
     if (retry_without_heaps(result, heaps)) {
         heap_shaders_refused = true;
@@ -9731,10 +9829,16 @@ ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state) {
         return state;
     if (deferred->ready.load(std::memory_order_acquire))
         return deferred->host;
-    // One thread: the host's driver holds a lock of its own while it compiles, which the
-    // title's threads that make resources wait on, and more threads would hold it longer.
+    // One thread, or XV_PSO_THREADS: the host's driver takes much memory over a pipeline, and
+    // with a title that takes most of the machine's, two or four at once each took a minute
+    // where one alone takes a third of a second (the system's memory paged out). The host's
+    // driver's blobs, kept (with_driver_blob), make the next run's quick instead.
     static const bool started = [] {
-        std::thread(make_pipelines).detach();
+        unsigned threads = 1;
+        if (const auto *const text = std::getenv("XV_PSO_THREADS"); text && std::atoi(text) > 0)
+            threads = static_cast<unsigned>(std::atoi(text));
+        for (unsigned n = 0; n < threads; ++n)
+            std::thread(make_pipelines).detach();
         return true;
     }();
     static_cast<void>(started);
