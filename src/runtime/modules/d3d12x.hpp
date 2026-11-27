@@ -41,6 +41,10 @@ void stop_calling_as_title(const void *code);
 void forget_layouts();
 // why the host's device stopped, and what its debug layer said, to the log
 void report_failure();
+// The pipelines a title's lists were given in its earlier runs, kept in the shader cache's
+// "pipelines" folder, made for the host once each without the title, so that the host
+// driver's blobs of the slow ones are there for the next run. How many were made.
+std::size_t warm_pipelines(unsigned threads);
 // a texture's first subresource, copied to the CPU through the title's direct queue
 // (XV_D3D_PROBE)
 bool read_back(ID3D12Resource *resource, std::vector<std::uint8_t> &data, unsigned &pitch,

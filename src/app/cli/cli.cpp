@@ -8,8 +8,10 @@
 #include "launcher/debug.hpp"
 #include "launcher/launch.hpp"
 #include "loader/image.hpp"
+#include "runtime/common/runtime.hpp"
 #include "runtime/console.hpp"
 #include "runtime/modules/console_shader.hpp"
+#include "runtime/modules/d3d12x.hpp"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -292,6 +294,15 @@ std::optional<int> run(int argc, wchar_t **argv) {
                                     {"failed", work->failed.load()}}
                          .dump()
                   << '\n';
+        return 0;
+    }
+    if ((argc == 3 || argc == 4) && command == "pipeline-warm") {
+        // <shader cache> [threads]: the pipelines a title's lists were given in its earlier
+        // runs, made for the host's driver without it, the blobs of the slow ones kept
+        runtime::detail::set_shader_cache_directory(argv[2]);
+        const auto made = runtime::modules::d3d12x::warm_pipelines(
+            argc == 4 ? static_cast<unsigned>(std::stoul(argv[3])) : 1);
+        std::cout << nlohmann::json{{"made", made}}.dump() << '\n';
         return 0;
     }
     if (argc == 3 && command == "shader-host") {

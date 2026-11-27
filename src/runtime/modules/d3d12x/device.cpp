@@ -1751,7 +1751,8 @@ struct RootParameter {
     UINT constants; // how many words, for constants
 };
 std::map<const void *, std::vector<RootParameter>> root_parameters;
-std::map<const void *, std::uint64_t> signature_keys; // by what it was made of
+std::map<const void *, std::uint64_t> signature_keys;              // by what it was made of
+std::map<const void *, std::vector<std::uint8_t>> signature_blobs; // what it was made of
 std::uint64_t bytes_key(const void *bytes, std::size_t size,
                         std::uint64_t key = 0xcbf29ce484222325ull) {
     for (const auto *at = static_cast<const std::uint8_t *>(bytes), *end = at + size; at < end;
@@ -1769,6 +1770,8 @@ void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
     {
         const std::lock_guard lock(signature_mutex);
         signature_keys[signature] = bytes_key(blob, size);
+        signature_blobs[signature].assign(static_cast<const std::uint8_t *>(blob),
+                                          static_cast<const std::uint8_t *>(blob) + size);
     }
     using Create = HRESULT(WINAPI *)(const void *, SIZE_T, REFIID, void **);
     static const auto create = host_d3d12<Create>("D3D12CreateVersionedRootSignatureDeserializer");
@@ -6798,6 +6801,15 @@ void STDMETHODCALLTYPE set_index_buffer(void *self, const D3D12_INDEX_BUFFER_VIE
 // into a buffer of ours, which is what the host is given: 64 KiB of it, or as much as is
 // there. The copies go round a ring, which a frame does not come near filling.
 constexpr std::uint64_t most_copied = 64 << 10;
+// A copy of the title's memory, which another of its threads may let go of between our look
+// at it and the copy: what is gone then is left as it was in the copy, not a crash.
+void copy_title_memory(void *to, const void *from, std::size_t bytes) {
+    __try {
+        std::memcpy(to, from, bytes);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+    }
+}
 // the GPU address of a copy of `bytes` (most_copied at most) at `source`, 0 if there is no ring;
 // with `align`, the copy starts on a multiple of it in the ring, which `buffer` and `offset`
 // are given
@@ -6846,10 +6858,10 @@ std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t m
         const auto *const from = static_cast<const std::uint8_t *>(source);
         auto *const to = memory + at;
         when_run(copying_for, [from, to, bytes] {
-            std::memcpy(to, from, static_cast<std::size_t>(readable_bytes(from, bytes)));
+            copy_title_memory(to, from, static_cast<std::size_t>(readable_bytes(from, bytes)));
         });
     }
-    std::memcpy(memory + at, source, bytes);
+    copy_title_memory(memory + at, source, bytes);
     if (buffer)
         *buffer = ring;
     if (offset)
@@ -9316,6 +9328,70 @@ HRESULT STDMETHODCALLTYPE create_command_signature(ID3D12Device *self,
 // from 25 on.
 constexpr std::size_t subobject_sizes[] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8,  48, 56, 24,
                                            8,  8,  40, 8,  16, 8,  24, 8,  64,  32, 24, 24};
+// What a host's stream of subobjects is made of, as a key for with_driver_blob: its
+// shaders' and input layout's contents and its root signature's key where it has pointers, its
+// bytes elsewhere. 0 (no blob kept) where it has what is not followed here.
+std::uint64_t stream_key(const std::vector<std::uint8_t> &stream) {
+    auto key = bytes_key(nullptr, 0);
+    for (std::size_t at = 0; at + 8 <= stream.size();) {
+        std::uint32_t type;
+        std::memcpy(&type, stream.data() + at, 4);
+        const std::size_t size = type < std::size(subobject_sizes) ? subobject_sizes[type]
+                                 : type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ? 24
+                                                                                  : 0;
+        if (!size || at + size > stream.size())
+            return 0;
+        const auto *const value = stream.data() + at + 8;
+        key = bytes_key(&type, sizeof type, key);
+        switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
+            void *signature = nullptr;
+            std::memcpy(&signature, value, sizeof signature);
+            const auto of = signature_key(signature);
+            if (!of)
+                return 0;
+            key = bytes_key(&of, sizeof of, key);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+            D3D12_SHADER_BYTECODE shader{};
+            std::memcpy(&shader, value, sizeof shader);
+            key = bytes_key(shader.pShaderBytecode, shader.BytecodeLength,
+                            bytes_key(&shader.BytecodeLength, sizeof shader.BytecodeLength, key));
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+            D3D12_INPUT_LAYOUT_DESC layout{};
+            std::memcpy(&layout, value, sizeof layout);
+            for (UINT n = 0; n < layout.NumElements; ++n) {
+                auto element = layout.pInputElementDescs[n];
+                const auto *const name = element.SemanticName ? element.SemanticName : "";
+                key = bytes_key(name, std::strlen(name), key);
+                element.SemanticName = nullptr;
+                key = bytes_key(&element, sizeof element, key);
+            }
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+            if (std::any_of(value, stream.data() + at + size, [](auto byte) { return byte; }))
+                return 0;
+            break;
+        default:
+            key = bytes_key(stream.data() + at + 4, size - 4, key);
+        }
+        at += size;
+    }
+    return key;
+}
 // ID3D12Device2::CreatePipelineState, from a stream of subobjects: the host's (47), and why
 // when it turns the pipeline down
 HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
@@ -9589,10 +9665,23 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             }
         at += size;
     }
+    // the host driver's blob of it, kept by what the stream is made of
+    const auto key = desc == &host ? stream_key(stream) : 0;
+    if (key) {
+        stream.resize(stream.size() + 24);
+        const UINT type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO;
+        std::memcpy(stream.data() + stream.size() - 24, &type, 4);
+        host = {stream.size(), stream.data()};
+    }
     HRESULT result;
     {
         const HostClock timed{2};
-        result = original<Create>(self, 47)(self, desc, iid, state);
+        D3D12_CACHED_PIPELINE_STATE unused{};
+        auto &cached = key ? *reinterpret_cast<D3D12_CACHED_PIPELINE_STATE *>(stream.data() +
+                                                                              stream.size() - 16)
+                           : unused;
+        result = with_driver_blob(
+            key, cached, state, [&] { return original<Create>(self, 47)(self, desc, iid, state); });
     }
     if (retry_without_heaps(result, tried_heaps)) {
         if (from_shader)
@@ -9823,6 +9912,7 @@ void make_pipelines() {
         deferred_release(pipeline);
     }
 }
+void record_pipeline(const DeferredPipeline &pipeline);
 ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state) {
     auto *const deferred = deferred_of(state);
     if (!deferred)
@@ -9845,6 +9935,8 @@ ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state) {
     using Clock = std::chrono::steady_clock;
     static std::uint64_t frame = ~0ull;
     static Clock::duration left{};
+    if (!deferred->queued.load())
+        record_pipeline(*deferred);
     std::unique_lock lock(making_mutex);
     if (!deferred->queued.exchange(true)) {
         deferred_add_ref(deferred);
@@ -10011,6 +10103,335 @@ HRESULT STDMETHODCALLTYPE deferred_pipeline_state(ID3D12Device *self,
     }
     return hand_out_deferred(std::move(pipeline), iid, state);
 }
+// The pipelines lists were given, as the title made them, each a file of the shader cache's
+// "pipelines" folder: `xvboot pipeline-warm` makes them for the host's driver without the
+// title, whose next run is given the driver's blobs of them (with_driver_blob) instead of
+// waiting seconds on each. A file holds its parts (1 a root signature as the title made it, 2
+// a shader, 3 an input layout: a count, then each element's semantic name and the element),
+// then the title's description with each pointer the number of its part (0 for none). After
+// ScarlettPort's `warm` and XCL's manifest of pipelines.
+constexpr char recipe_magic[] = "XVPR";
+std::filesystem::path recipe_folder() {
+    const auto &folder = shader_cache_directory();
+    return folder.empty() ? folder : folder / "pipelines";
+}
+struct Recipe {
+    std::vector<std::pair<std::uint8_t, std::vector<std::uint8_t>>> parts;
+    std::vector<std::uint8_t> desc;
+    bool complete = true;
+    std::uint64_t signature(const void *signature) {
+        if (!signature)
+            return 0;
+        std::vector<std::uint8_t> blob;
+        {
+            const std::lock_guard lock(signature_mutex);
+            if (const auto found = signature_blobs.find(signature); found != signature_blobs.end())
+                blob = found->second;
+        }
+        complete &= !blob.empty();
+        parts.emplace_back(1, std::move(blob));
+        return parts.size();
+    }
+    std::uint64_t shader(const D3D12_SHADER_BYTECODE &code) {
+        if (!code.pShaderBytecode)
+            return 0;
+        const auto *const bytes = static_cast<const std::uint8_t *>(code.pShaderBytecode);
+        parts.emplace_back(2, std::vector<std::uint8_t>(bytes, bytes + code.BytecodeLength));
+        return parts.size();
+    }
+    std::uint64_t layout(const D3D12_INPUT_LAYOUT_DESC &layout) {
+        if (!layout.NumElements)
+            return 0;
+        std::vector<std::uint8_t> bytes(4);
+        std::memcpy(bytes.data(), &layout.NumElements, 4);
+        for (UINT n = 0; n < layout.NumElements; ++n) {
+            auto element = layout.pInputElementDescs[n];
+            const std::string_view name = element.SemanticName ? element.SemanticName : "";
+            bytes.insert(bytes.end(), name.begin(), name.end());
+            bytes.push_back(0);
+            element.SemanticName = nullptr;
+            const auto *const raw = reinterpret_cast<const std::uint8_t *>(&element);
+            bytes.insert(bytes.end(), raw, raw + sizeof element);
+        }
+        parts.emplace_back(3, std::move(bytes));
+        return parts.size();
+    }
+};
+template <class T> void put_number(T &field, std::uint64_t number) {
+    std::memcpy(&field, &number, sizeof number);
+}
+void record_pipeline(const DeferredPipeline &pipeline) {
+    static const auto folder = recipe_folder();
+    static const bool off = [] {
+        const auto *const text = std::getenv("XV_PSO_RECIPES");
+        return text && *text == '0';
+    }();
+    if (folder.empty() || pipeline.bvh || off)
+        return;
+    Recipe recipe;
+    if (pipeline.kind == 0) {
+        auto desc = pipeline.graphics;
+        put_number(desc.pRootSignature, recipe.signature(desc.pRootSignature));
+        for (auto *const shader : {&desc.VS, &desc.PS, &desc.DS, &desc.HS, &desc.GS})
+            put_number(shader->pShaderBytecode, recipe.shader(*shader));
+        put_number(desc.InputLayout.pInputElementDescs, recipe.layout(desc.InputLayout));
+        desc.CachedPSO = {};
+        const auto *const raw = reinterpret_cast<const std::uint8_t *>(&desc);
+        recipe.desc.assign(raw, raw + sizeof desc);
+    } else if (pipeline.kind == 1) {
+        auto desc = pipeline.compute;
+        put_number(desc.pRootSignature, recipe.signature(desc.pRootSignature));
+        put_number(desc.CS.pShaderBytecode, recipe.shader(desc.CS));
+        desc.CachedPSO = {};
+        const auto *const raw = reinterpret_cast<const std::uint8_t *>(&desc);
+        recipe.desc.assign(raw, raw + sizeof desc);
+    } else {
+        recipe.desc = pipeline.stream;
+        for (std::size_t at = 0; at + 8 <= recipe.desc.size();) {
+            std::uint32_t type;
+            std::memcpy(&type, recipe.desc.data() + at, 4);
+            if (type >= std::size(subobject_sizes))
+                return;
+            auto *const value = recipe.desc.data() + at + 8;
+            if ((type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS &&
+                 type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) ||
+                type == 23 || type == 24) {
+                D3D12_SHADER_BYTECODE code;
+                std::memcpy(&code, value, sizeof code);
+                put_number(code.pShaderBytecode, recipe.shader(code));
+                std::memcpy(value, &code, sizeof code);
+            } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                void *signature;
+                std::memcpy(&signature, value, sizeof signature);
+                put_number(signature, recipe.signature(signature));
+                std::memcpy(value, &signature, sizeof signature);
+            } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+                D3D12_INPUT_LAYOUT_DESC layout;
+                std::memcpy(&layout, value, sizeof layout);
+                put_number(layout.pInputElementDescs, recipe.layout(layout));
+                std::memcpy(value, &layout, sizeof layout);
+            }
+            at += subobject_sizes[type];
+        }
+    }
+    if (!recipe.complete)
+        return;
+    std::vector<std::uint8_t> file(recipe_magic, recipe_magic + 4);
+    const auto put = [&](const void *bytes, std::size_t size) {
+        file.insert(file.end(), static_cast<const std::uint8_t *>(bytes),
+                    static_cast<const std::uint8_t *>(bytes) + size);
+    };
+    const std::uint32_t head[] = {1, static_cast<std::uint32_t>(pipeline.kind),
+                                  static_cast<std::uint32_t>(recipe.parts.size())};
+    put(head, sizeof head);
+    for (const auto &[type, bytes] : recipe.parts) {
+        const std::uint64_t size = bytes.size();
+        put(&type, 1);
+        put(&size, sizeof size);
+        put(bytes.data(), bytes.size());
+    }
+    const std::uint64_t size = recipe.desc.size();
+    put(&size, sizeof size);
+    put(recipe.desc.data(), recipe.desc.size());
+    char name[32];
+    std::snprintf(name, sizeof name, "%016llx.xvpr",
+                  static_cast<unsigned long long>(bytes_key(file.data(), file.size())));
+    std::error_code error;
+    const auto path = folder / name;
+    if (std::filesystem::exists(path, error))
+        return;
+    std::filesystem::create_directories(folder, error);
+    auto part = path;
+    part += ".part";
+    if (std::ofstream out(part, std::ios::binary); out) {
+        out.write(reinterpret_cast<const char *>(file.data()),
+                  static_cast<std::streamsize>(file.size()));
+        out.close();
+        std::filesystem::rename(part, path, error);
+    }
+}
+HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, void **device);
+// one file of those made for the host, its driver's blob kept if it took long; false if the
+// file is not one
+bool warm_pipeline(ID3D12Device *device, const std::vector<std::uint8_t> &file) {
+    std::size_t at = 0;
+    const auto take = [&](void *to, std::size_t size) {
+        if (at + size > file.size())
+            return false;
+        std::memcpy(to, file.data() + at, size);
+        at += size;
+        return true;
+    };
+    char magic[4];
+    std::uint32_t head[3];
+    if (!take(magic, 4) || std::memcmp(magic, recipe_magic, 4) || !take(head, sizeof head) ||
+        head[0] != 1)
+        return false;
+    struct Part {
+        std::uint8_t type;
+        std::vector<std::uint8_t> bytes;
+        ID3D12RootSignature *signature = nullptr;
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    };
+    std::vector<Part> parts(head[2]);
+    bool fine = true;
+    for (auto &part : parts) {
+        std::uint64_t size = 0;
+        if (!take(&part.type, 1) || !take(&size, sizeof size) || at + size > file.size())
+            return false;
+        part.bytes.assign(file.begin() + at, file.begin() + at + size);
+        at += size;
+        if (part.type == 1)
+            fine &= SUCCEEDED(create_root_signature(device, 0, part.bytes.data(), part.bytes.size(),
+                                                    IID_PPV_ARGS(&part.signature)));
+        if (part.type == 3 && part.bytes.size() >= 4) {
+            std::uint32_t count = 0;
+            std::memcpy(&count, part.bytes.data(), 4);
+            for (std::size_t from = 4; part.elements.size() < count && from < part.bytes.size();) {
+                const auto *const name = reinterpret_cast<const char *>(part.bytes.data() + from);
+                from += std::strlen(name) + 1;
+                D3D12_INPUT_ELEMENT_DESC element{};
+                if (from + sizeof element > part.bytes.size())
+                    break;
+                std::memcpy(&element, part.bytes.data() + from, sizeof element);
+                element.SemanticName = name;
+                from += sizeof element;
+                part.elements.push_back(element);
+            }
+        }
+    }
+    std::uint64_t size = 0;
+    std::vector<std::uint8_t> desc;
+    if (!take(&size, sizeof size) || at + size > file.size())
+        return false;
+    desc.assign(file.begin() + at, file.begin() + at + size);
+    const auto part_of = [&](const void *number) -> Part * {
+        const auto index = reinterpret_cast<std::uintptr_t>(number);
+        return index && index <= parts.size() ? &parts[index - 1] : nullptr;
+    };
+    const auto signature = [&](void *number) -> ID3D12RootSignature * {
+        auto *const part = part_of(number);
+        return part ? part->signature : nullptr;
+    };
+    const auto shader = [&](D3D12_SHADER_BYTECODE &code) {
+        auto *const part = part_of(code.pShaderBytecode);
+        code = part ? D3D12_SHADER_BYTECODE{part->bytes.data(), part->bytes.size()}
+                    : D3D12_SHADER_BYTECODE{};
+    };
+    const auto layout = [&](D3D12_INPUT_LAYOUT_DESC &layout) {
+        auto *const part = part_of(layout.pInputElementDescs);
+        layout = part ? D3D12_INPUT_LAYOUT_DESC{part->elements.data(),
+                                                static_cast<UINT>(part->elements.size())}
+                      : D3D12_INPUT_LAYOUT_DESC{};
+    };
+    void *made = nullptr;
+    if (fine && head[1] == 0 && desc.size() == sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics;
+        std::memcpy(&graphics, desc.data(), sizeof graphics);
+        graphics.pRootSignature = signature(graphics.pRootSignature);
+        for (auto *const code :
+             {&graphics.VS, &graphics.PS, &graphics.DS, &graphics.HS, &graphics.GS})
+            shader(*code);
+        layout(graphics.InputLayout);
+        create_graphics_pipeline(device, &graphics,
+                                 IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState **>(&made)));
+    } else if (fine && head[1] == 1 && desc.size() == sizeof(D3D12_COMPUTE_PIPELINE_STATE_DESC)) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC compute;
+        std::memcpy(&compute, desc.data(), sizeof compute);
+        compute.pRootSignature = signature(compute.pRootSignature);
+        shader(compute.CS);
+        create_compute_pipeline(device, &compute,
+                                IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState **>(&made)));
+    } else if (fine && head[1] == 2) {
+        for (std::size_t at_object = 0; at_object + 8 <= desc.size();) {
+            std::uint32_t type;
+            std::memcpy(&type, desc.data() + at_object, 4);
+            if (type >= std::size(subobject_sizes))
+                break;
+            auto *const value = desc.data() + at_object + 8;
+            if ((type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS &&
+                 type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) ||
+                type == 23 || type == 24) {
+                D3D12_SHADER_BYTECODE code;
+                std::memcpy(&code, value, sizeof code);
+                shader(code);
+                std::memcpy(value, &code, sizeof code);
+            } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                void *number;
+                std::memcpy(&number, value, sizeof number);
+                void *made_signature = signature(number);
+                std::memcpy(value, &made_signature, sizeof made_signature);
+            } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+                D3D12_INPUT_LAYOUT_DESC elements;
+                std::memcpy(&elements, value, sizeof elements);
+                layout(elements);
+                std::memcpy(value, &elements, sizeof elements);
+            }
+            at_object += subobject_sizes[type];
+        }
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream{desc.size(), desc.data()};
+        create_pipeline_state(device, &stream,
+                              IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState **>(&made)));
+    }
+    if (made)
+        static_cast<IUnknown *>(made)->Release();
+    for (auto &part : parts)
+        if (part.signature)
+            part.signature->Release();
+    return true;
+}
+} // namespace
+
+// See record_pipeline: each of the pipelines a title's lists were given in its earlier runs
+// made for the host once, on `threads` threads, those done kept in the folder's list
+std::size_t warm_pipelines(unsigned threads) {
+    const auto folder = recipe_folder();
+    std::error_code error;
+    if (folder.empty() || !std::filesystem::is_directory(folder, error))
+        return 0;
+    console = Target::scarlett;
+    ID3D12Device *device = nullptr;
+    if (FAILED(xbox_create_device(nullptr, nullptr, IID_PPV_ARGS(&device))))
+        return 0;
+    std::set<std::string> done;
+    const auto done_file = folder / "done.txt";
+    for (std::ifstream in(done_file); in;) {
+        std::string line;
+        if (std::getline(in, line) && !line.empty())
+            done.insert(line);
+    }
+    std::vector<std::filesystem::path> files;
+    for (const auto &entry : std::filesystem::directory_iterator(folder, error))
+        if (entry.path().extension() == ".xvpr" && !done.contains(entry.path().filename().string()))
+            files.push_back(entry.path());
+    std::atomic<std::size_t> next{0}, made{0};
+    std::mutex done_mutex;
+    std::ofstream done_out(done_file, std::ios::app);
+    const auto work = [&] {
+        for (std::size_t index; (index = next++) < files.size();) {
+            std::ifstream in(files[index], std::ios::binary);
+            const std::vector<std::uint8_t> file((std::istreambuf_iterator<char>(in)), {});
+            if (!warm_pipeline(device, file))
+                continue;
+            const std::lock_guard lock(done_mutex);
+            done_out << files[index].filename().string() << '\n' << std::flush;
+            if (++made % 25 == 0)
+                std::fprintf(stderr,
+                             "[Runtime] pipelines made: %zu of %zu, driver blobs kept %llu\n",
+                             made.load(), files.size(),
+                             static_cast<unsigned long long>(driver_blobs.kept.load()));
+        }
+    };
+    std::vector<std::thread> workers;
+    for (unsigned n = 1; n < std::max(threads, 1u); ++n)
+        workers.emplace_back(work);
+    work();
+    for (auto &worker : workers)
+        worker.join();
+    device->Release();
+    return made;
+}
+namespace {
 // the host's method `Index` after its first 44, at whatever slot the console has it
 template <std::size_t... Index>
 std::array<Slot, sizeof...(Index)> later_device_methods(std::index_sequence<Index...>) {
