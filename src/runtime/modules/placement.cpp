@@ -126,7 +126,9 @@ LONG CALLBACK written(EXCEPTION_POINTERS *exception) {
     // going on is only right if the write can now happen; otherwise it faults again forever
     if (ours && !writable(address))
         protect(address, address + 1, PAGE_READWRITE);
-    return ours && writable(address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    // A page another thread opened between the fault and this handler (its placement let go
+    // of, or written by it first) takes the write now: it is made again, not a crash.
+    return writable(address) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 UINT row_bytes(UINT width, DXGI_FORMAT format) {

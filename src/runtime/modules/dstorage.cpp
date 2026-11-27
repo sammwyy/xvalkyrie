@@ -253,6 +253,16 @@ HRESULT read_file(const Request &request, void *target) {
         return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
     return S_OK;
 }
+// a copy into the title's memory where a guard's fault is taken, and memory that is not there
+// fails it instead of ending the process
+bool copy_to_title(void *to, const void *from, std::size_t size) {
+    __try {
+        std::memcpy(to, from, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 // where a request's data comes from: a file, the title's memory or its physical pages
 HRESULT read_source(const Request &request, std::vector<std::uint8_t> &buffer,
                     const std::uint8_t *&data) {
@@ -328,7 +338,37 @@ HRESULT read(const Request &request) {
     if (!decompress && options.source_type != source_memory &&
         !options.destination_is_physical_pages) {
         const TitleWrite writing(request.destination, request.source_size);
-        return read_file(request, request.destination);
+        const auto result = read_file(request, request.destination);
+        if (result != HRESULT_FROM_WIN32(ERROR_NOACCESS))
+            return result;
+        // The host's kernel does not fault where it writes the title's memory, it fails: a
+        // page made read-only meanwhile (a guard, or an alias the title mapped there) failed
+        // a title's read, and the title stopped on it. Read aside, the copy faults instead,
+        // where the guard is taken.
+        std::vector<std::uint8_t> aside(request.source_size);
+        if (const auto again = read_file(request, aside.data()); FAILED(again))
+            return again;
+        if (copy_to_title(request.destination, aside.data(), aside.size())) {
+            if (static std::atomic<int> told{0}; told++ < 4) {
+                std::fprintf(stderr,
+                             "[Runtime] DirectStorage: %u bytes the host's kernel could not write "
+                             "to the title's memory at %p are copied there\n",
+                             request.source_size, request.destination);
+                std::fflush(stderr);
+            }
+            return S_OK;
+        }
+        if (static std::atomic<int> told{0}; told++ < 4) {
+            MEMORY_BASIC_INFORMATION info{};
+            VirtualQuery(request.destination, &info, sizeof info);
+            std::fprintf(stderr,
+                         "[Runtime] DirectStorage: %u bytes for the title's memory at %p, which "
+                         "is not there to write (state 0x%lx, protection 0x%lx, type 0x%lx)\n",
+                         request.source_size, request.destination, info.State, info.Protect,
+                         info.Type);
+            std::fflush(stderr);
+        }
+        return result;
     }
     std::vector<std::uint8_t> packed;
     const std::uint8_t *data = nullptr;
