@@ -233,7 +233,7 @@ void save(ID3D12Resource *resource, D3D12_RESOURCE_STATES state, std::uint64_t f
 // indirect) is captured, as many times as asked (once without), a frame apart at least: a
 // title's 3D shots, whose frame numbers differ from run to run.
 struct AutoCapture {
-    std::uint64_t draws = 0, left = 0;
+    std::uint64_t draws = 0, left = 0, delay = 0;
     std::atomic<std::uint64_t> meshes{0}, frame{~0ull};
 };
 AutoCapture &auto_capture() {
@@ -242,7 +242,12 @@ AutoCapture &auto_capture() {
         if (const auto *const text = std::getenv("XV_CAPTURE_AUTO")) {
             char *end = nullptr;
             state.draws = std::strtoull(text, &end, 10);
-            state.left = end && *end == ',' ? std::strtoull(end + 1, nullptr, 10) : 1;
+            if (end && *end == ',')
+                state.left = std::strtoull(end + 1, &end, 10);
+            else
+                state.left = 1;
+            if (end && *end == ',')
+                state.delay = std::strtoull(end + 1, nullptr, 10);
         }
         return true;
     }();
@@ -264,6 +269,10 @@ void arm_auto_capture() {
         return;
     const auto meshes = state.meshes.exchange(0);
     if (state.left && meshes >= state.draws && state.frame != frames_shown() + 1) {
+        if (state.delay) {
+            --state.delay;
+            return;
+        }
         --state.left;
         state.frame = frames_shown() + 2;
         std::fprintf(stderr, "[Capture] %llu mesh draws in frame %llu: the next is captured\n",
@@ -306,25 +315,29 @@ void capture_frame(ID3D12Resource *picture) {
     }
     std::fprintf(stderr, "[Capture] frame %llu: %zu targets, into %ls\n",
                  static_cast<unsigned long long>(frame), taken.size(), folder().c_str());
+    const bool capture_all = std::getenv("XV_CAPTURE_ALL") != nullptr;
     int index = 0;
     for (const auto &one : taken) {
         char name[32];
         std::snprintf(name, sizeof name, "%02d_%s", index++, one.depth ? "depth" : "target");
-        save(one.resource,
-             tracked_state(one.resource, one.depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
-                                                   : D3D12_RESOURCE_STATE_RENDER_TARGET),
-             frame, name, one.draws);
+        if (!one.depth || capture_all)
+            save(one.resource,
+                 tracked_state(one.resource, one.depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                                       : D3D12_RESOURCE_STATE_RENDER_TARGET),
+                 frame, name, one.draws);
         one.resource->Release();
     }
     if (picture)
         save(picture, tracked_state(picture, D3D12_RESOURCE_STATE_PRESENT), frame, "presented", 0);
     // and the textures the title writes through memory, as the host has them now
-    index = 0;
-    for (auto *const texture : written_textures()) {
-        char name[32];
-        std::snprintf(name, sizeof name, "written%02d", index++);
-        save(texture, tracked_state(texture, D3D12_RESOURCE_STATE_COMMON), frame, name, 0);
-        texture->Release();
+    if (capture_all) {
+        index = 0;
+        for (auto *const texture : written_textures()) {
+            char name[32];
+            std::snprintf(name, sizeof name, "written%02d", index++);
+            save(texture, tracked_state(texture, D3D12_RESOURCE_STATE_COMMON), frame, name, 0);
+            texture->Release();
+        }
     }
     std::fflush(stderr);
 }

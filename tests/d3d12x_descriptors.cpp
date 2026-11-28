@@ -56,3 +56,38 @@ TEST_CASE("descriptors made and copied in a heap shaders see are the ones shader
     results->Release();
     data->Release();
 }
+
+TEST_CASE("unwritten shader-visible heap slots read as null textures without dropping the device") {
+    if (!device())
+        return;
+    std::uint64_t output = 0;
+    auto *const results = buffer(4096, output);
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 3};
+    const D3D12_ROOT_PARAMETER parameters[]{table(&range, 1),
+                                            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const signature = root_signature({2, parameters});
+    auto *const pipeline = compute_pipeline(signature, R"(
+        Texture2D<float4> unwritten : register(t0);
+        RWByteAddressBuffer output : register(u0);
+        [numthreads(1, 1, 1)] void main() {
+            float4 v = unwritten.Load(int3(0, 0, 0));
+            output.Store4(0, asuint(v));
+            output.Store(16, 1u);
+        })");
+    const Heap heap(8);
+    Work work;
+    work.record(32, 1u, &heap.heap);
+    work.record(33, signature);
+    work.record(25, pipeline);
+    work.record(35, 0u, heap.gpu);
+    work.record(45, 1u, output);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+    CHECK(removed_reason() == S_OK);
+    CHECK(words(output)[4] == 1u);
+    for (int i = 0; i < 4; ++i)
+        CHECK(words(output)[i] == 0u);
+    pipeline->Release();
+    signature->Release();
+    results->Release();
+}

@@ -1001,6 +1001,30 @@ ID3D12Resource *texture_placed_at(std::uint64_t address, const D3D12_RESOURCE_DE
     }
     return nullptr;
 }
+UINT element_bytes(DXGI_FORMAT format);
+// A GPU-written texture at `address` with the same shape and texel width in another format
+// (e.g. R32_UINT UAV packing R9G9B9E5 light read through an R9G9B9E5 SRV placed at its address).
+ID3D12Resource *texture_alias_at(std::uint64_t address, const D3D12_RESOURCE_DESC &of) {
+    const auto elem = element_bytes(of.Format);
+    if (!elem || of.SampleDesc.Count > 1)
+        return nullptr;
+    const std::lock_guard lock(placed_texture_mutex);
+    for (const auto &[resource, placed] : placed_textures) {
+        const auto &d = placed.desc;
+        if (placed.address == address && d.Dimension == of.Dimension && d.Width == of.Width &&
+            d.Height == of.Height && d.DepthOrArraySize == of.DepthOrArraySize &&
+            d.MipLevels == of.MipLevels && d.SampleDesc.Count <= 1 && d.Format != of.Format &&
+            !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+            (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
+            element_bytes(d.Format) == elem) {
+            auto *const texture = static_cast<ID3D12Resource *>(const_cast<void *>(resource));
+            texture->AddRef();
+            return texture;
+        }
+    }
+    return nullptr;
+}
 // GetGPUVirtualAddress (11): see track_buffer, and a placed texture's is where it was placed
 bool mapped_address(const void *resource, std::uint64_t &address);
 std::uint64_t STDMETHODCALLTYPE resource_address(ID3D12Resource *self) {
@@ -1008,9 +1032,22 @@ std::uint64_t STDMETHODCALLTYPE resource_address(ID3D12Resource *self) {
         return address;
     if (std::uint64_t address = 0; placed_texture_address(self, address))
         return address;
-    const auto address = original<std::uint64_t(STDMETHODCALLTYPE *)(void *)>(self, 11)(self);
+    auto address = original<std::uint64_t(STDMETHODCALLTYPE *)(void *)>(self, 11)(self);
     // the host has no address for a texture; the console's is its memory
-    return address ? address : reinterpret_cast<std::uint64_t>(scratch_memory(self));
+    if (!address)
+        address = reinterpret_cast<std::uint64_t>(scratch_memory(self));
+    // an address outside the title's memory, which a title may check its own are in
+    if (static std::atomic<int> told{0}; told++ < 32) {
+        const auto desc = self->GetDesc();
+        std::fprintf(stderr,
+                     "[Runtime] the address of a resource of dimension %d %llux%u format %d flags "
+                     "0x%x, %llx, is none of the title's memory, for %s\n",
+                     desc.Dimension, desc.Width, desc.Height, desc.Format, desc.Flags,
+                     static_cast<unsigned long long>(address),
+                     detail::guest_location(_ReturnAddress()).c_str());
+        std::fflush(stderr);
+    }
+    return address;
 }
 void mappable_resource(void *resource) {
     console_vtable<Family::resource>(resource, 15, 17,
@@ -1200,8 +1237,18 @@ std::map<std::uint64_t, MemoryView> memory_views;
 struct BufferView {
     ID3D12Resource *resource;
     D3D12_SHADER_RESOURCE_VIEW_DESC desc;
+    std::uint64_t title_address = 0;
+};
+struct UavBufferView {
+    ID3D12Resource *resource;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw_desc{};
+    bool promoted_from_raw = false;
 };
 std::map<std::uint64_t, BufferView> buffer_views; // under memory_view_mutex
+std::map<std::uint64_t, UavBufferView> uav_views; // under memory_view_mutex
+std::atomic<bool> console_heap_shaders_active{false};
+void activate_console_heap_shaders(ID3D12Device *device);
 // XV_D3D_LOST: what the shader resource view in each of the host's slots was made of
 std::map<std::uint64_t, std::string> lost_views; // under memory_view_mutex
 // the host's descriptors of `slots` slots from `at` were written: the twin's go to the heap
@@ -1332,6 +1379,10 @@ void resolve(const ShadowHeap &heap, std::uintptr_t at) {
         buffer_views[own.ptr] = found->second;
     else
         buffer_views.erase(own.ptr);
+    if (const auto found = uav_views.find(words[1]); found != uav_views.end())
+        uav_views[own.ptr] = found->second;
+    else
+        uav_views.erase(own.ptr);
 }
 // the host's handle for a console one whose descriptor is about to be read
 D3D12_CPU_DESCRIPTOR_HANDLE host_view(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -1349,6 +1400,10 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_view(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
 // a constant buffer view of nothing, as the device's inline CreateConstantBufferView writes it
 bool null_buffer(const std::uint32_t *words) { return words[2] == 1 && words[3] == 0x0002403c; }
 std::uint64_t gpu_address(std::uint64_t address);
+std::uint64_t readable_bytes(const void *address, std::uint64_t bytes);
+std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
+                        std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
+                        std::uint64_t *offset = nullptr);
 // A descriptor the title wrote: made on the host from what the hardware descriptor says.
 // Buffers (V#: 48-bit address, stride in bits 48-61, record count in the third dword) become
 // constant buffer views.
@@ -1384,8 +1439,14 @@ void decode_written(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     D3D12_CONSTANT_BUFFER_VIEW_DESC view{
         gpu_address(address),
         static_cast<UINT>(std::min<std::uint64_t>((size + 255) & ~255ull, 65536))};
+    if (console == Target::scarlett && (view.BufferLocation & 255) && view.SizeInBytes) {
+        if (const auto avail =
+                readable_bytes(reinterpret_cast<const void *>(address), view.SizeInBytes))
+            if (const auto copy = ring_copy(reinterpret_cast<const void *>(address), avail))
+                view.BufferLocation = copy;
+    }
     // memory the host's GPU cannot see: a view of nothing
-    if (!view.BufferLocation)
+    if (!view.BufferLocation || (view.BufferLocation & 255))
         view = {};
     using Create = void(STDMETHODCALLTYPE *)(void *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *,
                                              D3D12_CPU_DESCRIPTOR_HANDLE);
@@ -1466,6 +1527,7 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
     // the twin of a heap shaders see; without one the host's descriptors are made in it
     std::shared_ptr<Twin> twin;
     if (visible) {
+        const auto host_visible = host;
         D3D12_DESCRIPTOR_HEAP_DESC twin_desc = desc;
         twin_desc.Flags &= ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         void *made = nullptr;
@@ -1474,14 +1536,51 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
         if (SUCCEEDED(original<Create>(device, 14)(device, &twin_desc,
                                                    __uuidof(ID3D12DescriptorHeap), &made)) &&
             made) {
-            twin = std::make_shared<Twin>(device, static_cast<ID3D12DescriptorHeap *>(made), host,
-                                          desc.Type, twin_desc.NumDescriptors, host_stride);
+            twin = std::make_shared<Twin>(device, static_cast<ID3D12DescriptorHeap *>(made),
+                                          host_visible, desc.Type, twin_desc.NumDescriptors,
+                                          host_stride);
             host = twin->start;
             // an eighth of the host's heap, 128 Ki slots at most, for the ring: a title that
-            // goes round all of its heap in turn uses a few tables of the far part a frame
-            if (host_count < desc.NumDescriptors) {
-                twin->ring_count = std::min(host_count / 8, 131072u);
-                twin->limit = twin->ring_first = host_count - twin->ring_count;
+            // goes round all of its heap in turn uses a few tables of the far part a frame.
+            // Keep the very last visible slot as a permanent null descriptor for clamped indices.
+            if (host_count < desc.NumDescriptors && host_count > 1) {
+                const UINT reserved = std::min(host_count / 8, 131072u);
+                twin->ring_count = reserved > 1 ? reserved - 1 : 0;
+                twin->limit = twin->ring_first = host_count - 1 - twin->ring_count;
+            }
+            const UINT visible_count = std::min(host_count, desc.NumDescriptors);
+            if (visible_count > 0 && (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+                                      desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)) {
+                if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
+                    null_srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    null_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    null_srv.Texture2D.MipLevels = 1;
+                    original<void(STDMETHODCALLTYPE *)(void *, void *, const void *,
+                                                       D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 18)(
+                        device, nullptr, &null_srv, twin->start);
+                } else {
+                    D3D12_SAMPLER_DESC def{};
+                    def.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                    def.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    def.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    def.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    def.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+                    def.MaxLOD = 3.402823466e+38f;
+                    original<void(STDMETHODCALLTYPE *)(void *, const void *,
+                                                       D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 22)(
+                        device, &def, twin->start);
+                }
+                using Copy = void(STDMETHODCALLTYPE *)(void *, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                       D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                       D3D12_DESCRIPTOR_HEAP_TYPE);
+                const auto copy = original<Copy>(device, 24);
+                for (UINT filled = 1; filled < visible_count; filled *= 2)
+                    copy(device, std::min(filled, visible_count - filled),
+                         {twin->start.ptr + std::uint64_t{filled} * host_stride}, twin->start,
+                         desc.Type);
+                copy(device, visible_count, host_visible, twin->start, desc.Type);
             }
         }
     }
@@ -1645,6 +1744,132 @@ bool mapped_address(const void *resource, std::uint64_t &address) {
     if (found == mapped_start.end())
         return false;
     address = found->second;
+    return true;
+}
+extern std::atomic<ID3D12Device *> d3d12_device;
+struct TitleHeap {
+    ID3D12Heap *heap = nullptr;
+    ID3D12Resource *buffer = nullptr;
+    std::uint64_t gpu = 0;
+    std::uint64_t size = 0;
+};
+struct ReleasedTitleHeap {
+    TitleHeap entry;
+    ULONGLONG when = 0;
+};
+std::mutex title_heap_mutex;
+std::map<std::pair<ID3D12Device *, std::uint64_t>, TitleHeap> title_heaps;
+std::deque<ReleasedTitleHeap> released_title_heaps;
+std::once_flag title_heap_hooked;
+void drain_released_title_heaps(ULONGLONG now) {
+    while (!released_title_heaps.empty() && now - released_title_heaps.front().when > 20000) {
+        auto &old = released_title_heaps.front().entry;
+        if (old.buffer)
+            old.buffer->Release();
+        if (old.heap)
+            old.heap->Release();
+        released_title_heaps.pop_front();
+    }
+}
+bool title_memory_buffer(std::uint64_t address, ID3D12Resource *&resource, std::uint64_t &offset,
+                         std::uint64_t &contiguous, std::uint64_t &gpu) {
+    if (!address || console != Target::scarlett)
+        return false;
+    auto *const device = d3d12_device.load();
+    if (!device)
+        return false;
+    SectionSpan span{};
+    if (!title_memory_section(static_cast<std::uintptr_t>(address), span) || !span.section)
+        return false;
+    std::call_once(title_heap_hooked, [] {
+        on_section_released([](std::uint64_t id) {
+            const auto now = GetTickCount64();
+            const std::lock_guard lock(title_heap_mutex);
+            for (auto it = title_heaps.begin(); it != title_heaps.end();) {
+                if (it->first.second == id) {
+                    if (it->second.buffer || it->second.heap)
+                        released_title_heaps.push_back({it->second, now});
+                    it = title_heaps.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            drain_released_title_heaps(now);
+        });
+        static const auto cleanup_title_heaps = +[] {
+            const std::lock_guard lock(title_heap_mutex);
+            for (auto &[k, th] : title_heaps) {
+                if (th.buffer)
+                    th.buffer->Release();
+                if (th.heap)
+                    th.heap->Release();
+            }
+            title_heaps.clear();
+            for (auto &[th, when] : released_title_heaps) {
+                if (th.buffer)
+                    th.buffer->Release();
+                if (th.heap)
+                    th.heap->Release();
+            }
+            released_title_heaps.clear();
+        };
+        std::atexit(cleanup_title_heaps);
+        detail::set_fatal_cleanup(cleanup_title_heaps);
+    });
+    const auto key = std::make_pair(device, span.id);
+    const std::lock_guard lock(title_heap_mutex);
+    auto found = title_heaps.find(key);
+    if (found == title_heaps.end()) {
+        TitleHeap made{};
+        ID3D12Device3 *dev3 = nullptr;
+        HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&dev3));
+        if (SUCCEEDED(hr) && dev3) {
+            hr = dev3->OpenExistingHeapFromFileMapping(span.section, IID_PPV_ARGS(&made.heap));
+            dev3->Release();
+        }
+        if (SUCCEEDED(hr) && made.heap) {
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = span.section_size;
+            desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = device->CreatePlacedResource(made.heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                              nullptr, IID_PPV_ARGS(&made.buffer));
+            if (SUCCEEDED(hr) && made.buffer) {
+                made.gpu = made.buffer->GetGPUVirtualAddress();
+                made.size = span.section_size;
+                if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+                    std::fprintf(
+                        stderr,
+                        "[Runtime] title memory sections are opened directly as GPU heaps\n");
+                    std::fflush(stderr);
+                }
+            } else {
+                made.heap->Release();
+                made.heap = nullptr;
+            }
+        }
+        if (!made.buffer) {
+            if (static std::atomic<int> shown{0}; shown++ < 8) {
+                std::fprintf(
+                    stderr,
+                    "[Runtime] opening a GPU heap over title memory (%llu bytes) failed: 0x%08lx\n",
+                    static_cast<unsigned long long>(span.section_size),
+                    static_cast<unsigned long>(hr));
+                std::fflush(stderr);
+            }
+        }
+        found = title_heaps.emplace(key, made).first;
+    }
+    if (!found->second.buffer)
+        return false;
+    resource = found->second.buffer;
+    offset = span.offset;
+    contiguous = span.contiguous;
+    gpu = found->second.gpu + span.offset;
     return true;
 }
 // The host's GPU address for one the title gives: in a buffer here, the host's address there.
@@ -1895,9 +2120,6 @@ template <class View> bool fit_buffer_view(ID3D12Resource *resource, View &view)
 template <class View> bool raw_off_16(const View &view) {
     return static_cast<UINT>(view.Buffer.Flags) & 1 && view.Buffer.FirstElement % 4;
 }
-std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
-                        std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
-                        std::uint64_t *offset = nullptr);
 // A raw view to read that the host cannot have where it is: what it is of is copied, as it
 // is now, to 16 bytes into the ring of copies, and the view is of the copy, as constants that
 // do not start on 256 bytes are (see create_cbv). `address` becomes the title's address of
@@ -2094,35 +2316,51 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
         // the address is the one the title has for the buffer, which on Series is where
         // its memory is: the host is given its own for it, and no more than the buffer has
         const auto wanted = std::max<std::uint64_t>((bytes + 255) & ~255ull, 256);
-        const D3D12_CONSTANT_BUFFER_VIEW_DESC view{
+        D3D12_CONSTANT_BUFFER_VIEW_DESC view{
             gpu_address(address),
             static_cast<UINT>(std::min<std::uint64_t>({wanted, 65536, room & ~255ull}))};
-        if (!view.SizeInBytes)
+        if (console == Target::scarlett && (view.BufferLocation & 255) && view.SizeInBytes) {
+            if (const auto avail =
+                    readable_bytes(reinterpret_cast<const void *>(address), view.SizeInBytes))
+                if (const auto copy = ring_copy(reinterpret_cast<const void *>(address), avail))
+                    view.BufferLocation = copy;
+        }
+        if (!view.SizeInBytes || (view.BufferLocation & 255))
             view_nothing(true);
         else
             original<void(STDMETHODCALLTYPE *)(void *, const void *, D3D12_CPU_DESCRIPTOR_HANDLE)>(
                 device, 17)(device, &view, host);
     } else {
         const auto size = std::min(room, bytes ? bytes : room);
-        // structured when the descriptor has a stride that is not a format's, raw otherwise
-        const bool structured = stride > 4 && offset % stride == 0;
-        const UINT element = structured ? stride : 4;
+        // structured when the descriptor has a stride that is not a format's, raw otherwise;
+        // promote RAW / stride-4 / stride-8 buffers to stride 16 for translated heap shaders
+        const bool want_s16 = console == Target::scarlett &&
+                              console_heap_shaders_active.load(std::memory_order_acquire) &&
+                              (offset % 16 == 0);
+        const UINT use_stride = stride >= 16 && offset % stride == 0 ? stride
+                                : want_s16                           ? 16u
+                                           : (stride > 4 && offset % stride == 0 ? stride : 0u);
+        const bool structured = use_stride != 0;
+        const UINT element = structured ? use_stride : 4;
         if (type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
             view.Format = structured ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
             view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             view.Buffer = {offset / element, static_cast<UINT>(size / element),
-                           structured ? stride : 0,
+                           structured ? use_stride : 0,
                            structured ? D3D12_BUFFER_SRV_FLAG_NONE : D3D12_BUFFER_SRV_FLAG_RAW};
             std::uint64_t copied = 0;
             if (!fit_buffer_view(resource, view) ||
-                (raw_off_16(view) && !copy_raw_view(resource, view, copied)))
+                (raw_off_16(view) && !copy_raw_view(resource, view, copied))) {
                 view_nothing(true);
-            else
+            } else {
                 original<void(STDMETHODCALLTYPE *)(void *, void *, const void *,
                                                    D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 18)(
                     device, resource, &view, host);
+                const std::lock_guard lock(memory_view_mutex);
+                buffer_views[host.ptr] = {resource, view, address};
+            }
             if (copied)
                 keep_raw_copy({at}, view, copied);
         } else {
@@ -2130,15 +2368,27 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
             view.Format = structured ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
             view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
             view.Buffer = {offset / element, static_cast<UINT>(size / element),
-                           structured ? stride : 0, 0,
+                           structured ? use_stride : 0, 0,
                            structured ? D3D12_BUFFER_UAV_FLAG_NONE : D3D12_BUFFER_UAV_FLAG_RAW};
             // a raw view not on 16 bytes is of nothing: a copy would lose what the GPU writes
-            if (!fit_buffer_view(resource, view) || raw_off_16(view))
+            if (!fit_buffer_view(resource, view) || raw_off_16(view)) {
                 view_nothing(true);
-            else
+            } else {
                 original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *,
                                                    D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 19)(
                     device, resource, nullptr, &view, host);
+                D3D12_UNORDERED_ACCESS_VIEW_DESC raw_orig{};
+                bool from_raw = false;
+                if (want_s16 && stride <= 4) {
+                    raw_orig = view;
+                    raw_orig.Format = DXGI_FORMAT_R32_TYPELESS;
+                    raw_orig.Buffer = {offset / 4, static_cast<UINT>(size / 4), 0, 0,
+                                       D3D12_BUFFER_UAV_FLAG_RAW};
+                    from_raw = true;
+                }
+                const std::lock_guard lock(memory_view_mutex);
+                uav_views[host.ptr] = {resource, view, raw_orig, from_raw};
+            }
         }
     }
     set_mark(heap, at);
@@ -2219,6 +2469,7 @@ std::uint64_t root_address(std::uint64_t address);
 std::uint64_t root_uav_address(std::uint64_t address);
 std::uint32_t root_view_limit(std::uint64_t address);
 std::uint64_t root_constants(std::uint64_t address);
+void copy_title_memory(void *to, const void *from, std::size_t bytes);
 void when_run(void *self, std::function<void()> work);
 // the title's list a method of this thread is recording into, whose copies of the title's
 // memory (ring_copy) are made again when a queue is given it
@@ -2264,23 +2515,24 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
         // buffer of its own. Such constants are copied to where the host takes them, as
         // they are when the view is made (a title may make its views as it draws).
         const auto given = host.BufferLocation;
+        const auto direct = gpu_address(given);
         host.BufferLocation =
-            console == Target::scarlett ? root_address(given) : gpu_address(given);
+            direct ? direct : (console == Target::scarlett ? root_address(given) : 0);
         MEMORY_BASIC_INFORMATION info{};
-        // root_address has copied what is memory of the title's and in no buffer
-        copied = console == Target::scarlett && host.BufferLocation != given &&
-                 VirtualQuery(reinterpret_cast<void *>(given), &info, sizeof info) &&
-                 info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
-        if (console == Target::scarlett && host.BufferLocation & 255 &&
+        const bool readable_title =
             VirtualQuery(reinterpret_cast<void *>(given), &info, sizeof info) &&
-            info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
-            const auto room =
-                reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - given;
-            if (const auto copy = ring_copy(reinterpret_cast<const void *>(given),
-                                            std::min<std::uint64_t>(room, host.SizeInBytes))) {
-                host.BufferLocation = copy;
-                copied = true;
-            }
+            info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+        // root_address has copied what is memory of the title's and in no buffer
+        copied = console == Target::scarlett && !direct && host.BufferLocation != given &&
+                 readable_title;
+        if (console == Target::scarlett && (host.BufferLocation & 255) && readable_title) {
+            const auto avail =
+                readable_bytes(reinterpret_cast<const void *>(given), host.SizeInBytes);
+            if (avail)
+                if (const auto copy = ring_copy(reinterpret_cast<const void *>(given), avail)) {
+                    host.BufferLocation = copy;
+                    copied = true;
+                }
         }
         if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_LOST") && shown++ < 12) {
             std::fprintf(stderr,
@@ -2575,11 +2827,54 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
             desc = &view;
         }
         if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            if (console == Target::scarlett && !view.Buffer.StructureByteStride &&
+                !(view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) {
+                switch (view.Format) {
+                case DXGI_FORMAT_R32G32B32A32_UINT:
+                case DXGI_FORMAT_R32G32B32A32_SINT:
+                    view.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                    break;
+                case DXGI_FORMAT_R32G32B32_UINT:
+                case DXGI_FORMAT_R32G32B32_SINT:
+                    view.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+                    break;
+                case DXGI_FORMAT_R32G32_UINT:
+                case DXGI_FORMAT_R32G32_SINT:
+                    view.Format = DXGI_FORMAT_R32G32_FLOAT;
+                    break;
+                case DXGI_FORMAT_R32_UINT:
+                case DXGI_FORMAT_R32_SINT:
+                    view.Format = DXGI_FORMAT_R32_FLOAT;
+                    break;
+                default:
+                    break;
+                }
+            }
             desc = &view;
             if (!fit_buffer_view(resource, view) ||
                 (raw_off_16(view) && !copy_raw_view(resource, view, copied))) {
                 resource = nullptr;
                 desc = null_view(view, nullptr);
+            } else if (console == Target::scarlett &&
+                       console_heap_shaders_active.load(std::memory_order_acquire) &&
+                       ((view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ||
+                        view.Buffer.StructureByteStride == 4 ||
+                        view.Buffer.StructureByteStride == 8)) {
+                const std::uint64_t elem =
+                    view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride : 4;
+                const auto start = view.Buffer.FirstElement * elem;
+                const auto bytes = view.Buffer.NumElements * elem;
+                if (start % 16 == 0 && bytes) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC s16 = view;
+                    s16.Format = DXGI_FORMAT_UNKNOWN;
+                    s16.Buffer.FirstElement = start / 16;
+                    s16.Buffer.NumElements =
+                        static_cast<UINT>(std::max<std::uint64_t>(1, (bytes + 15) / 16));
+                    s16.Buffer.StructureByteStride = 16;
+                    s16.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+                    if (fit_buffer_view(resource, s16))
+                        view = s16;
+                }
             }
         }
     }
@@ -2594,8 +2889,6 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
         if (made.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
             const auto slot = host_handle(handle).ptr;
             const std::lock_guard lock(memory_view_mutex);
-            if (buffer_views.size() > 400'000)
-                buffer_views.clear();
             buffer_views[slot] = {resource, made};
         }
     }
@@ -2669,6 +2962,8 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
     }
     // the console's own formats as the host has them (see host_format)
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw_uav_orig{};
+    bool uav_promoted_from_raw = false;
     if (desc) {
         std::memcpy(&view, desc, sizeof view);
         if (const auto format =
@@ -2679,12 +2974,59 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
         }
     }
     if (resource && desc && view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        if (console == Target::scarlett && !view.Buffer.StructureByteStride &&
+            !(view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
+            switch (view.Format) {
+            case DXGI_FORMAT_R32G32B32A32_UINT:
+            case DXGI_FORMAT_R32G32B32A32_SINT:
+                view.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                break;
+            case DXGI_FORMAT_R32G32B32_UINT:
+            case DXGI_FORMAT_R32G32B32_SINT:
+                view.Format = DXGI_FORMAT_R32G32B32_FLOAT;
+                break;
+            case DXGI_FORMAT_R32G32_UINT:
+            case DXGI_FORMAT_R32G32_SINT:
+                view.Format = DXGI_FORMAT_R32G32_FLOAT;
+                break;
+            case DXGI_FORMAT_R32_UINT:
+            case DXGI_FORMAT_R32_SINT:
+                view.Format = DXGI_FORMAT_R32_FLOAT;
+                break;
+            default:
+                break;
+            }
+        }
         desc = &view;
         // a raw view not on 16 bytes (see raw_off_16) is of nothing: a copy would lose what
         // the GPU writes
         if (!fit_buffer_view(resource, view) || raw_off_16(view)) {
             resource = counter = nullptr;
             desc = null_view(view, nullptr);
+        } else if (console == Target::scarlett && !counter &&
+                   console_heap_shaders_active.load(std::memory_order_acquire) &&
+                   ((view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) ||
+                    view.Buffer.StructureByteStride == 4 || view.Buffer.StructureByteStride == 8)) {
+            const std::uint64_t elem =
+                view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride : 4;
+            const auto start = view.Buffer.FirstElement * elem;
+            const auto bytes = view.Buffer.NumElements * elem;
+            if (start % 16 == 0 && bytes) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC s16 = view;
+                s16.Format = DXGI_FORMAT_UNKNOWN;
+                s16.Buffer.FirstElement = start / 16;
+                s16.Buffer.NumElements =
+                    static_cast<UINT>(std::max<std::uint64_t>(1, (bytes + 15) / 16));
+                s16.Buffer.StructureByteStride = 16;
+                s16.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+                if (fit_buffer_view(resource, s16)) {
+                    if (view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+                        raw_uav_orig = view;
+                        uav_promoted_from_raw = true;
+                    }
+                    view = s16;
+                }
+            }
         }
     }
     if (static const bool checking = std::getenv("XV_D3D_LOST") != nullptr; checking) {
@@ -2729,6 +3071,15 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
     original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *, Handle)>(self, 19)(
         self, resource, counter, desc, host_handle(handle));
     mark_host(handle);
+    if (resource && !counter && desc && console == Target::scarlett) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC made;
+        std::memcpy(&made, desc, sizeof made);
+        if (made.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+            const auto slot = host_handle(handle).ptr;
+            const std::lock_guard lock(memory_view_mutex);
+            uav_views[slot] = {resource, made, raw_uav_orig, uav_promoted_from_raw};
+        }
+    }
 }
 // Xbox One's CreatePlacedShaderResourceViewX (46) and CreatePlacedUnorderedAccessViewX (47):
 // the console's descriptions begin as the host's do and go on with where the memory is and
@@ -2948,19 +3299,43 @@ void STDMETHODCALLTYPE create_sampler_x(ID3D12Device *self, const ConsoleSampler
 // A copied descriptor: the host's goes along with the host's copy; one the title wrote goes
 // along as the title wrote it, read where it is bound
 void carry(Handle destination, Handle source, UINT stride) {
-    host_view(source);
-    const std::lock_guard lock(shadow_mutex);
-    const auto *const heap = shadow_heap(destination.ptr);
-    if (!heap)
-        return;
-    std::uint64_t first = host_mark;
-    if (shadow_heap(source.ptr))
-        std::memcpy(&first, reinterpret_cast<const void *>(source.ptr), sizeof first);
-    if (first == host_mark || first == 0)
-        set_mark(*heap, destination.ptr);
-    else
-        std::memcpy(reinterpret_cast<void *>(destination.ptr),
-                    reinterpret_cast<const void *>(source.ptr), stride);
+    const auto src_host = host_view(source).ptr;
+    const auto dst_host = host_handle(destination).ptr;
+    bool copied_host = false;
+    {
+        const std::lock_guard lock(shadow_mutex);
+        const auto *const heap = shadow_heap(destination.ptr);
+        if (!heap)
+            return;
+        std::uint64_t first = host_mark;
+        if (shadow_heap(source.ptr))
+            std::memcpy(&first, reinterpret_cast<const void *>(source.ptr), sizeof first);
+        if (first == host_mark || first == 0) {
+            set_mark(*heap, destination.ptr);
+            copied_host = true;
+        } else {
+            std::memcpy(reinterpret_cast<void *>(destination.ptr),
+                        reinterpret_cast<const void *>(source.ptr), stride);
+        }
+    }
+    if (copied_host && dst_host != src_host) {
+        const std::lock_guard lock(memory_view_mutex);
+        if (const auto found = buffer_views.find(src_host); found != buffer_views.end())
+            buffer_views[dst_host] = found->second;
+        else
+            buffer_views.erase(dst_host);
+        if (const auto found = uav_views.find(src_host); found != uav_views.end())
+            uav_views[dst_host] = found->second;
+        else
+            uav_views.erase(dst_host);
+        if (const auto found = memory_views.find(src_host); found != memory_views.end()) {
+            auto view = found->second;
+            view.handle = destination;
+            memory_views[dst_host] = view;
+        } else {
+            memory_views.erase(dst_host);
+        }
+    }
 }
 void STDMETHODCALLTYPE copy_descriptors(ID3D12Device *self, UINT destination_ranges,
                                         const Handle *destinations, const UINT *destination_sizes,
@@ -3465,6 +3840,7 @@ UINT element_bytes(DXGI_FORMAT format) {
            : f >= 23 && f <= 43 ? 4
            : f >= 48 && f <= 59 ? 2
            : f >= 60 && f <= 64 ? 1
+           : f == 67            ? 4
            : f >= 87 && f <= 93 ? 4
                                 : 0;
 }
@@ -3491,6 +3867,91 @@ struct MemoryTexture {
 };
 std::mutex memory_texture_mutex;
 std::map<std::uint64_t, MemoryTexture> memory_textures;
+struct AliasedTexture {
+    ID3D12Resource *dest = nullptr;
+    ID3D12Resource *source = nullptr;
+    ID3D12Resource *through = nullptr;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> src_fp;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> dst_fp;
+};
+std::mutex aliased_texture_mutex;
+std::map<ID3D12Resource *, AliasedTexture> aliased_textures;
+void forget_aliased_texture(ID3D12Resource *dest) {
+    AliasedTexture gone;
+    {
+        const std::lock_guard lock(aliased_texture_mutex);
+        const auto found = aliased_textures.find(dest);
+        if (found == aliased_textures.end())
+            return;
+        gone = std::move(found->second);
+        aliased_textures.erase(found);
+    }
+    if (gone.through)
+        gone.through->Release();
+    if (gone.source)
+        gone.source->Release();
+    if (gone.dest)
+        gone.dest->Release();
+}
+void register_aliased_texture(ID3D12Device *device, ID3D12Resource *dest, ID3D12Resource *source,
+                              std::uint64_t address) {
+    const auto sd = source->GetDesc(), dd = dest->GetDesc();
+    const auto subresources = [](const D3D12_RESOURCE_DESC &d) -> UINT {
+        const UINT layers =
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1u : d.DepthOrArraySize;
+        return static_cast<UINT>(d.MipLevels) * layers;
+    };
+    const UINT parts = subresources(sd);
+    if (!parts || parts > 64 || parts != subresources(dd))
+        return;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> sfp(parts), dfp(parts);
+    UINT64 sbytes = 0, dbytes = 0;
+    device->GetCopyableFootprints(&sd, 0, parts, 0, sfp.data(), nullptr, nullptr, &sbytes);
+    device->GetCopyableFootprints(&dd, 0, parts, 0, dfp.data(), nullptr, nullptr, &dbytes);
+    if (!sbytes || sbytes != dbytes)
+        return;
+    for (UINT i = 0; i < parts; ++i) {
+        if (sfp[i].Offset != dfp[i].Offset || sfp[i].Footprint.Width != dfp[i].Footprint.Width ||
+            sfp[i].Footprint.Height != dfp[i].Footprint.Height ||
+            sfp[i].Footprint.Depth != dfp[i].Footprint.Depth ||
+            sfp[i].Footprint.RowPitch != dfp[i].Footprint.RowPitch)
+            return;
+    }
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type = D3D12_HEAP_TYPE_CUSTOM;
+    props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_L1;
+    D3D12_RESOURCE_DESC bdesc{};
+    bdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bdesc.Width = sbytes;
+    bdesc.Height = 1;
+    bdesc.DepthOrArraySize = 1;
+    bdesc.MipLevels = 1;
+    bdesc.SampleDesc = {1, 0};
+    bdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource *through = nullptr;
+    using Create = HRESULT(STDMETHODCALLTYPE *)(
+        void *, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+        D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **);
+    if (FAILED(original<Create>(device, 27)(device, &props, D3D12_HEAP_FLAG_NONE, &bdesc,
+                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            IID_PPV_ARGS(&through))) ||
+        !through)
+        return;
+    dest->AddRef();
+    source->AddRef();
+    {
+        const std::lock_guard lock(aliased_texture_mutex);
+        aliased_textures[dest] = {dest, source, through, std::move(sfp), std::move(dfp)};
+    }
+    if (static std::atomic<int> shown{0}; shown++ < 24) {
+        std::fprintf(stderr, "[Runtime] aliased texture %llux%ux%u mips %u: f%d -> f%d at %llx\n",
+                     sd.Width, sd.Height, sd.DepthOrArraySize, sd.MipLevels,
+                     static_cast<int>(sd.Format), static_cast<int>(dd.Format),
+                     static_cast<unsigned long long>(address));
+        std::fflush(stderr);
+    }
+}
 ID3D12Resource *texture_at(ID3D12Device *self, std::uint64_t address,
                            const D3D12_RESOURCE_DESC *of) {
     if (!address || !of || of->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
@@ -3504,6 +3965,7 @@ ID3D12Resource *texture_at(ID3D12Device *self, std::uint64_t address,
     if (const auto found = memory_textures.find(address); found != memory_textures.end()) {
         if (same(found->second.desc))
             return found->second.resource;
+        forget_aliased_texture(found->second.resource);
         found->second.resource->Release();
         memory_textures.erase(found);
     }
@@ -3526,6 +3988,10 @@ ID3D12Resource *texture_at(ID3D12Device *self, std::uint64_t address,
             std::fflush(stderr);
         }
         return nullptr;
+    }
+    if (auto *const alias_src = texture_alias_at(address, *of)) {
+        register_aliased_texture(self, resource, alias_src, address);
+        alias_src->Release();
     }
     memory_textures[address] = {resource, *of};
     return resource;
@@ -3564,7 +4030,46 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
                          : view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW
                              ? 4
                              : element_bytes(view.Format);
-    const bool known = buffer_at(address, resource, offset, size);
+    const auto skipped = view.Buffer.FirstElement * element;
+    const auto bytes = std::uint64_t{view.Buffer.NumElements} * element;
+    bool in_explicit = false;
+    {
+        const std::lock_guard lock(buffer_mutex);
+        auto found = buffers_at.upper_bound(address);
+        if (found != buffers_at.begin() && address < std::prev(found)->second.end) {
+            --found;
+            resource = found->second.resource;
+            offset = address - found->first;
+            size = found->second.end - address;
+            in_explicit = true;
+        }
+    }
+    if (!in_explicit && skipped + bytes > (2ull << 20) && skipped + bytes <= (512ull << 20))
+        consolidate_title_memory(static_cast<std::uintptr_t>(address), skipped + bytes);
+    std::uint64_t tgpu = 0;
+    bool in_section = !in_explicit && title_memory_buffer(address, resource, offset, size, tgpu);
+    bool spans_chunks =
+        in_section && skipped + bytes > size &&
+        readable_bytes(reinterpret_cast<const void *>(address), skipped + bytes) > size;
+    const bool raw_unaligned = in_section && (view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) &&
+                               (((offset + skipped) & 15) != 0);
+    bool elem_unaligned = in_section && element > 1 && (offset % element != 0);
+    // A large structured view whose section offset is 16-byte aligned (not element-aligned)
+    // cannot be copied to the ring; expose it with stride 16 so SM 6.6 StructuredBuffer<Words>
+    // still addresses every dword by byte offset without dropping it to a null view.
+    if (in_section && elem_unaligned && !spans_chunks && bytes > (16ull << 20) &&
+        ((offset + skipped) % 16 == 0)) {
+        const auto start_bytes = offset + skipped;
+        view.Format = DXGI_FORMAT_UNKNOWN;
+        view.Buffer.FirstElement = start_bytes / 16;
+        view.Buffer.NumElements = static_cast<UINT>((bytes + 15) / 16);
+        view.Buffer.StructureByteStride = 16;
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        offset = 0;
+        elem_unaligned = false;
+    }
+    const bool known =
+        in_explicit || (in_section && !raw_unaligned && !elem_unaligned && !spans_chunks);
     if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_LOST") && shown++ < 6) {
         float first[16]{};
         MEMORY_BASIC_INFORMATION info{};
@@ -3584,18 +4089,15 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
                      10);
     }
     if (!known) {
-        // Memory of the title's that is in no buffer here: what the view is of is copied,
-        // as it is now, to where the host can have a view (the matrices a title draws its
-        // first screens with may be in such views, made as it draws).
-        // The copy is of the elements viewed, and starts on 256 bytes, which a raw view takes.
-        const auto skipped = view.Buffer.FirstElement * element;
-        const auto bytes = std::uint64_t{view.Buffer.NumElements} * element;
-        MEMORY_BASIC_INFORMATION info{};
+        // Memory of the title's that is in no buffer here (or whose offset is not aligned to
+        // its element or 16 bytes for raw views, or that crosses a chunk): what the view is of
+        // is copied, as it is now, to where the host can have a view.
+        const auto avail =
+            element && bytes && bytes <= (16ull << 20)
+                ? readable_bytes(reinterpret_cast<const void *>(address + skipped), bytes)
+                : 0;
         if (console != Target::scarlett || !element || !bytes || bytes > (16ull << 20) ||
-            !VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
-            info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
-            reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - address <
-                skipped + bytes ||
+            avail < bytes ||
             !ring_copy(reinterpret_cast<const void *>(address + skipped), bytes, bytes,
                        256 % element ? element : 256, &resource, &offset)) {
             // nothing the host can have a view of: a view of nothing, whose reads give 0
@@ -3607,6 +4109,12 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
     if (element)
         view.Buffer.FirstElement += offset / element;
     create_srv(self, resource, &view, handle);
+    if (known && in_section) {
+        const auto slot = host_handle(handle).ptr;
+        const std::lock_guard lock(memory_view_mutex);
+        if (const auto found = buffer_views.find(slot); found != buffer_views.end())
+            found->second.title_address = address + skipped;
+    }
     if (!known) {
         MemoryView kept;
         kept.handle = handle;
@@ -3630,12 +4138,55 @@ void structured_view(ID3D12Device *device, std::uint64_t slot, std::uint32_t str
                                                              : element_bytes(view.desc.Format);
     const auto start = view.desc.Buffer.FirstElement * element;
     const auto bytes = view.desc.Buffer.NumElements * element;
-    if (!element || element == stride || start % stride || bytes < stride)
+    const bool already_structured = view.desc.Format == DXGI_FORMAT_UNKNOWN &&
+                                    view.desc.Buffer.StructureByteStride == stride &&
+                                    !(view.desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
+    if (!element || already_structured || !bytes)
         return;
+    const auto count = std::max<std::uint64_t>(1, (bytes + stride - 1) / stride);
+    if (start % stride) {
+        // The view lies in a buffer whose offset is not a multiple of the shader's element
+        // stride: copy what it views to a stride-aligned offset in the ring.
+        const auto copy_bytes = count * stride;
+        if (copy_bytes > (16ull << 20))
+            return;
+        ID3D12Resource *ring = nullptr;
+        std::uint64_t off = 0;
+        if (view.title_address) {
+            const auto avail =
+                readable_bytes(reinterpret_cast<const void *>(view.title_address), bytes);
+            if (!avail || !ring_copy(reinterpret_cast<const void *>(view.title_address), avail,
+                                     copy_bytes, stride, &ring, &off))
+                return;
+        } else {
+            void *memory = nullptr;
+            const D3D12_RANGE read{static_cast<SIZE_T>(start), static_cast<SIZE_T>(start + bytes)};
+            if (FAILED(view.resource->Map(0, &read, &memory)) || !memory)
+                return;
+            const auto copied = ring_copy(static_cast<const std::uint8_t *>(memory) + start, bytes,
+                                          copy_bytes, stride, &ring, &off);
+            const D3D12_RANGE nothing{0, 0};
+            view.resource->Unmap(0, &nothing);
+            if (!copied)
+                return;
+        }
+        auto made = view.desc;
+        made.Format = DXGI_FORMAT_UNKNOWN;
+        made.Buffer.FirstElement = off / stride;
+        made.Buffer.NumElements = static_cast<UINT>(count);
+        made.Buffer.StructureByteStride = stride;
+        made.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        if (!fit_buffer_view(ring, made))
+            return;
+        original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(device, 18)(
+            device, ring, &made, Handle{slot});
+        wrote_slot(slot);
+        return;
+    }
     auto made = view.desc;
     made.Format = DXGI_FORMAT_UNKNOWN;
     made.Buffer.FirstElement = start / stride;
-    made.Buffer.NumElements = static_cast<UINT>(bytes / stride);
+    made.Buffer.NumElements = static_cast<UINT>(count);
     made.Buffer.StructureByteStride = stride;
     made.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
     if (!fit_buffer_view(view.resource, made))
@@ -3644,7 +4195,78 @@ void structured_view(ID3D12Device *device, std::uint64_t slot, std::uint32_t str
         device, view.resource, &made, Handle{slot});
     wrote_slot(slot);
     const std::lock_guard lock(memory_view_mutex);
-    buffer_views[slot] = {view.resource, made};
+    buffer_views[slot] = {view.resource, made, view.title_address};
+}
+void structured_uav_view(ID3D12Device *device, std::uint64_t slot, std::uint32_t stride) {
+    UavBufferView view;
+    {
+        const std::lock_guard lock(memory_view_mutex);
+        const auto found = uav_views.find(slot);
+        if (found == uav_views.end())
+            return;
+        view = found->second;
+    }
+    // Leave typed buffer UAVs (RWBuffer<float4>) alone; only promote RAW or structured views.
+    if (!(view.desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) &&
+        !view.desc.Buffer.StructureByteStride)
+        return;
+    const std::uint64_t element =
+        view.desc.Buffer.StructureByteStride                 ? view.desc.Buffer.StructureByteStride
+        : view.desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW ? 4
+                                                             : element_bytes(view.desc.Format);
+    const auto start = view.desc.Buffer.FirstElement * element;
+    const auto bytes = view.desc.Buffer.NumElements * element;
+    const bool already_structured = view.desc.Format == DXGI_FORMAT_UNKNOWN &&
+                                    view.desc.Buffer.StructureByteStride == stride &&
+                                    !(view.desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+    if (!element || already_structured || !bytes)
+        return;
+    if (start % stride) {
+        if (start % 16 == 0)
+            stride = 16;
+        else
+            return;
+    }
+    auto made = view.desc;
+    made.Format = DXGI_FORMAT_UNKNOWN;
+    made.Buffer.FirstElement = start / stride;
+    made.Buffer.NumElements =
+        static_cast<UINT>(std::max<std::uint64_t>(1, (bytes + stride - 1) / stride));
+    made.Buffer.StructureByteStride = stride;
+    made.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+    if (!fit_buffer_view(view.resource, made))
+        return;
+    original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *, Handle)>(device, 19)(
+        device, view.resource, nullptr, &made, Handle{slot});
+    wrote_slot(slot);
+    const std::lock_guard lock(memory_view_mutex);
+    const auto raw_orig = view.promoted_from_raw ? view.raw_desc
+                          : (view.desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
+                              ? view.desc
+                              : D3D12_UNORDERED_ACCESS_VIEW_DESC{};
+    const bool was_raw =
+        view.promoted_from_raw || (view.desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+    uav_views[slot] = {view.resource, made, raw_orig, was_raw};
+}
+void activate_console_heap_shaders(ID3D12Device *device) {
+    if (!device || console_heap_shaders_active.exchange(true, std::memory_order_acq_rel))
+        return;
+    std::vector<std::uint64_t> srv_slots, uav_slots;
+    {
+        const std::lock_guard lock(memory_view_mutex);
+        for (const auto &[slot, v] : buffer_views)
+            if ((v.desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ||
+                v.desc.Buffer.StructureByteStride == 4 || v.desc.Buffer.StructureByteStride == 8)
+                srv_slots.push_back(slot);
+        for (const auto &[slot, v] : uav_views)
+            if ((v.desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) ||
+                v.desc.Buffer.StructureByteStride == 4 || v.desc.Buffer.StructureByteStride == 8)
+                uav_slots.push_back(slot);
+    }
+    for (const auto slot : srv_slots)
+        structured_view(device, slot, 16u);
+    for (const auto slot : uav_slots)
+        structured_uav_view(device, slot, 16u);
 }
 // the copy a view of the title's memory is of, made again: `slot` is the host's
 extern std::atomic<ID3D12Device *> d3d12_device;
@@ -3699,8 +4321,23 @@ void STDMETHODCALLTYPE create_uav_at(ID3D12Device *self, const D3D12_RESOURCE_DE
             _ReturnAddress());
     ID3D12Resource *resource = nullptr;
     std::uint64_t offset = 0, size = 0;
-    if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER ||
-        !buffer_at(address, resource, offset, size)) {
+    bool found_uav = false;
+    {
+        const std::lock_guard lock(buffer_mutex);
+        auto found = buffers_at.upper_bound(address);
+        if (found != buffers_at.begin() && address < std::prev(found)->second.end) {
+            --found;
+            resource = found->second.resource;
+            offset = address - found->first;
+            size = found->second.end - address;
+            found_uav = true;
+        }
+    }
+    if (!found_uav) {
+        std::uint64_t tgpu = 0;
+        found_uav = title_memory_buffer(address, resource, offset, size, tgpu);
+    }
+    if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || !found_uav) {
         create_uav(self, nullptr, nullptr, null_view(view, of), handle);
         return;
     }
@@ -3708,6 +4345,10 @@ void STDMETHODCALLTYPE create_uav_at(ID3D12Device *self, const D3D12_RESOURCE_DE
                          : view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW
                              ? 4
                              : element_bytes(view.Format);
+    if (element > 1 && offset % element != 0) {
+        create_uav(self, nullptr, nullptr, null_view(view, of), handle);
+        return;
+    }
     if (element)
         view.Buffer.FirstElement += offset / element;
     create_uav(self, resource, nullptr, &view, handle);
@@ -3904,6 +4545,8 @@ struct HeapUses {
 };
 // what a shader of a container says of its registers (modules::shader_heap_layout)
 HeapUses::Stage heap_stage(const D3D12_SHADER_BYTECODE &code) {
+    if (auto *const dev = d3d12_device.load())
+        activate_console_heap_shaders(dev);
     HeapUses::Stage stage;
     if (!code.pShaderBytecode)
         return stage;
@@ -6350,8 +6993,12 @@ void fill_user(ListProxy *list, const HeapUses::Stage &stage,
             if (words[0] == host_mark)
                 refresh_memory_view(words[1]);
             decode_as(heaps[at], where, use.type);
-            if (use.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && use.stride > 4)
-                structured_view(heaps[at].device, host_slot(heaps[at], where).ptr, use.stride);
+            if (use.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && use.stride > 0)
+                structured_view(heaps[at].device, host_slot(heaps[at], where).ptr,
+                                std::max<std::uint32_t>(use.stride, 16u));
+            else if (use.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV)
+                structured_uav_view(heaps[at].device, host_slot(heaps[at], where).ptr,
+                                    std::max<std::uint32_t>(use.stride, 16u));
         }
     if (!stage.samplers.empty()) {
         ShadowHeap samplers{};
@@ -6906,6 +7553,10 @@ std::uint64_t geometry_address(const char *what, std::uint64_t address, UINT &by
         if (buffer != buffers_at.begin() && address < std::prev(buffer)->second.end)
             return address;
     }
+    ID3D12Resource *tbuf = nullptr;
+    std::uint64_t toff = 0, tcontig = 0, tgpu = 0;
+    if (title_memory_buffer(address, tbuf, toff, tcontig, tgpu) && tcontig >= bytes)
+        return tgpu;
     // as much of it as is memory
     const auto readable = readable_bytes(reinterpret_cast<const void *>(address), bytes);
     const auto copy =
@@ -7050,7 +7701,25 @@ std::uint64_t unseen_root_address(bool written) {
     return buffer ? buffer->GetGPUVirtualAddress() : 0;
 }
 std::uint64_t root_address(std::uint64_t address) {
-    if (const auto host = gpu_address(address); host || !address)
+    if (!address)
+        return 0;
+    {
+        const std::lock_guard lock(buffer_mutex);
+        if (const auto found = mapped_at.upper_bound(address);
+            found != mapped_at.begin() && address < std::prev(found)->second.end)
+            return std::prev(found)->second.gpu + (address - std::prev(found)->first);
+        if (const auto found = buffers_at.upper_bound(address);
+            found != buffers_at.begin() && address < std::prev(found)->second.end)
+            return address;
+    }
+    ID3D12Resource *tbuf = nullptr;
+    std::uint64_t toff = 0, tcontig = 0, tgpu = 0;
+    if (title_memory_buffer(address, tbuf, toff, tcontig, tgpu)) {
+        const auto want = readable_bytes(reinterpret_cast<const void *>(address), most_copied);
+        if (tcontig >= want)
+            return tgpu;
+    }
+    if (const auto host = gpu_address(address); !tbuf && host)
         return host;
     if (const auto readable = readable_bytes(reinterpret_cast<const void *>(address), most_copied))
         if (const auto copy = ring_copy(reinterpret_cast<const void *>(address), readable))
@@ -7061,12 +7730,17 @@ std::uint64_t root_address(std::uint64_t address) {
 // copy root_address makes of memory of the title's, or of the buffer for unseen memory
 std::uint32_t root_view_limit(std::uint64_t address) {
     ID3D12Resource *resource = nullptr;
-    std::uint64_t offset = 0, bytes = 0;
+    std::uint64_t offset = 0, bytes = 0, tgpu = 0;
     if (!address)
         bytes = 0;
-    else if (!buffer_at(address, resource, offset, bytes) && gpu_address(address))
+    else if (buffer_at(address, resource, offset, bytes)) {
+    } else if (title_memory_buffer(address, resource, offset, bytes, tgpu)) {
+        const auto want = readable_bytes(reinterpret_cast<const void *>(address), most_copied);
+        if (bytes < want)
+            bytes = std::max<std::uint64_t>(want, most_copied);
+    } else if (gpu_address(address))
         bytes = ~std::uint64_t{0};
-    else if (!resource)
+    else
         bytes = std::max<std::uint64_t>(
             readable_bytes(reinterpret_cast<const void *>(address), most_copied), most_copied);
     return bytes < 4 ? 0u
@@ -7074,17 +7748,34 @@ std::uint32_t root_view_limit(std::uint64_t address) {
 }
 // A root UAV of memory the host's GPU cannot see writes where nothing reads
 std::uint64_t root_uav_address(std::uint64_t address) {
-    const auto host = gpu_address(address);
-    return host || !address ? host : unseen_root_address(true);
+    if (!address)
+        return 0;
+    if (const auto host = gpu_address(address))
+        return host;
+    ID3D12Resource *tbuf = nullptr;
+    std::uint64_t toff = 0, tcontig = 0, tgpu = 0;
+    if (title_memory_buffer(address, tbuf, toff, tcontig, tgpu))
+        return tgpu;
+    return unseen_root_address(true);
 }
 // A constant buffer starts anywhere on the console and on a multiple of 256 bytes on the
 // host, which turns the whole list down for one that does not. What a buffer the CPU can
 // read holds from such an address on is copied to where the host takes it.
 std::uint64_t root_constants(std::uint64_t address) {
     const auto host = root_address(address);
-    // only Xbox One titles have been seen to need it, and a Series title that binds its
-    // constants this way for every draw would have 64 KiB copied each time
-    if (!(host & 255) || console != Target::durango)
+    if (!(host & 255))
+        return host;
+    if (console == Target::scarlett) {
+        ID3D12Resource *tbuf = nullptr;
+        std::uint64_t toff = 0, tcontig = 0, tgpu = 0;
+        if (title_memory_buffer(address, tbuf, toff, tcontig, tgpu)) {
+            if (const auto avail = readable_bytes(reinterpret_cast<const void *>(address), 65536))
+                if (const auto copy = ring_copy(reinterpret_cast<const void *>(address), avail))
+                    return copy;
+        }
+        return host;
+    }
+    if (console != Target::durango)
         return host;
     ID3D12Resource *buffer = nullptr;
     std::uint64_t start = 0, end = 0;
@@ -7337,21 +8028,146 @@ Handle feedback_clear_view(List *host, Handle view, ID3D12Resource *map) {
     device->Release();
     return view;
 }
+constexpr char uav_clear_source[] = R"(
+cbuffer C : register(b0) { uint count; uint v0; uint v1; uint v2; uint v3; uint stride; };
+RWByteAddressBuffer dst : register(u0);
+[numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    for (uint i = id.x; i < count; i += stride) {
+        uint lane = i & 3u;
+        uint v = lane == 0u ? v0 : lane == 1u ? v1 : lane == 2u ? v2 : v3;
+        dst.Store(i * 4u, v);
+    }
+}
+)";
+struct UavClearer {
+    ID3D12RootSignature *signature = nullptr;
+    ID3D12PipelineState *pipeline = nullptr;
+    bool tried = false;
+};
+std::mutex uav_clearer_mutex;
+UavClearer uav_clearer;
+bool make_uav_clearer(ID3D12Device *device) {
+    const std::lock_guard lock(uav_clearer_mutex);
+    if (uav_clearer.tried)
+        return uav_clearer.pipeline != nullptr;
+    uav_clearer.tried = true;
+    using Compile =
+        HRESULT(WINAPI *)(const void *, SIZE_T, const char *, const void *, void *, const char *,
+                          const char *, UINT, UINT, ID3DBlob **, ID3DBlob **);
+    const auto library =
+        LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto compile =
+        library ? reinterpret_cast<Compile>(GetProcAddress(library, "D3DCompile")) : nullptr;
+    ID3DBlob *code = nullptr, *errors = nullptr;
+    if (!compile || FAILED(compile(uav_clear_source, sizeof uav_clear_source - 1, "uav_clear",
+                                   nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)))
+        return false;
+    D3D12_ROOT_PARAMETER parameters[2]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 6};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[1].Descriptor = {0, 0};
+    const D3D12_ROOT_SIGNATURE_DESC desc{2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    using Serialize = HRESULT(WINAPI *)(const D3D12_ROOT_SIGNATURE_DESC *,
+                                        D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
+    static const auto serialize = host_d3d12<Serialize>("D3D12SerializeRootSignature");
+    ID3DBlob *blob = nullptr;
+    if (serialize && SUCCEEDED(serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)))
+        device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                    IID_PPV_ARGS(&uav_clearer.signature));
+    if (blob)
+        blob->Release();
+    if (uav_clearer.signature) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC state{};
+        state.pRootSignature = uav_clearer.signature;
+        state.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        device->CreateComputePipelineState(&state, IID_PPV_ARGS(&uav_clearer.pipeline));
+    }
+    code->Release();
+    return uav_clearer.pipeline != nullptr;
+}
+bool clear_promoted_raw_uav(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, Handle hcpu,
+                            ID3D12Resource *resource, const UINT values[4], UINT rect_count) {
+    if (!resource || rect_count)
+        return false;
+    UavBufferView view{};
+    bool found_promoted = false;
+    {
+        std::uint64_t gpu_slot = 0;
+        {
+            const std::lock_guard slock(shadow_mutex);
+            if (const auto *const heap = shadow_heap(gpu.ptr))
+                gpu_slot = host_slot(*heap, gpu.ptr).ptr;
+        }
+        const std::lock_guard lock(memory_view_mutex);
+        if (const auto it = uav_views.find(hcpu.ptr);
+            it != uav_views.end() && it->second.promoted_from_raw) {
+            view = it->second;
+            found_promoted = true;
+        } else if (gpu_slot) {
+            if (const auto it2 = uav_views.find(gpu_slot);
+                it2 != uav_views.end() && it2->second.promoted_from_raw) {
+                view = it2->second;
+                found_promoted = true;
+            }
+        }
+    }
+    if (!found_promoted)
+        return false;
+    auto *const dev = d3d12_device.load();
+    if (!dev || !make_uav_clearer(dev))
+        return false;
+    const auto start = view.raw_desc.Buffer.FirstElement * 4ull;
+    const auto dwords = view.raw_desc.Buffer.NumElements;
+    if (!dwords)
+        return true;
+    auto *const list = static_cast<ListProxy *>(self);
+    auto *const host = list->host;
+    const UINT groups =
+        static_cast<UINT>(std::min<std::uint64_t>((dwords + 63ull) / 64ull, 65535u));
+    const UINT constants[6] = {dwords, values[0], values[1], values[2], values[3], groups * 64u};
+    host->SetPipelineState(uav_clearer.pipeline);
+    host->SetComputeRootSignature(uav_clearer.signature);
+    host->SetComputeRoot32BitConstants(0, 6, constants, 0);
+    host->SetComputeRootUnorderedAccessView(1, resource->GetGPUVirtualAddress() + start);
+    host->Dispatch(groups, 1, 1);
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = resource;
+    host->ResourceBarrier(1, &uav);
+    if (list->pipeline)
+        host->SetPipelineState(list->pipeline);
+    if (list->compute_ours_bound)
+        host->SetComputeRootSignature(heap_signature(dev));
+    else if (list->compute_root)
+        title_compute_back(list);
+    prepare_dispatch(list);
+    return true;
+}
 void STDMETHODCALLTYPE clear_uav_uint(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, Handle cpu,
                                       ID3D12Resource *resource, const UINT *values, UINT count,
                                       const D3D12_RECT *rects) {
     bind_heap_of(self, gpu.ptr);
-    host_of(self)->ClearUnorderedAccessViewUint(
-        host_gpu(static_cast<ListProxy *>(self), gpu),
-        feedback_clear_view(host_of(self), host_view(cpu), resource), resource, values, count,
-        rects);
+    const auto hcpu = host_view(cpu);
+    if (values && clear_promoted_raw_uav(self, gpu, hcpu, resource, values, count))
+        return;
+    host_of(self)->ClearUnorderedAccessViewUint(host_gpu(static_cast<ListProxy *>(self), gpu),
+                                                feedback_clear_view(host_of(self), hcpu, resource),
+                                                resource, values, count, rects);
 }
 void STDMETHODCALLTYPE clear_uav_float(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, Handle cpu,
                                        ID3D12Resource *resource, const FLOAT *values, UINT count,
                                        const D3D12_RECT *rects) {
     bind_heap_of(self, gpu.ptr);
+    const auto hcpu = host_view(cpu);
+    if (values) {
+        UINT raw_vals[4];
+        std::memcpy(raw_vals, values, sizeof raw_vals);
+        if (clear_promoted_raw_uav(self, gpu, hcpu, resource, raw_vals, count))
+            return;
+    }
     host_of(self)->ClearUnorderedAccessViewFloat(host_gpu(static_cast<ListProxy *>(self), gpu),
-                                                 host_view(cpu), resource, values, count, rects);
+                                                 hcpu, resource, values, count, rects);
 }
 void STDMETHODCALLTYPE ignored_list_method(void *) {}
 void STDMETHODCALLTYPE flush_pipeline_x(void *self, UINT, std::uint64_t, std::uint64_t);
@@ -7523,7 +8339,11 @@ RWByteAddressBuffer dst : register(u0);
         }
     } else if (kind == 2 || kind == 10) {
         uint x = src.Load(b), y = src.Load(b + 4), z = src.Load(b + 8);
-        bool bad = x > 65535u || y > 65535u || z > 65535u;
+        if (kind == 10 && x != 0u) {
+            if (y == 0u) { y = 1u; dst.Store(b + 4, 1u); }
+            if (z == 0u) { z = 1u; dst.Store(b + 8, 1u); }
+        }
+        bool bad = x > (kind == 10 ? 2048u : 65535u) || y > 65535u || z > 65535u;
         if (!bad && kind == 10 && x != 0 && y != 0 && (x * y > 4194304u || z > 4194304u / (x * y)))
             bad = true;
         if (!bad && kind == 2 && x != 0 && y != 0 && (x * y > 16777216u || z > 16777216u / (x * y)))
@@ -7659,6 +8479,11 @@ void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *sign
                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
                 host->ResourceBarrier(1, &back);
+            }
+            {
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                host->ResourceBarrier(1, &uav);
             }
             host->SetPipelineState(clamper.pipeline);
             host->SetComputeRootSignature(clamper.signature);
@@ -7808,8 +8633,20 @@ void STDMETHODCALLTYPE write_buffer_immediate(
     std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> host;
     std::vector<D3D12_WRITEBUFFERIMMEDIATE_MODE> host_modes;
     for (UINT i = 0; parameters && i < count; ++i) {
-        if (const auto address = gpu_address(parameters[i].Dest)) {
-            host.push_back({address, parameters[i].Value});
+        std::uint64_t explicit_gpu = 0;
+        {
+            const std::lock_guard lock(buffer_mutex);
+            if (const auto found = mapped_at.upper_bound(parameters[i].Dest);
+                found != mapped_at.begin() && parameters[i].Dest < std::prev(found)->second.end)
+                explicit_gpu =
+                    std::prev(found)->second.gpu + (parameters[i].Dest - std::prev(found)->first);
+            else if (const auto found = buffers_at.upper_bound(parameters[i].Dest);
+                     found != buffers_at.begin() &&
+                     parameters[i].Dest < std::prev(found)->second.end)
+                explicit_gpu = parameters[i].Dest;
+        }
+        if (explicit_gpu) {
+            host.push_back({explicit_gpu, parameters[i].Value});
             if (modes)
                 host_modes.push_back(modes[i]);
         } else {
@@ -8568,6 +9405,153 @@ void order_after(ID3D12CommandQueue *queue) {
     if (SUCCEEDED(queue->Signal(order.fence, order.submitted + 1)))
         ++order.submitted;
 }
+void sync_aliased_textures(ID3D12CommandQueue *queue) {
+    static const bool off = [] {
+        const auto *const v = std::getenv("XV_ALIAS_SYNC");
+        return v && std::string_view(v) == "0";
+    }();
+    if (off || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    std::vector<AliasedTexture> items;
+    {
+        const std::lock_guard lock(aliased_texture_mutex);
+        if (aliased_textures.empty())
+            return;
+        items.reserve(aliased_textures.size());
+        for (const auto &[k, v] : aliased_textures) {
+            v.dest->AddRef();
+            v.source->AddRef();
+            v.through->AddRef();
+            items.push_back(v);
+        }
+    }
+    static std::mutex sync_mutex;
+    const std::lock_guard lock(sync_mutex);
+    static Uploader syncer;
+    ID3D12Device *device = nullptr;
+    queue->GetDevice(IID_PPV_ARGS(&device));
+    const auto release_items = [&] {
+        for (auto &it : items) {
+            it.dest->Release();
+            it.source->Release();
+            it.through->Release();
+        }
+    };
+    if (!device) {
+        release_items();
+        return;
+    }
+    if (!syncer.fence &&
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&syncer.fence)))) {
+        release_items();
+        device->Release();
+        return;
+    }
+    auto &turn = syncer.turns[syncer.next++ % syncer.turns.size()];
+    if (!turn.list &&
+        (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&turn.allocator))) ||
+         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, turn.allocator,
+                                          nullptr, IID_PPV_ARGS(&turn.list))))) {
+        release_items();
+        device->Release();
+        return;
+    }
+    if (turn.value) {
+        if (syncer.fence->GetCompletedValue() < turn.value) {
+            auto *const event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            syncer.fence->SetEventOnCompletion(turn.value, event);
+            WaitForSingleObject(event, 5000);
+            CloseHandle(event);
+        }
+        for (auto *r : turn.textures)
+            r->Release();
+        turn.textures.clear();
+        turn.allocator->Reset();
+        turn.list->Reset(turn.allocator, nullptr);
+    }
+    for (auto &it : items) {
+        const auto s_state = tracked_state(it.source, D3D12_RESOURCE_STATE_COMMON);
+        const auto d_state = tracked_state(it.dest, D3D12_RESOURCE_STATE_COMMON);
+        std::vector<D3D12_RESOURCE_BARRIER> pre;
+        if (s_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Transition = {it.source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, s_state,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE};
+            pre.push_back(b);
+        }
+        if (d_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Transition = {it.dest, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, d_state,
+                            D3D12_RESOURCE_STATE_COPY_DEST};
+            pre.push_back(b);
+        }
+        if (!pre.empty())
+            turn.list->ResourceBarrier(static_cast<UINT>(pre.size()), pre.data());
+        for (UINT i = 0; i < it.src_fp.size(); ++i) {
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{
+                it.through, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            dst_loc.PlacedFootprint = it.src_fp[i];
+            D3D12_TEXTURE_COPY_LOCATION src_loc{
+                it.source, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            src_loc.SubresourceIndex = i;
+            turn.list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        }
+        {
+            D3D12_RESOURCE_BARRIER mid{};
+            mid.Transition = {it.through, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            turn.list->ResourceBarrier(1, &mid);
+        }
+        for (UINT i = 0; i < it.dst_fp.size(); ++i) {
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{
+                it.dest, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            dst_loc.SubresourceIndex = i;
+            D3D12_TEXTURE_COPY_LOCATION src_loc{
+                it.through, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            src_loc.PlacedFootprint = it.dst_fp[i];
+            turn.list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        }
+        std::vector<D3D12_RESOURCE_BARRIER> post;
+        if (s_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Transition = {it.source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE, s_state};
+            post.push_back(b);
+        }
+        if (d_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Transition = {it.dest, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_COPY_DEST, d_state};
+            post.push_back(b);
+        }
+        if (!post.empty())
+            turn.list->ResourceBarrier(static_cast<UINT>(post.size()), post.data());
+        turn.textures.push_back(it.dest);
+        turn.textures.push_back(it.source);
+        turn.textures.push_back(it.through);
+    }
+    if (SUCCEEDED(turn.list->Close())) {
+        const bool had = SUCCEEDED(device->GetDeviceRemovedReason());
+        ID3D12CommandList *const list = turn.list;
+        queue->ExecuteCommandLists(1, &list);
+        if (const auto reason = device->GetDeviceRemovedReason(); had && FAILED(reason)) {
+            std::fprintf(
+                stderr, "[Runtime] sync_aliased_textures dropped the device: 0x%08lx (%zu items)\n",
+                static_cast<unsigned long>(reason), items.size());
+            std::fflush(stderr);
+        }
+        turn.value = ++syncer.value;
+        queue->Signal(syncer.fence, turn.value);
+    } else {
+        for (auto *r : turn.textures)
+            r->Release();
+        turn.textures.clear();
+        turn.allocator->Reset();
+        turn.list->Reset(turn.allocator, nullptr);
+    }
+    device->Release();
+}
 // ID3D12CommandQueue::ExecuteCommandLists: the host's lists for the title's proxies
 void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT count,
                                              ID3D12CommandList *const *lists) {
@@ -8577,6 +9561,7 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
     upload_scratch(self);
     copy_twins();
     upload_placements_d3d12(self);
+    sync_aliased_textures(self);
     std::vector<ID3D12CommandList *> host(count);
     for (UINT i = 0; i < count; ++i)
         host[i] = host_list(lists[i]);
@@ -10090,17 +11075,43 @@ ULONG STDMETHODCALLTYPE deferred_release(void *self) {
 // told, and what it would draw or compute with one that is not made by then is left out.
 std::mutex making_mutex;
 std::condition_variable to_make_added, pipeline_made;
-std::deque<DeferredPipeline *> to_make; // each with a reference of ours
+std::deque<DeferredPipeline *> to_make_compute, to_make,
+    to_make_heavy; // each with a reference of ours
 void make_pipelines() {
     for (;;) {
         DeferredPipeline *pipeline = nullptr;
         {
             std::unique_lock lock(making_mutex);
-            to_make_added.wait(lock, [] { return !to_make.empty(); });
-            pipeline = to_make.front();
-            to_make.pop_front();
+            to_make_added.wait(lock, [] {
+                return !to_make_compute.empty() || !to_make.empty() || !to_make_heavy.empty();
+            });
+            auto &queue = !to_make_compute.empty() ? to_make_compute
+                          : !to_make.empty()       ? to_make
+                                                   : to_make_heavy;
+            if (&queue == &to_make_compute) {
+                const auto best = std::min_element(
+                    queue.begin(), queue.end(),
+                    [](const DeferredPipeline *a, const DeferredPipeline *b) {
+                        return a->compute.CS.BytecodeLength < b->compute.CS.BytecodeLength;
+                    });
+                pipeline = *best;
+                queue.erase(best);
+            } else {
+                pipeline = queue.front();
+                queue.pop_front();
+            }
         }
+        const auto started = std::chrono::steady_clock::now();
         made_pipeline(*pipeline);
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+                .count();
+        if (ms > 3000.0) {
+            std::fprintf(
+                stderr, "[Runtime] slow pipeline: kind %d cs=%zu %.0f ms\n", pipeline->kind,
+                pipeline->kind == 1 ? pipeline->compute.CS.BytecodeLength : std::size_t{0}, ms);
+            std::fflush(stderr);
+        }
         // taken, so that a list that has just found it not made is waiting when told
         { const std::lock_guard lock(making_mutex); }
         pipeline_made.notify_all();
@@ -10129,19 +11140,32 @@ ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state) {
     static_cast<void>(started);
     using Clock = std::chrono::steady_clock;
     static std::uint64_t frame = ~0ull;
-    static Clock::duration left{};
+    static Clock::duration left_graphics{}, left_compute{};
     if (!deferred->queued.load())
         record_pipeline(*deferred);
+    const bool is_compute = deferred->kind == 1;
+    const bool is_heavy = is_compute && deferred->compute.CS.BytecodeLength > 32768;
     std::unique_lock lock(making_mutex);
     if (!deferred->queued.exchange(true)) {
         deferred_add_ref(deferred);
-        to_make.push_back(deferred);
+        (is_heavy ? to_make_heavy : is_compute ? to_make_compute : to_make).push_back(deferred);
         to_make_added.notify_one();
     }
+    if (is_heavy)
+        return nullptr;
+    static const auto budget = [] {
+        if (const auto *const text = std::getenv("XV_PIPELINE_WAIT_MS");
+            text && std::atoi(text) > 0)
+            return std::chrono::milliseconds(std::atoi(text));
+        return std::chrono::milliseconds(1000);
+    }();
+    static const auto compute_budget = std::max(budget, std::chrono::milliseconds(30000));
     if (const auto now = frames_shown(); now != frame) {
         frame = now;
-        left = std::chrono::seconds(1);
+        left_graphics = budget;
+        left_compute = compute_budget;
     }
+    auto &left = is_compute ? left_compute : left_graphics;
     const auto waited_from = Clock::now();
     pipeline_made.wait_for(lock, left, [&] { return deferred->ready.load(); });
     left -= std::min(left, Clock::now() - waited_from);

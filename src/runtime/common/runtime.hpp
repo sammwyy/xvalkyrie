@@ -159,5 +159,6 @@ void *title_export(std::string_view module, std::string_view symbol);
 void *guest_library(const wchar_t *path);
 void *guest_symbol(void *module, const char *symbol);
 bool host_policy_allows(std::string_view module, std::string_view symbol);
+void set_fatal_cleanup(void (*fn)());
 } // namespace detail
 } // namespace xv::runtime

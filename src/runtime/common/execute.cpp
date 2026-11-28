@@ -570,6 +570,7 @@ int unwind_frames(CONTEXT context, DWORD64 *frames, int most) {
     }
     return count;
 }
+std::atomic<void (*)()> fatal_cleanup_fn{nullptr};
 int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
     const auto *record = info->ExceptionRecord;
     const auto address = reinterpret_cast<std::uint64_t>(record->ExceptionAddress);
@@ -623,6 +624,8 @@ int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
     if (!last) // one the title may yet handle
         return EXCEPTION_CONTINUE_SEARCH;
     // Unwinding a guest in an unknown state can block or fault again.
+    if (auto *const cleanup = fatal_cleanup_fn.load())
+        cleanup();
     TerminateProcess(GetCurrentProcess(), exit_guest_fault);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -1400,4 +1403,7 @@ void detail::report_thread_stacks(std::uint64_t own_stack) {
     for (int index = 0; index < count; ++index)
         ResumeThread(threads[index]);
 }
+namespace detail {
+void set_fatal_cleanup(void (*fn)()) { fatal_cleanup_fn.store(fn); }
+} // namespace detail
 } // namespace xv::runtime

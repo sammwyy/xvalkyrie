@@ -625,3 +625,195 @@ TEST_CASE("title physical pages are read past 64 KiB and written directly by the
     CHECK(reinterpret_cast<BOOL(WINAPI *)(ULONG_PTR, ULONG_PTR *)>(
         xmem_fn("XMemFreePhysicalPages"))(count, pages));
 }
+
+TEST_CASE("unaligned constant buffers and views at addresses in title physical pages work") {
+    if (!device())
+        return;
+    const LayoutsShown layouts;
+    static xv::runtime::Registry xmem_reg = [] {
+        xv::runtime::Registry made;
+        xv::runtime::modules::install_xmem(made);
+        return made;
+    }();
+    const auto xmem_fn = [&](const char *name) {
+        auto *const fn = std::string_view(name).starts_with("XMem")
+                             ? xmem_reg.find("xmem.dll", name)
+                             : xmem_reg.find_api(name);
+        REQUIRE(fn);
+        return fn;
+    };
+    constexpr DWORD large_pages = 0x20000000;
+    constexpr std::size_t page = 1 << 16, count = 2;
+    ULONG_PTR pages[count]{}, got = count;
+    REQUIRE(reinterpret_cast<BOOL(WINAPI *)(ULONGLONG, ULONG_PTR *, ULONG_PTR *)>(
+        xmem_fn("XMemAllocatePhysicalPages"))(0, &got, pages));
+    REQUIRE(got == count);
+    auto *const base = static_cast<std::uint8_t *>(
+        reinterpret_cast<void *(WINAPI *)(void *, SIZE_T, DWORD, ULONGLONG, DWORD)>(
+            xmem_fn("XMemVirtualAlloc"))(nullptr, count * page, MEM_RESERVE | large_pages, 0,
+                                         PAGE_READWRITE));
+    REQUIRE(base);
+    REQUIRE(reinterpret_cast<void *(WINAPI *)(void *, ULONG_PTR, ULONG_PTR *)>(
+                xmem_fn("XMemMapPhysicalPages"))(base, count, pages) == base);
+    const auto addr = reinterpret_cast<std::uint64_t>(base);
+
+    const std::uint32_t c0 = 0x11223344u, c1 = 0x55667788u, s0 = 0x99aabbccu;
+    std::memcpy(base + 64, &c0, 4);
+    std::memcpy(base + 320, &c1, 4);
+    std::memcpy(base + 4096, &s0, 4);
+
+    const D3D12_DESCRIPTOR_RANGE ranges[]{{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0},
+                                          {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1},
+                                          {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+    const D3D12_ROOT_PARAMETER params[]{table(ranges, 3),
+                                        root_view(D3D12_ROOT_PARAMETER_TYPE_CBV, 1)};
+    auto *const sig = root_signature({2, params});
+    auto *const pipe = compute_pipeline(sig, R"(
+        cbuffer TableC : register(b0) { uint tbl_c; };
+        cbuffer RootC : register(b1) { uint root_c; };
+        ByteAddressBuffer srv_mem : register(t0);
+        RWByteAddressBuffer uav_mem : register(u0);
+        [numthreads(1, 1, 1)] void main() {
+            uav_mem.Store(0, tbl_c);
+            uav_mem.Store(4, root_c);
+            uav_mem.Store(8, srv_mem.Load(0));
+        })");
+
+    const Heap heap(3);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{addr + 64, 256};
+    title().call<void>(device(), 17, &cbv, heap.cpu);
+
+    D3D12_RESOURCE_DESC of{};
+    of.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    of.Width = 4096;
+    of.Height = of.DepthOrArraySize = of.MipLevels = 1;
+    of.SampleDesc.Count = 1;
+    of.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::uint64_t address;
+    } srv_at{{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING},
+             addr + 4096};
+    srv_at.view.Buffer = {0, 16, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    struct {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view;
+        std::uint64_t address, counter;
+    } uav_at{{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER}, addr + 8192, 0};
+    uav_at.view.Buffer = {0, 16, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    title().call<void>(device(), 70, &of, &srv_at, heap.cpu + 32);
+    title().call<void>(device(), 71, &of, &uav_at, heap.cpu + 64);
+
+    Work work;
+    work.record(32, 1u, &heap.heap);
+    work.record(33, sig);
+    work.record(25, pipe);
+    work.record(35, 0u, heap.gpu);
+    work.record(41, 1u, addr + 320);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+    CHECK(removed_reason() == S_OK);
+    const auto *const out = reinterpret_cast<const std::uint32_t *>(base + 8192);
+    CHECK(out[0] == c0);
+    CHECK(out[1] == c1);
+    CHECK(out[2] == s0);
+
+    pipe->Release();
+    sig->Release();
+    CHECK(reinterpret_cast<BOOL(WINAPI *)(void *, SIZE_T, DWORD)>(xmem_fn("VirtualFree"))(
+        base, 0, MEM_RELEASE));
+    CHECK(reinterpret_cast<BOOL(WINAPI *)(ULONG_PTR, ULONG_PTR *)>(
+        xmem_fn("XMemFreePhysicalPages"))(count, pages));
+}
+
+TEST_CASE("a placed texture written in one format is read through a view at its address in "
+          "another format of the same texel width") {
+    if (!device())
+        return;
+    const LayoutsShown layouts;
+    const PlacementsGone placements;
+    const TitleMemory memory;
+    std::uint64_t output = 0;
+    auto *const results = d3d12x_test::buffer(4096, output);
+
+    D3D12_RESOURCE_DESC uav_tex_desc{};
+    uav_tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    uav_tex_desc.Width = uav_tex_desc.Height = 16;
+    uav_tex_desc.DepthOrArraySize = uav_tex_desc.MipLevels = 1;
+    uav_tex_desc.Format = DXGI_FORMAT_R32_UINT;
+    uav_tex_desc.SampleDesc.Count = 1;
+    uav_tex_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    void *placed_raw = nullptr;
+    REQUIRE(title().call(device(), 44, memory.address(), &uav_tex_desc,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         static_cast<const D3D12_CLEAR_VALUE *>(nullptr), &__uuidof(ID3D12Resource),
+                         &placed_raw) == S_OK);
+    auto *const uav_tex = static_cast<ID3D12Resource *>(placed_raw);
+
+    auto srv_tex_desc = uav_tex_desc;
+    srv_tex_desc.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    srv_tex_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    const Heap heap(2);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{DXGI_FORMAT_R32_UINT, D3D12_UAV_DIMENSION_TEXTURE2D};
+    title().call<void>(device(), 19, uav_tex, static_cast<ID3D12Resource *>(nullptr), &uav_desc,
+                       heap.cpu);
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::uint64_t address;
+    } srv_at{{DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_SRV_DIMENSION_TEXTURE2D,
+              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING},
+             memory.address()};
+    srv_at.view.Texture2D.MipLevels = 1;
+    title().call<void>(device(), 70, &srv_tex_desc, &srv_at, heap.cpu + 32);
+
+    const D3D12_DESCRIPTOR_RANGE write_range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    const D3D12_ROOT_PARAMETER write_params[]{table(&write_range, 1)};
+    auto *const write_sig = root_signature({1, write_params});
+    // R9G9B9E5: exponent field 24 (2^(24 - 15 - 9) = 1.0) with R=1, G=2, B=4 -> (1, 2, 4)
+    auto *const write_pipe = compute_pipeline(write_sig, R"(
+        RWTexture2D<uint> tex : register(u0);
+        [numthreads(1, 1, 1)] void main() {
+            tex[uint2(0, 0)] = (24u << 27) | (4u << 18) | (2u << 9) | 1u;
+        })");
+
+    const D3D12_DESCRIPTOR_RANGE read_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1};
+    const D3D12_ROOT_PARAMETER read_params[]{table(&read_range, 1),
+                                             root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const read_sig = root_signature({2, read_params});
+    auto *const read_pipe = compute_pipeline(read_sig, R"(
+        Texture2D<float4> tex : register(t0);
+        RWByteAddressBuffer out_buf : register(u0);
+        [numthreads(1, 1, 1)] void main() {
+            out_buf.Store4(0, asuint(tex.Load(int3(0, 0, 0))));
+        })");
+
+    Work work;
+    work.record(32, 1u, &heap.heap);
+    work.record(33, write_sig);
+    work.record(25, write_pipe);
+    work.record(35, 0u, heap.gpu);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+
+    // next ExecuteCommandLists syncs aliased textures through an L1 staging buffer
+    work.record(32, 1u, &heap.heap);
+    work.record(33, read_sig);
+    work.record(25, read_pipe);
+    work.record(35, 0u, heap.gpu);
+    work.record(45, 1u, output);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+
+    CHECK(removed_reason() == S_OK);
+    CHECK(words(output)[0] == 0x3f800000u); // 1.0f
+    CHECK(words(output)[1] == 0x40000000u); // 2.0f
+    CHECK(words(output)[2] == 0x40800000u); // 4.0f
+
+    read_pipe->Release();
+    read_sig->Release();
+    write_pipe->Release();
+    write_sig->Release();
+    uav_tex->Release();
+    results->Release();
+}
