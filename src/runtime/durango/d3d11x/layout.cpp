@@ -5,6 +5,7 @@
 #include "runtime/durango/d3d11x/descriptors.hpp"
 #include "runtime/durango/runtime.hpp"
 #include "runtime/durango/winrt/application.hpp"
+#include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/inflate.hpp"
 #include "runtime/modules/placement.hpp"
@@ -24,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -95,6 +97,7 @@ Layout view() {
     auto result = child("view", 8);
     result.words = child_words;
     result.vtable[9] = forward(7, {out(1, Kind::resource)}); // GetResource
+    result.vtable[12] = {Method::ignore};
     return result;
 }
 
@@ -253,6 +256,46 @@ HRESULT STDMETHODCALLTYPE create_depth_stencil_view(void *self, void *resource,
     return result;
 }
 // CreateShaderResourceView, which says what it was given when the host refuses it
+struct CbShadow {
+    std::vector<std::byte> bytes;
+    UINT orig_size = 0;
+};
+std::mutex cb_mutex;
+std::map<ID3D11Buffer *, CbShadow> cb_shadows;
+std::map<std::pair<ID3D11DeviceContext *, ID3D11Resource *>, void *> cb_mapped;
+struct SliceCbKey {
+    ID3D11DeviceContext *ctx;
+    UINT stage, slot;
+    bool operator<(const SliceCbKey &o) const {
+        return std::tie(ctx, stage, slot) < std::tie(o.ctx, o.stage, o.slot);
+    }
+};
+std::map<SliceCbKey, std::pair<ID3D11Buffer *, UINT>> slice_cbs;
+
+std::mutex rect_gs_mutex;
+std::map<ID3D11VertexShader *, std::vector<std::uint8_t>> vs_bytecodes;
+std::map<ID3D11VertexShader *, ID3D11GeometryShader *> rect_geometry_shaders;
+std::map<void *, bool> rect_gs_bound;
+
+HRESULT STDMETHODCALLTYPE create_vertex_shader(void *self, const void *code, SIZE_T size,
+                                               void *linkage, ID3D11VertexShader **shader) {
+    auto *const device = static_cast<ID3D11Device *>(unwrap(self));
+    ID3D11VertexShader *created = nullptr;
+    const auto result =
+        device->CreateVertexShader(code, size, static_cast<ID3D11ClassLinkage *>(unwrap(linkage)),
+                                   shader ? &created : nullptr);
+    if (SUCCEEDED(result) && created) {
+        if (code && size) {
+            const auto *const p = static_cast<const std::uint8_t *>(code);
+            const std::lock_guard lock(rect_gs_mutex);
+            vs_bytecodes[created].assign(p, p + size);
+        }
+        if (shader)
+            *shader = static_cast<ID3D11VertexShader *>(wrap(created, Kind::child));
+    }
+    return result;
+}
+
 // CreateBuffer (3): the console's own miscellaneous flags (above the desktop's 16 bits) mean
 // nothing to the host, which turns the buffer down for them
 HRESULT STDMETHODCALLTYPE create_buffer(void *self, const D3D11_BUFFER_DESC *desc,
@@ -261,9 +304,28 @@ HRESULT STDMETHODCALLTYPE create_buffer(void *self, const D3D11_BUFFER_DESC *des
         return E_INVALIDARG;
     auto host = *desc;
     host.MiscFlags &= 0xffff;
+    std::vector<std::byte> padded;
+    D3D11_SUBRESOURCE_DATA padded_data{};
+    if (host.BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+        host.ByteWidth = (std::max(host.ByteWidth, 16u) + 255u) & ~255u;
+        if (data && data->pSysMem) {
+            padded.resize(host.ByteWidth);
+            std::memcpy(padded.data(), data->pSysMem, std::min(desc->ByteWidth, host.ByteWidth));
+            padded_data = {padded.data(), data->SysMemPitch, data->SysMemSlicePitch};
+            data = &padded_data;
+        }
+    }
     ID3D11Buffer *created = nullptr;
     const auto result = static_cast<ID3D11Device *>(unwrap(self))
                             ->CreateBuffer(&host, data, buffer ? &created : nullptr);
+    if (SUCCEEDED(result) && created && (host.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+        const std::lock_guard lock(cb_mutex);
+        auto &shadow = cb_shadows[created];
+        shadow.orig_size = desc->ByteWidth;
+        shadow.bytes.assign(host.ByteWidth, std::byte{0});
+        if (!padded.empty())
+            shadow.bytes = std::move(padded);
+    }
     if (FAILED(result))
         std::fprintf(stderr,
                      "[Runtime] CreateBuffer of %u bytes, usage %u bind 0x%x access 0x%x misc "
@@ -736,14 +798,32 @@ HRESULT STDMETHODCALLTYPE create_placement_buffer(void *self, const D3D11_BUFFER
         host.CPUAccessFlags = 0;
     if (host.Usage == D3D11_USAGE_DYNAMIC)
         host.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    const D3D11_SUBRESOURCE_DATA initial{address, 0, 0};
+    std::vector<std::byte> padded;
+    if (host.BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+        host.ByteWidth = (std::max(host.ByteWidth, 16u) + 255u) & ~255u;
+        if (address) {
+            padded.resize(host.ByteWidth);
+            if (readable_memory(reinterpret_cast<std::uintptr_t>(address), desc->ByteWidth))
+                std::memcpy(padded.data(), address, std::min(desc->ByteWidth, host.ByteWidth));
+        }
+    }
+    const D3D11_SUBRESOURCE_DATA initial{!padded.empty() ? padded.data() : address, 0, 0};
     ID3D11Buffer *created = nullptr;
     auto *const device = static_cast<ID3D11Device *>(unwrap(self));
-    auto result = device->CreateBuffer(&host, address ? &initial : nullptr, &created);
+    auto result =
+        device->CreateBuffer(&host, (address || !padded.empty()) ? &initial : nullptr, &created);
     if (FAILED(result) && address)
         result = device->CreateBuffer(&host, nullptr, &created);
     if (FAILED(result))
         return result;
+    if (host.BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+        const std::lock_guard lock(cb_mutex);
+        auto &shadow = cb_shadows[created];
+        shadow.orig_size = desc->ByteWidth;
+        shadow.bytes.assign(host.ByteWidth, std::byte{0});
+        if (!padded.empty())
+            shadow.bytes = std::move(padded);
+    }
     track_placement(created, address);
     if (buffer) {
         *buffer = static_cast<ID3D11Buffer *>(wrap(created, Kind::buffer));
@@ -1210,6 +1290,7 @@ Layout device() {
     result.vtable[11] = custom(&create_input_layout);
     for (std::size_t slot : {12, 13, 15, 16, 17, 18}) // shaders
         set(slot, {in(3), created(4, Kind::child)});
+    result.vtable[12] = custom(&create_vertex_shader);
     set(14, {in(8), created(9, Kind::child)});      // geometry shader with stream output
     set(19, {created(1, Kind::state)});             // class linkage
     for (std::size_t slot = 20; slot <= 26; ++slot) // states, queries, counters
@@ -1234,7 +1315,7 @@ Layout device() {
         result.vtable[slot] = result.vtable[slot - 1];
     result.vtable[37] = {Method::ignore};
     result.vtable[55] = forward(40, {out(1, Kind::context)}); // GetImmediateContextX
-    for (std::size_t slot : {58, 60, 61, 69, 80, 81, 82, 83, 84, 85})
+    for (std::size_t slot : {56, 57, 58, 60, 61, 69, 80, 81, 82, 83, 84, 85})
         result.vtable[slot] = {Method::ignore}; // hints, fences done, debug, priority
     result.vtable[59] = custom(&create_dma_engine_context);
     result.vtable[62] = custom(&create_placement_buffer);
@@ -1526,15 +1607,47 @@ void apply_context_state(void *self) {
     const std::uint32_t clean = 0;
     std::memcpy(static_cast<char *>(self) + state::dirty, &clean, sizeof clean);
     auto *const host = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    auto *const vs =
+        static_cast<ID3D11VertexShader *>(unwrap(state::read<void *>(self, state::vertex_shader)));
     host->IASetInputLayout(
         static_cast<ID3D11InputLayout *>(unwrap(state::read<void *>(self, state::input_layout))));
-    host->VSSetShader(
-        static_cast<ID3D11VertexShader *>(unwrap(state::read<void *>(self, state::vertex_shader))),
-        nullptr, 0);
+    host->VSSetShader(vs, nullptr, 0);
     host->PSSetShader(
         static_cast<ID3D11PixelShader *>(unwrap(state::read<void *>(self, state::pixel_shader))),
         nullptr, 0);
     const auto value = state::read<std::uint64_t>(self, state::topology);
+    const bool is_rect =
+        (value & 0xffffffffull) == 0xc0009e00ull && ((value >> 37) & 0x3full) == 0x11ull;
+    if (is_rect) {
+        host->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11GeometryShader *gs = nullptr;
+        if (vs) {
+            const std::lock_guard lock(rect_gs_mutex);
+            const auto existing = rect_geometry_shaders.find(vs);
+            if (existing != rect_geometry_shaders.end()) {
+                gs = existing->second;
+            } else if (const auto code = vs_bytecodes.find(vs); code != vs_bytecodes.end()) {
+                const auto made = modules::rectangle_shader(code->second, true);
+                if (!made.empty()) {
+                    ID3D11Device *dev = nullptr;
+                    host->GetDevice(&dev);
+                    dev->CreateGeometryShader(made.data(), made.size(), nullptr, &gs);
+                    dev->Release();
+                }
+                rect_geometry_shaders[vs] = gs;
+            }
+            rect_gs_bound[self] = true;
+        }
+        host->GSSetShader(gs, nullptr, 0);
+        return;
+    }
+    {
+        const std::lock_guard lock(rect_gs_mutex);
+        if (auto it = rect_gs_bound.find(self); it != rect_gs_bound.end() && it->second) {
+            it->second = false;
+            host->GSSetShader(nullptr, nullptr, 0);
+        }
+    }
     for (std::size_t topology = 1; topology < std::size(state::topologies); ++topology)
         if (state::topologies[topology] == value && value != state::topologies[0]) {
             host->IASetPrimitiveTopology(static_cast<D3D11_PRIMITIVE_TOPOLOGY>(topology));
@@ -1569,16 +1682,25 @@ void STDMETHODCALLTYPE set_fast_vertex_buffer(void *self, UINT slot, void *buffe
     static_cast<ID3D11DeviceContext *>(unwrap(self))
         ->IASetVertexBuffers(slot, 1, &host, &stride, &offset);
 }
-void STDMETHODCALLTYPE set_placed_vertex_buffer(void *self, UINT slot, void *buffer, void *,
+void STDMETHODCALLTYPE set_placed_vertex_buffer(void *self, UINT slot, void *buffer, void *address,
                                                 UINT stride) {
-    set_fast_vertex_buffer(self, slot, buffer, stride);
+    auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
+    UINT offset = 0;
+    if (host && address)
+        buffer_offset(host, reinterpret_cast<std::uintptr_t>(address), offset);
+    static_cast<ID3D11DeviceContext *>(unwrap(self))
+        ->IASetVertexBuffers(slot, 1, &host, &stride, &offset);
 }
 void STDMETHODCALLTYPE set_fast_index_buffer(void *self, UINT hardware_format, void *buffer) {
     set_index_buffer(self, hardware_format, buffer, 0);
 }
 void STDMETHODCALLTYPE set_placed_index_buffer(void *self, UINT hardware_format, void *buffer,
-                                               void *) {
-    set_index_buffer(self, hardware_format, buffer, 0);
+                                               void *address) {
+    auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
+    UINT offset = 0;
+    if (host && address)
+        buffer_offset(host, reinterpret_cast<std::uintptr_t>(address), offset);
+    set_index_buffer(self, hardware_format, buffer, offset);
 }
 
 // SetFastResources_Debug(table, end): what titles call instead of writing descriptor packets
@@ -1632,21 +1754,59 @@ void STDMETHODCALLTYPE set_fast_resources(void *self, const UINT *table, const U
                 UINT offset = 0;
                 ID3D11DeviceContext1 *latest = nullptr;
                 const auto address = extra & 0xffffffffffffull;
-                // constants the title wrote at an address of its own (a placement binding)
-                if (buffer && address && !buffer_offset(buffer, address, offset)) {
-                    D3D11_BUFFER_DESC desc;
-                    buffer->GetDesc(&desc);
-                    if (desc.Usage == D3D11_USAGE_DEFAULT &&
-                        readable_memory(address, desc.ByteWidth))
-                        context->UpdateSubresource(buffer, 0, nullptr,
-                                                   reinterpret_cast<const void *>(address), 0, 0);
+                const bool inside = buffer && address && buffer_offset(buffer, address, offset);
+                if (address && (!inside || offset % 256 != 0) && readable_memory(address, 16)) {
+                    UINT copy_len = 4096u;
+                    if (buffer) {
+                        D3D11_BUFFER_DESC desc;
+                        buffer->GetDesc(&desc);
+                        const UINT avail = inside && desc.ByteWidth > offset
+                                               ? desc.ByteWidth - offset
+                                               : desc.ByteWidth;
+                        copy_len = std::min(avail ? avail : 4096u, 4096u);
+                    }
+                    while (copy_len > 16 && !readable_memory(address, copy_len))
+                        copy_len /= 2;
+                    const UINT aligned = (std::max(copy_len, 256u) + 255u) & ~255u;
+                    ID3D11Buffer *slice = nullptr;
+                    {
+                        const std::lock_guard lock(cb_mutex);
+                        auto &entry = slice_cbs[{context, stage, slot + i}];
+                        if (!entry.first || entry.second < aligned) {
+                            if (entry.first)
+                                entry.first->Release();
+                            entry = {nullptr, 0};
+                            ID3D11Device *dev = nullptr;
+                            context->GetDevice(&dev);
+                            const D3D11_BUFFER_DESC bd{aligned,
+                                                       D3D11_USAGE_DYNAMIC,
+                                                       D3D11_BIND_CONSTANT_BUFFER,
+                                                       D3D11_CPU_ACCESS_WRITE,
+                                                       0,
+                                                       0};
+                            if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                                entry.second = aligned;
+                            dev->Release();
+                        }
+                        slice = entry.first;
+                    }
+                    if (slice) {
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(
+                                context->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                            std::memset(mapped.pData, 0, aligned);
+                            std::memcpy(mapped.pData, reinterpret_cast<const void *>(address),
+                                        copy_len);
+                            context->Unmap(slice, 0);
+                        }
+                        (context->*constants[stage])(slot + i, 1, &slice);
+                        continue;
+                    }
                 }
-                if (buffer && buffer_offset(buffer, extra & 0xffffffffffffull, offset) && offset &&
-                    SUCCEEDED(context->QueryInterface(&latest))) {
-                    // constants from the address the title gave, in 256-byte steps
+                if (inside && offset && SUCCEEDED(context->QueryInterface(&latest))) {
                     D3D11_BUFFER_DESC desc;
                     buffer->GetDesc(&desc);
-                    const UINT first = offset / 256 * 16,
+                    const UINT first = offset / 16,
                                count =
                                    std::min(4096u, (desc.ByteWidth / 16 - first + 15) / 16 * 16);
                     using Set1 = void (STDMETHODCALLTYPE ID3D11DeviceContext1::*)(
@@ -1754,17 +1914,58 @@ void STDMETHODCALLTYPE set_fast_resources_from_batch(void *self, const UINT *bat
                 stage = &candidate;
         const UINT within = place - stage->base;
         if (within < views_at) {
+            const UINT stage_idx = static_cast<UINT>(stage - &stages[0]);
             for (UINT i = 0; i + 4 <= count; i += 4) {
                 const UINT slot = (within + i * 4) / 16;
+                const auto address = (std::uintptr_t{words[i + 1] & 0xffff} << 32) | words[i];
                 UINT offset = 0;
                 auto *const buffer = described_buffer(words + i, offset);
+                if ((!buffer || offset % 256 != 0) && address && readable_memory(address, 16)) {
+                    UINT copy_len = words[i + 2] ? std::min(words[i + 2], 65536u) : 4096u;
+                    while (copy_len > 16 && !readable_memory(address, copy_len))
+                        copy_len /= 2;
+                    const UINT aligned = (std::max(copy_len, 256u) + 255u) & ~255u;
+                    ID3D11Buffer *slice = nullptr;
+                    {
+                        const std::lock_guard lock(cb_mutex);
+                        auto &entry = slice_cbs[{context, stage_idx, slot}];
+                        if (!entry.first || entry.second < aligned) {
+                            if (entry.first)
+                                entry.first->Release();
+                            entry = {nullptr, 0};
+                            ID3D11Device *dev = nullptr;
+                            context->GetDevice(&dev);
+                            const D3D11_BUFFER_DESC bd{aligned,
+                                                       D3D11_USAGE_DYNAMIC,
+                                                       D3D11_BIND_CONSTANT_BUFFER,
+                                                       D3D11_CPU_ACCESS_WRITE,
+                                                       0,
+                                                       0};
+                            if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                                entry.second = aligned;
+                            dev->Release();
+                        }
+                        slice = entry.first;
+                    }
+                    if (slice) {
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(
+                                context->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                            std::memset(mapped.pData, 0, aligned);
+                            std::memcpy(mapped.pData, reinterpret_cast<const void *>(address),
+                                        copy_len);
+                            context->Unmap(slice, 0);
+                        }
+                        (context->*stage->constants)(slot, 1, &slice);
+                        continue;
+                    }
+                }
                 if (!buffer)
                     continue;
                 if (offset && latest) {
-                    // constants from where the descriptor points, in 256-byte steps
                     D3D11_BUFFER_DESC desc;
                     buffer->GetDesc(&desc);
-                    const UINT first = offset / 256 * 16,
+                    const UINT first = offset / 16,
                                constants =
                                    std::min(4096u, (desc.ByteWidth / 16 - first + 15) / 16 * 16);
                     (latest->*stage->constants1)(slot, 1, &buffer, &first, &constants);
@@ -1837,8 +2038,251 @@ void STDMETHODCALLTYPE context_fill_memory(void *, void *destination, SIZE_T siz
 template <class Shader, void (STDMETHODCALLTYPE ID3D11DeviceContext::*Set)(
                             Shader *, ID3D11ClassInstance *const *, UINT)>
 void STDMETHODCALLTYPE set_shader(void *self, void *shader) {
+    if constexpr (std::is_same_v<Shader, ID3D11GeometryShader>) {
+        const std::lock_guard lock(rect_gs_mutex);
+        rect_gs_bound[self] = false;
+    }
     (static_cast<ID3D11DeviceContext *>(unwrap(self))->*Set)(static_cast<Shader *>(unwrap(shader)),
                                                              nullptr, 0);
+}
+
+HRESULT STDMETHODCALLTYPE context_map(void *self, void *resource, UINT subresource,
+                                      D3D11_MAP map_type, UINT flags,
+                                      D3D11_MAPPED_SUBRESOURCE *mapped) {
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    auto *const res = static_cast<ID3D11Resource *>(unwrap(resource));
+    const auto hr = ctx->Map(res, subresource, map_type, flags, mapped);
+    if (SUCCEEDED(hr) && mapped && mapped->pData && subresource == 0) {
+        const std::lock_guard lock(cb_mutex);
+        if (cb_shadows.contains(static_cast<ID3D11Buffer *>(res)))
+            cb_mapped[{ctx, res}] = mapped->pData;
+    }
+    return hr;
+}
+void STDMETHODCALLTYPE context_unmap(void *self, void *resource, UINT subresource) {
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    auto *const res = static_cast<ID3D11Resource *>(unwrap(resource));
+    if (subresource == 0) {
+        const std::lock_guard lock(cb_mutex);
+        if (const auto m = cb_mapped.find({ctx, res}); m != cb_mapped.end()) {
+            if (const auto s = cb_shadows.find(static_cast<ID3D11Buffer *>(res));
+                s != cb_shadows.end() && m->second)
+                std::memcpy(s->second.bytes.data(), m->second,
+                            std::min<std::size_t>(s->second.orig_size, s->second.bytes.size()));
+            cb_mapped.erase(m);
+        }
+    }
+    ctx->Unmap(res, subresource);
+}
+void update_cb_shadow_and_gpu(ID3D11DeviceContext *ctx, ID3D11Resource *res, UINT subresource,
+                              const D3D11_BOX *box, const void *data, UINT row_pitch,
+                              UINT depth_pitch, UINT flags, bool v1) {
+    if (res && data && subresource == 0) {
+        std::vector<std::byte> copy;
+        {
+            const std::lock_guard lock(cb_mutex);
+            if (auto it = cb_shadows.find(static_cast<ID3D11Buffer *>(res));
+                it != cb_shadows.end()) {
+                auto &shadow = it->second;
+                if (box) {
+                    if (box->left < shadow.bytes.size() && box->right > box->left) {
+                        const auto len = std::min<std::size_t>(box->right - box->left,
+                                                               shadow.bytes.size() - box->left);
+                        std::memcpy(shadow.bytes.data() + box->left, data, len);
+                    }
+                } else {
+                    std::memcpy(shadow.bytes.data(), data,
+                                std::min<std::size_t>(shadow.orig_size, shadow.bytes.size()));
+                }
+                copy = shadow.bytes;
+            }
+        }
+        if (!copy.empty()) {
+            ctx->UpdateSubresource(res, 0, nullptr, copy.data(), 0, 0);
+            return;
+        }
+    }
+    if (v1) {
+        if (ID3D11DeviceContext1 *c1 = nullptr; SUCCEEDED(ctx->QueryInterface(&c1))) {
+            c1->UpdateSubresource1(res, subresource, box, data, row_pitch, depth_pitch, flags);
+            c1->Release();
+            return;
+        }
+    }
+    ctx->UpdateSubresource(res, subresource, box, data, row_pitch, depth_pitch);
+}
+void STDMETHODCALLTYPE context_update_subresource(void *self, void *dst, UINT sub,
+                                                  const D3D11_BOX *box, const void *data,
+                                                  UINT row_pitch, UINT depth_pitch) {
+    update_cb_shadow_and_gpu(static_cast<ID3D11DeviceContext *>(unwrap(self)),
+                             static_cast<ID3D11Resource *>(unwrap(dst)), sub, box, data, row_pitch,
+                             depth_pitch, 0, false);
+}
+void STDMETHODCALLTYPE context_update_subresource1(void *self, void *dst, UINT sub,
+                                                   const D3D11_BOX *box, const void *data,
+                                                   UINT row_pitch, UINT depth_pitch, UINT flags) {
+    update_cb_shadow_and_gpu(static_cast<ID3D11DeviceContext *>(unwrap(self)),
+                             static_cast<ID3D11Resource *>(unwrap(dst)), sub, box, data, row_pitch,
+                             depth_pitch, flags, true);
+}
+template <UINT Stage>
+void STDMETHODCALLTYPE context_set_cb1(void *self, UINT start_slot, UINT num_buffers,
+                                       void *const *buffers, const UINT *first_constant,
+                                       const UINT *num_constants) {
+    if (!num_buffers || num_buffers > D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+        return;
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    ID3D11DeviceContext1 *c1 = nullptr;
+    if (FAILED(ctx->QueryInterface(&c1)))
+        return;
+    ID3D11Buffer *host_bufs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    UINT host_first[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    UINT host_count[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    for (UINT i = 0; i < num_buffers; ++i) {
+        auto *const buf = buffers ? static_cast<ID3D11Buffer *>(unwrap(buffers[i])) : nullptr;
+        const UINT fc = first_constant ? first_constant[i] : 0;
+        const UINT nc = num_constants ? num_constants[i] : 4096;
+        if (!buf) {
+            host_bufs[i] = nullptr;
+            host_first[i] = 0;
+            host_count[i] = 4096;
+            continue;
+        }
+        if (fc % 16 == 0) {
+            host_bufs[i] = buf;
+            host_first[i] = fc;
+            host_count[i] = std::min(4096u, (std::max(nc, 1u) + 15u) & ~15u);
+            continue;
+        }
+        const UINT byte_off = fc * 16, byte_len = std::max(nc, 1u) * 16;
+        const UINT aligned_bytes = std::min(65536u, (std::max(byte_len, 256u) + 255u) & ~255u);
+        ID3D11Buffer *slice = nullptr;
+        std::vector<std::byte> sub(aligned_bytes);
+        {
+            const std::lock_guard lock(cb_mutex);
+            if (const auto s = cb_shadows.find(buf);
+                s != cb_shadows.end() && byte_off < s->second.bytes.size()) {
+                std::memcpy(sub.data(), s->second.bytes.data() + byte_off,
+                            std::min<std::size_t>(byte_len, s->second.bytes.size() - byte_off));
+            }
+            auto &entry = slice_cbs[{ctx, Stage, start_slot + i}];
+            if (!entry.first || entry.second < aligned_bytes) {
+                if (entry.first)
+                    entry.first->Release();
+                entry = {nullptr, 0};
+                ID3D11Device *dev = nullptr;
+                ctx->GetDevice(&dev);
+                const D3D11_BUFFER_DESC bd{aligned_bytes,
+                                           D3D11_USAGE_DYNAMIC,
+                                           D3D11_BIND_CONSTANT_BUFFER,
+                                           D3D11_CPU_ACCESS_WRITE,
+                                           0,
+                                           0};
+                if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                    entry.second = aligned_bytes;
+                dev->Release();
+            }
+            slice = entry.first;
+        }
+        if (slice) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(ctx->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                std::memcpy(mapped.pData, sub.data(), aligned_bytes);
+                ctx->Unmap(slice, 0);
+            }
+            host_bufs[i] = slice;
+            host_first[i] = 0;
+            host_count[i] = aligned_bytes / 16;
+        } else {
+            host_bufs[i] = buf;
+            host_first[i] = fc & ~15u;
+            host_count[i] = std::min(4096u, (nc + 31u) & ~15u);
+        }
+    }
+    using Set1 = void (STDMETHODCALLTYPE ID3D11DeviceContext1::*)(UINT, UINT, ID3D11Buffer *const *,
+                                                                  const UINT *, const UINT *);
+    constexpr Set1 setters[] = {
+        &ID3D11DeviceContext1::VSSetConstantBuffers1, &ID3D11DeviceContext1::HSSetConstantBuffers1,
+        &ID3D11DeviceContext1::DSSetConstantBuffers1, &ID3D11DeviceContext1::GSSetConstantBuffers1,
+        &ID3D11DeviceContext1::PSSetConstantBuffers1, &ID3D11DeviceContext1::CSSetConstantBuffers1};
+    (c1->*setters[Stage])(start_slot, num_buffers, host_bufs, host_first, host_count);
+    c1->Release();
+}
+
+template <UINT Stage>
+void STDMETHODCALLTYPE set_placed_cb(void *self, UINT slot, void *buffer, void *address) {
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
+    if (!host || !address) {
+        using Set =
+            void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11Buffer *const *);
+        constexpr Set plain[] = {
+            &ID3D11DeviceContext::VSSetConstantBuffers, &ID3D11DeviceContext::HSSetConstantBuffers,
+            &ID3D11DeviceContext::DSSetConstantBuffers, &ID3D11DeviceContext::GSSetConstantBuffers,
+            &ID3D11DeviceContext::PSSetConstantBuffers, &ID3D11DeviceContext::CSSetConstantBuffers};
+        (ctx->*plain[Stage])(slot, 1, &host);
+        return;
+    }
+    D3D11_BUFFER_DESC desc{};
+    host->GetDesc(&desc);
+    UINT offset = 0;
+    const auto addr = reinterpret_cast<std::uintptr_t>(address);
+    const bool inside = buffer_offset(host, addr, offset);
+    ID3D11DeviceContext1 *c1 = nullptr;
+    if (FAILED(ctx->QueryInterface(&c1)))
+        return;
+    using Set1 = void (STDMETHODCALLTYPE ID3D11DeviceContext1::*)(UINT, UINT, ID3D11Buffer *const *,
+                                                                  const UINT *, const UINT *);
+    constexpr Set1 setters[] = {
+        &ID3D11DeviceContext1::VSSetConstantBuffers1, &ID3D11DeviceContext1::HSSetConstantBuffers1,
+        &ID3D11DeviceContext1::DSSetConstantBuffers1, &ID3D11DeviceContext1::GSSetConstantBuffers1,
+        &ID3D11DeviceContext1::PSSetConstantBuffers1, &ID3D11DeviceContext1::CSSetConstantBuffers1};
+    if (inside && offset % 256 == 0) {
+        const UINT fc = offset / 16;
+        const UINT nc = std::min(4096u, ((desc.ByteWidth - offset) / 16 + 15u) & ~15u);
+        (c1->*setters[Stage])(slot, 1, &host, &fc, &nc);
+        c1->Release();
+        return;
+    }
+    const UINT avail = inside && desc.ByteWidth > offset ? desc.ByteWidth - offset : desc.ByteWidth;
+    const UINT copy_len = std::min(avail ? avail : 4096u, 4096u);
+    const UINT aligned_bytes = (std::max(copy_len, 256u) + 255u) & ~255u;
+    ID3D11Buffer *slice = nullptr;
+    {
+        const std::lock_guard lock(cb_mutex);
+        auto &entry = slice_cbs[{ctx, Stage, slot}];
+        if (!entry.first || entry.second < aligned_bytes) {
+            if (entry.first)
+                entry.first->Release();
+            entry = {nullptr, 0};
+            ID3D11Device *dev = nullptr;
+            ctx->GetDevice(&dev);
+            const D3D11_BUFFER_DESC bd{aligned_bytes,
+                                       D3D11_USAGE_DYNAMIC,
+                                       D3D11_BIND_CONSTANT_BUFFER,
+                                       D3D11_CPU_ACCESS_WRITE,
+                                       0,
+                                       0};
+            if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                entry.second = aligned_bytes;
+            dev->Release();
+        }
+        slice = entry.first;
+    }
+    if (slice && readable_memory(addr, copy_len)) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(ctx->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            std::memset(mapped.pData, 0, aligned_bytes);
+            std::memcpy(mapped.pData, address, copy_len);
+            ctx->Unmap(slice, 0);
+        }
+        const UINT fc = 0, nc = aligned_bytes / 16;
+        (c1->*setters[Stage])(slot, 1, &slice, &fc, &nc);
+    } else {
+        const UINT fc = 0, nc = std::min(4096u, (desc.ByteWidth / 16 + 15u) & ~15u);
+        (c1->*setters[Stage])(slot, 1, &host, &fc, &nc);
+    }
+    c1->Release();
 }
 
 // Desktop slot of every ID3D11DeviceContext1 method, with what its arguments are.
@@ -1859,8 +2303,8 @@ std::array<Method, 134> context_methods() {
         set(slot); // draws, topology, viewports, scissors, ClearState, Flush
     for (std::size_t slot : {12, 13, 20, 21, 38})
         methods[slot].draws = true;
-    set(14, {in(1)}); // Map
-    set(15, {in(1)}); // Unmap
+    methods[14] = custom(&context_map);
+    methods[15] = custom(&context_unmap);
     set(17, {in(1)}); // IASetInputLayout
     set(18, {in_array(3, 2)});
     set(19, {in(1)});
@@ -1876,7 +2320,7 @@ std::array<Method, 134> context_methods() {
     methods[39].draws = methods[40].draws = true;
     set(46, {in(1), in(6)}); // CopySubresourceRegion
     set(47, {in(1), in(2)}); // CopyResource
-    set(48, {in(1)});        // UpdateSubresource
+    methods[48] = custom(&context_update_subresource);
     set(49, {in(1), in(3)});
     for (std::size_t slot : {50, 51, 52, 54}) // clears, GenerateMips
         set(slot, {in(1)});
@@ -1910,11 +2354,15 @@ std::array<Method, 134> context_methods() {
     set(96);
     set(114, {created(2, Kind::state)}); // FinishCommandList
     set(115, {in(1), in(6)});
-    set(116, {in(1)});
+    methods[116] = custom(&context_update_subresource1);
     set(117, {in(1)});
     set(118, {in(1)});
-    for (std::size_t slot = 119; slot <= 124; ++slot) // constant buffers with ranges
-        set(slot, {in_array(3, 2)});
+    methods[119] = custom(&context_set_cb1<0>);
+    methods[120] = custom(&context_set_cb1<1>);
+    methods[121] = custom(&context_set_cb1<2>);
+    methods[122] = custom(&context_set_cb1<3>);
+    methods[123] = custom(&context_set_cb1<4>);
+    methods[124] = custom(&context_set_cb1<5>);
     set(132, {in(1)});
     set(133, {in(1)});
     return methods;
@@ -1984,17 +2432,17 @@ Layout context() {
                            custom(&set_one<Sampler, &Context::DSSetSamplers>),
                            custom(&set_fast_vertex_buffer),
                            custom(&set_fast_index_buffer),
-                           custom(&set_placed<Buffer, &Context::PSSetConstantBuffers>),
+                           custom(&set_placed_cb<4>),
                            custom(&set_placed<View, &Context::PSSetShaderResources>),
-                           custom(&set_placed<Buffer, &Context::VSSetConstantBuffers>),
+                           custom(&set_placed_cb<0>),
                            custom(&set_placed<View, &Context::VSSetShaderResources>),
-                           custom(&set_placed<Buffer, &Context::GSSetConstantBuffers>),
+                           custom(&set_placed_cb<3>),
                            custom(&set_placed<View, &Context::GSSetShaderResources>),
-                           custom(&set_placed<Buffer, &Context::CSSetConstantBuffers>),
+                           custom(&set_placed_cb<5>),
                            custom(&set_placed<View, &Context::CSSetShaderResources>),
-                           custom(&set_placed<Buffer, &Context::HSSetConstantBuffers>),
+                           custom(&set_placed_cb<1>),
                            custom(&set_placed<View, &Context::HSSetShaderResources>),
-                           custom(&set_placed<Buffer, &Context::DSSetConstantBuffers>),
+                           custom(&set_placed_cb<2>),
                            custom(&set_placed<View, &Context::DSSetShaderResources>),
                            custom(&set_placed_vertex_buffer),
                            custom(&set_placed_index_buffer)};
@@ -2227,6 +2675,22 @@ bool kind_of(const GUID &iid, Kind &kind) {
         kind = Kind::context;
     else if (iid == __uuidof(IDXGISwapChain) || iid == __uuidof(IDXGISwapChain1))
         kind = Kind::swap_chain;
+    else if (iid == __uuidof(ID3D11VertexShader) || iid == __uuidof(ID3D11PixelShader) ||
+             iid == __uuidof(ID3D11GeometryShader) || iid == __uuidof(ID3D11HullShader) ||
+             iid == __uuidof(ID3D11DomainShader) || iid == __uuidof(ID3D11ComputeShader) ||
+             iid == __uuidof(ID3D11InputLayout))
+        kind = Kind::child;
+    else if (iid == __uuidof(ID3D11View) || iid == __uuidof(ID3D11ShaderResourceView) ||
+             iid == __uuidof(ID3D11RenderTargetView) || iid == __uuidof(ID3D11DepthStencilView) ||
+             iid == __uuidof(ID3D11UnorderedAccessView))
+        kind = Kind::view;
+    else if (iid == __uuidof(ID3D11BlendState) || iid == __uuidof(ID3D11BlendState1) ||
+             iid == __uuidof(ID3D11DepthStencilState) || iid == __uuidof(ID3D11RasterizerState) ||
+             iid == __uuidof(ID3D11RasterizerState1) || iid == __uuidof(ID3D11SamplerState) ||
+             iid == __uuidof(ID3D11ClassLinkage) || iid == __uuidof(ID3D11Asynchronous) ||
+             iid == __uuidof(ID3D11Query) || iid == __uuidof(ID3D11Predicate) ||
+             iid == __uuidof(ID3D11Counter) || iid == __uuidof(ID3D11CommandList))
+        kind = Kind::state;
     else
         return false;
     return true;

@@ -248,6 +248,13 @@ HRESULT STDMETHODCALLTYPE query(void *self, REFIID iid, void **object) {
     if (same || iid == __uuidof(IUnknown) ||
         (iid == __uuidof(ID3D11DeviceChild) && info->kind != Kind::device &&
          info->kind != Kind::swap_chain)) {
+        if (same &&
+            (info->kind == Kind::child || info->kind == Kind::view || info->kind == Kind::state)) {
+            IUnknown *check = nullptr;
+            if (FAILED(info->host->QueryInterface(iid, reinterpret_cast<void **>(&check))))
+                return E_NOINTERFACE;
+            check->Release();
+        }
         ++info->references;
         *object = self;
         return S_OK;

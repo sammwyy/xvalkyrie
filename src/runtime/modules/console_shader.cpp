@@ -794,7 +794,7 @@ std::map<std::string, std::string> notes;
 bool inflate_zlib(Bytes stream, std::vector<std::uint8_t> &out) { return Inflate(stream).run(out); }
 
 bool console_only_shader(Bytes container);
-std::span<const std::uint8_t> rectangle_shader(Bytes vertex) {
+std::span<const std::uint8_t> rectangle_shader(Bytes vertex, bool sm50) {
     auto outputs = signature(vertex, "OSG1");
     if (outputs.empty())
         outputs = signature(vertex, "OSGN");
@@ -838,11 +838,37 @@ std::span<const std::uint8_t> rectangle_shader(Bytes vertex) {
     static std::map<std::string, std::vector<std::uint8_t>> rectangles; // by source; never erased
     const std::lock_guard lock(rectangles_mutex);
     // by the compiler that made the vertex shader it goes with
-    const bool newer = !part(vertex, "DXIL").empty();
-    const auto key = (newer ? "6" : "5") + source;
+    const bool newer = !sm50 && !part(vertex, "DXIL").empty();
+    const auto key = (sm50 ? "50" : newer ? "6" : "5") + source;
     const auto found = rectangles.find(key);
     if (found != rectangles.end())
         return found->second;
+    if (sm50) {
+        static const auto fn = [] {
+            const auto lib =
+                LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            return lib ? reinterpret_cast<Compile>(GetProcAddress(lib, "D3DCompile")) : nullptr;
+        }();
+        std::vector<std::uint8_t> bytes;
+        IUnknown *code = nullptr, *errors = nullptr;
+        if (fn) {
+            const auto st = _mm_getcsr();
+            _mm_setcsr(0x1f80);
+            const auto hr = fn(source.data(), source.size(), "rect_gs", nullptr, nullptr, "main",
+                               "gs_5_0", 0, 0, &code, &errors);
+            _mm_setcsr(st);
+            if (SUCCEEDED(hr) && code) {
+                auto *const blob = static_cast<Blob *>(code);
+                const auto *const p = static_cast<const std::uint8_t *>(blob->GetBufferPointer());
+                bytes.assign(p, p + blob->GetBufferSize());
+            }
+            if (code)
+                code->Release();
+            if (errors)
+                errors->Release();
+        }
+        return rectangles.emplace(key, std::move(bytes)).first->second;
+    }
     return rectangles
         .emplace(key,
                  compile_now(ShaderStage::geometry_triangles, source, true, nullptr, true, newer))

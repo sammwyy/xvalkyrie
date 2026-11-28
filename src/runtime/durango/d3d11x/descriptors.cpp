@@ -1,4 +1,5 @@
 #include "runtime/durango/d3d11x/descriptors.hpp"
+#include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -7,6 +8,7 @@
 #include <d3d11_1.h>
 #include <map>
 #include <mutex>
+#include <tuple>
 
 // Descriptor fields, as titles read them: a buffer's V# (48-bit address, size) at 0x20, a
 // shader resource view's T# at 0x30 and a sampler's S# at 0x20, which here hold the id of
@@ -119,6 +121,9 @@ const std::uint32_t *find(const Stream &stream, std::uint32_t reg) {
     return found == stream.registers.end() || !found->second.set ? nullptr
                                                                  : found->second.words.data();
 }
+std::map<std::tuple<ID3D11DeviceContext *, bool, UINT>, std::pair<ID3D11Buffer *, UINT>>
+    stream_slice_cbs;
+
 void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t base, bool pixel) {
     ID3D11DeviceContext1 *latest = nullptr;
     context->QueryInterface(&latest);
@@ -126,27 +131,62 @@ void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t
         const auto *descriptor = find(stream, base + slot * 0x10);
         if (!descriptor)
             continue;
+        const auto address = (std::uintptr_t{descriptor[1] & 0xffff} << 32) | descriptor[0];
         UINT offset = 0;
         auto *const buffer = buffer_at(descriptor, offset);
-        if (!buffer)
+        if (buffer && offset % 256 == 0) {
+            if (latest && offset) {
+                D3D11_BUFFER_DESC desc;
+                buffer->GetDesc(&desc);
+                const UINT first = offset / 16;
+                const UINT count =
+                    std::max(16u, (std::min(descriptor[2] ? descriptor[2] : desc.ByteWidth,
+                                            desc.ByteWidth - offset) +
+                                   255) /
+                                      256 * 16);
+                if (pixel)
+                    latest->PSSetConstantBuffers1(slot, 1, &buffer, &first, &count);
+                else
+                    latest->VSSetConstantBuffers1(slot, 1, &buffer, &first, &count);
+            } else if (pixel) {
+                context->PSSetConstantBuffers(slot, 1, &buffer);
+            } else {
+                context->VSSetConstantBuffers(slot, 1, &buffer);
+            }
             continue;
-        if (latest) {
-            D3D11_BUFFER_DESC desc;
-            buffer->GetDesc(&desc);
-            const UINT first = offset / 256 * 16;
-            const UINT count =
-                std::max(16u, (std::min(descriptor[2] ? descriptor[2] : desc.ByteWidth,
-                                        desc.ByteWidth - first * 16) +
-                               255) /
-                                  256 * 16);
+        }
+        const UINT raw_bytes = descriptor[2] ? std::min(descriptor[2], 65536u) : 4096u;
+        if (!address || !modules::readable_memory(address, 16))
+            continue;
+        UINT copy_len = raw_bytes;
+        while (copy_len > 16 && !modules::readable_memory(address, copy_len))
+            copy_len /= 2;
+        const UINT aligned = (std::max(copy_len, 256u) + 255u) & ~255u;
+        auto &entry = stream_slice_cbs[{context, pixel, slot}];
+        if (!entry.first || entry.second < aligned) {
+            if (entry.first)
+                entry.first->Release();
+            entry = {nullptr, 0};
+            ID3D11Device *dev = nullptr;
+            context->GetDevice(&dev);
+            const D3D11_BUFFER_DESC bd{
+                aligned, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0,
+                0};
+            if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                entry.second = aligned;
+            dev->Release();
+        }
+        if (auto *slice = entry.first) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(context->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                std::memset(mapped.pData, 0, aligned);
+                std::memcpy(mapped.pData, reinterpret_cast<const void *>(address), copy_len);
+                context->Unmap(slice, 0);
+            }
             if (pixel)
-                latest->PSSetConstantBuffers1(slot, 1, &buffer, &first, &count);
+                context->PSSetConstantBuffers(slot, 1, &slice);
             else
-                latest->VSSetConstantBuffers1(slot, 1, &buffer, &first, &count);
-        } else if (pixel) {
-            context->PSSetConstantBuffers(slot, 1, &buffer);
-        } else {
-            context->VSSetConstantBuffers(slot, 1, &buffer);
+                context->VSSetConstantBuffers(slot, 1, &slice);
         }
     }
     if (latest)

@@ -306,6 +306,10 @@ TEST_CASE("a rectangle list's fourth corner comes from a geometry shader") {
     CHECK(description.OutputParameters == 3);
     CHECK(description.GSMaxOutputVertexCount == 4);
     reflection->Release();
+    const auto sm50 = rectangle_shader(
+        {static_cast<const std::uint8_t *>(code->GetBufferPointer()), code->GetBufferSize()}, true);
+    REQUIRE(sm50.size() > 4);
+    CHECK(!std::memcmp(sm50.data(), "DXBC", 4));
     code->Release();
     const std::uint8_t nothing[16] = {};
     CHECK(rectangle_shader(nothing).empty());
