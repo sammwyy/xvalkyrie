@@ -452,6 +452,25 @@ HRESULT STDMETHODCALLTYPE create_input_layout(void *self, const D3D11_INPUT_ELEM
     }
     return result;
 }
+HRESULT STDMETHODCALLTYPE create_texture1d(void *self, const D3D11_TEXTURE1D_DESC *desc,
+                                           const D3D11_SUBRESOURCE_DATA *data,
+                                           ID3D11Texture1D **texture) {
+    if (!desc)
+        return E_INVALIDARG;
+    auto host = *desc;
+    host.MiscFlags &= 0xffff;
+    host.Width = std::max(host.Width, 1u);
+    if (host.Usage == D3D11_USAGE_DYNAMIC)
+        host.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    else if (host.Usage == D3D11_USAGE_DEFAULT)
+        host.CPUAccessFlags = 0;
+    ID3D11Texture1D *created = nullptr;
+    const auto result = static_cast<ID3D11Device *>(unwrap(self))
+                            ->CreateTexture1D(&host, data, texture ? &created : nullptr);
+    if (SUCCEEDED(result) && texture)
+        *texture = static_cast<ID3D11Texture1D *>(wrap(created, Kind::texture1d));
+    return result;
+}
 // CreateTexture3D (6), likewise
 HRESULT STDMETHODCALLTYPE create_texture3d(void *self, const D3D11_TEXTURE3D_DESC *desc,
                                            const D3D11_SUBRESOURCE_DATA *data,
@@ -1347,7 +1366,7 @@ Layout device() {
     for (std::size_t slot = 3; slot <= 49; ++slot)
         set(slot);
     result.vtable[3] = custom(&create_buffer);
-    set(4, {created(3, Kind::texture1d)});
+    result.vtable[4] = custom(&create_texture1d);
     result.vtable[5] = custom(&create_texture2d);
     result.vtable[6] = custom(&create_texture3d);
     for (std::size_t slot = 7; slot <= 10; ++slot) // views of a resource
@@ -1787,6 +1806,10 @@ void STDMETHODCALLTYPE set_placed_index_buffer(void *self, UINT hardware_format,
 // vertex streams), resource kind in bits 28-30 (0 views, 1 buffers, else samplers); each
 // entry is 4 dwords: our object, then the stride (bits 48-63) and placement address.
 constexpr std::size_t out_of_line_flags = 0x390;
+template <UINT Stage>
+void STDMETHODCALLTYPE context_set_cb1(void *self, UINT start_slot, UINT num_buffers,
+                                       void *const *buffers, const UINT *first_constant,
+                                       const UINT *num_constants);
 void STDMETHODCALLTYPE set_fast_resources(void *self, const UINT *table, const UINT *end) {
     auto *const context = static_cast<ID3D11DeviceContext *>(unwrap(self));
     using View = ID3D11ShaderResourceView;
@@ -1824,15 +1847,56 @@ void STDMETHODCALLTYPE set_fast_resources(void *self, const UINT *table, const U
             } else if (kind == 1 && stage == 6) {
                 auto *buffer = static_cast<Buffer *>(host);
                 const UINT stride = static_cast<UINT>(extra >> 48);
+                const auto low = extra & 0xffffffffffffull;
                 UINT offset = 0;
-                buffer_offset(buffer, extra & 0xffffffffffffull, offset);
+                if (buffer && low && !buffer_offset(buffer, low, offset)) {
+                    D3D11_BUFFER_DESC desc{};
+                    buffer->GetDesc(&desc);
+                    if (low < desc.ByteWidth)
+                        offset = static_cast<UINT>(low);
+                }
                 context->IASetVertexBuffers(slot + i, 1, &buffer, &stride, &offset);
             } else if (kind == 1 && stage < 6) {
                 auto *buffer = static_cast<Buffer *>(host);
                 UINT offset = 0;
                 ID3D11DeviceContext1 *latest = nullptr;
                 const auto address = extra & 0xffffffffffffull;
-                const bool inside = buffer && address && buffer_offset(buffer, address, offset);
+                bool inside = buffer && address && buffer_offset(buffer, address, offset);
+                bool raw_offset = false;
+                if (buffer && address && !inside && !readable_memory(address, 16)) {
+                    D3D11_BUFFER_DESC desc{};
+                    buffer->GetDesc(&desc);
+                    if (address < desc.ByteWidth) {
+                        offset = static_cast<UINT>(address);
+                        inside = true;
+                        raw_offset = true;
+                    }
+                }
+                if (raw_offset && offset % 256 != 0) {
+                    const UINT fc = offset / 16, nc = 256;
+                    void *wrapped_buf = object;
+                    switch (stage) {
+                    case 0:
+                        context_set_cb1<0>(self, slot + i, 1, &wrapped_buf, &fc, &nc);
+                        break;
+                    case 1:
+                        context_set_cb1<1>(self, slot + i, 1, &wrapped_buf, &fc, &nc);
+                        break;
+                    case 2:
+                        context_set_cb1<2>(self, slot + i, 1, &wrapped_buf, &fc, &nc);
+                        break;
+                    case 3:
+                        context_set_cb1<3>(self, slot + i, 1, &wrapped_buf, &fc, &nc);
+                        break;
+                    case 4:
+                        context_set_cb1<4>(self, slot + i, 1, &wrapped_buf, &fc, &nc);
+                        break;
+                    case 5:
+                        context_set_cb1<5>(self, slot + i, 1, &wrapped_buf, &fc, &nc);
+                        break;
+                    }
+                    continue;
+                }
                 if (address && (!inside || offset % 256 != 0) && readable_memory(address, 16)) {
                     UINT copy_len = 4096u;
                     if (buffer) {
@@ -2542,6 +2606,7 @@ Layout context() {
     // nothing is compressed here: GetResourceCompression(X) say none, decompressing is done
     for (std::size_t slot = 227; slot <= 230; ++slot)
         console(slot, {Method::ignore});
+    console(252, {Method::ignore});
     result.object[8 + object_table] = custom(&set_shader_resource<&Context::PSSetShaderResources>);
     result.object[19 + object_table] = custom(&set_index_buffer);
     result.object[12 + object_table] = custom(&draw_indexed);
@@ -2600,6 +2665,9 @@ Layout earliest_layout(const Layout &later, Kind kind, std::size_t table) {
     if (kind == Kind::device)
         for (std::size_t slot = 51; slot + 4 < result.vtable.size(); ++slot)
             result.vtable[slot] = later.vtable[slot + 4];
+    if (kind == Kind::buffer || kind == Kind::texture1d || kind == Kind::texture2d ||
+        kind == Kind::texture3d)
+        result.vtable[11] = forward(10); // GetDesc
     if (kind != Kind::context)
         return result;
     result.object = {};
@@ -2679,7 +2747,11 @@ const Layout &layout(Kind kind) {
             state.words = child_words;
             return state;
         }(),
-        child("device child", 6),
+        [] {
+            auto dc = child("device child", 6);
+            dc.vtable[9] = {Method::ignore};
+            return dc;
+        }(),
         dma(),
         compute(),
         Layout{"device (console methods)"},

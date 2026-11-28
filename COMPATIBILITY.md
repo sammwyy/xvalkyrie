@@ -56,7 +56,7 @@ further than its state says. Logs of a run are in `%APPDATA%\xvalkyrie\logs`.
 | Slender - The Arrival                    | `458E04D7` | **Playable** | Unity. Plays from its opening on                                                                                             |
 | SONIC FORCES                             | `07B5597E` | **Playable** | Gets in game and plays; some textures of its HUD lack their transparency                                                     |
 | Infinity Blade Saga                      | `6346E6A1` | **Nothing**  | Unreal Engine 3. Finds its package configs and shader binaries, then stops on missing global shader platform                 |
-| Plants vs. Zombies Garden Warfare        | `334CB9F9` | **Intro**    | Direct3D 11.X. Full-color 1080p loading screen with gameplay tips                                                            |
+| Plants vs. Zombies Garden Warfare        | `334CB9F9` | **Menu**     | Direct3D 11.X. 3D main menu at 1080p ("Garden Ops / Multiplayer / Split Screen"); 1,000+ frames, reads the gamepad            |
 | Sonic Mania                              | `34BA1DE0` | **Playable** |                                                                                                                              |
 | Stardew Valley                           | `1240B5DA` | **Nothing**  | Faults in its own garbage collector before its device                                                                        |
 | Titanfall                                | `4D046B58` | **Boots**    | First kits, Source engine. Presents frames, the picture is black or one flat colour                                          |
