@@ -21,7 +21,8 @@ namespace {
 constexpr std::uint32_t magic = 0xd3d1face, resource_magic = 0xd3d1fac0,
                         unordered_magic = 0xd3d1fac1;
 constexpr std::uint32_t textures = 0x6b40, samplers = 0x7b40, vertices = 0x7d70,
-                        vertex_constants = 0x1c40, pixel_constants = 0x6a00;
+                        vs_textures = 0x1d80, vs_samplers = 0x2d80, vertex_constants = 0x1c40,
+                        pixel_constants = 0x6a00;
 constexpr unsigned slots = 16;
 
 std::mutex mutex;
@@ -112,16 +113,30 @@ void read(Stream &stream, const std::byte *start, const std::byte *end) {
         std::uint32_t header;
         std::memcpy(&header, at, 4);
         const auto count = (header >> 16) + 1;
-        if (count > 8) { // not a descriptor packet: nothing further is either
+        if (count > 256) {
             at = end;
             break;
         }
         if (at + 4 + 4 * count > end)
             break;
-        auto &target = stream.registers[header & 0xffff];
-        target.words = {};
-        std::memcpy(target.words.data(), at + 4, 4 * count);
-        target.set = true;
+        const std::uint32_t base_reg = header & 0xffff;
+        const bool tex_range = (base_reg >= textures && base_reg < textures + 32 * 0x20) ||
+                               (base_reg >= vs_textures && base_reg < vs_textures + 32 * 0x20);
+        const std::uint32_t step_dwords = (tex_range && count % 8 == 0) ? 8u
+                                          : (count <= 8)                ? count
+                                          : (count % 4 == 0)            ? 4u
+                                                                        : 0u;
+        if (step_dwords == 0) {
+            at += 4 + 4 * count;
+            continue;
+        }
+        const std::uint32_t step_reg = step_dwords * 4;
+        for (std::uint32_t off = 0; off < count; off += step_dwords) {
+            auto &target = stream.registers[base_reg + (off / step_dwords) * step_reg];
+            target.words = {};
+            std::memcpy(target.words.data(), at + 4 + 4 * off, 4 * std::min(step_dwords, 8u));
+            target.set = true;
+        }
         at += 4 + 4 * count;
     }
     stream.parsed = at;
@@ -133,6 +148,7 @@ const std::uint32_t *find(const Stream &stream, std::uint32_t reg) {
 }
 std::map<std::tuple<ID3D11DeviceContext *, bool, UINT>, std::pair<ID3D11Buffer *, UINT>>
     stream_slice_cbs;
+std::map<std::pair<ID3D11DeviceContext *, UINT>, std::pair<ID3D11Buffer *, UINT>> stream_slice_vbs;
 
 void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t base, bool pixel) {
     ID3D11DeviceContext1 *latest = nullptr;
@@ -284,8 +300,22 @@ bool buffer_offset(ID3D11Buffer *host, std::uint64_t address, UINT &offset) {
 }
 
 void describe_buffer(void *object, ID3D11Buffer *host, const void *address) {
-    if (address)
+    if (address) {
         put_buffer(object, host, reinterpret_cast<std::uintptr_t>(address));
+        return;
+    }
+    const std::uint64_t zero = 0;
+    std::memcpy(static_cast<std::byte *>(object) + 0x20, &zero, sizeof zero);
+    const std::lock_guard lock(mutex);
+    for (auto [it, end] = addresses_of.equal_range(host); it != end;) {
+        if (const auto b = buffers.find(it->second);
+            b != buffers.end() && b->second.buffer == host) {
+            buffers.erase(b);
+            it = addresses_of.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void apply_descriptors(ID3D11DeviceContext *context, const std::byte *start, const std::byte *end) {
@@ -303,11 +333,85 @@ void apply_descriptors(ID3D11DeviceContext *context, const std::byte *start, con
         if (const auto *descriptor = find(stream, samplers + slot * 0x10))
             if (auto *sampler = object_of<ID3D11SamplerState>(descriptor))
                 context->PSSetSamplers(slot, 1, &sampler);
+        if (const auto *descriptor = find(stream, vs_textures + slot * 0x20))
+            if (auto *view = object_of<ID3D11ShaderResourceView>(descriptor))
+                context->VSSetShaderResources(slot, 1, &view);
+        if (const auto *descriptor = find(stream, vs_samplers + slot * 0x10))
+            if (auto *sampler = object_of<ID3D11SamplerState>(descriptor))
+                context->VSSetSamplers(slot, 1, &sampler);
         if (const auto *descriptor = find(stream, vertices + slot * 0x10)) {
             UINT offset = 0;
-            if (auto *buffer = buffer_at(descriptor, offset)) {
-                const UINT stride = (descriptor[1] >> 16) & 0x3fff;
+            const UINT stride = (descriptor[1] >> 16) & 0x3fff;
+            auto *buffer = buffer_at(descriptor, offset);
+            D3D11_BUFFER_DESC vbd{};
+            if (buffer)
+                buffer->GetDesc(&vbd);
+            if (buffer && (vbd.BindFlags & D3D11_BIND_VERTEX_BUFFER)) {
                 context->IASetVertexBuffers(slot, 1, &buffer, &stride, &offset);
+            } else if (buffer && offset < vbd.ByteWidth) {
+                const UINT copy_len = std::min(vbd.ByteWidth - offset, 65536u);
+                const UINT cap = std::max(copy_len, 4096u);
+                auto &entry = stream_slice_vbs[{context, slot}];
+                if (!entry.first || entry.second < cap ||
+                    entry.second == 0x80000000u) { // ensure DEFAULT usage for GPU copy
+                    if (entry.first)
+                        entry.first->Release();
+                    entry = {nullptr, 0};
+                    ID3D11Device *dev = nullptr;
+                    context->GetDevice(&dev);
+                    const D3D11_BUFFER_DESC bd{
+                        cap, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
+                    if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                        entry.second = cap;
+                    dev->Release();
+                }
+                if (auto *slice = entry.first) {
+                    const D3D11_BOX box{offset, 0, 0, offset + copy_len, 1, 1};
+                    context->CopySubresourceRegion(slice, 0, 0, 0, 0, buffer, 0, &box);
+                    const UINT zero_off = 0;
+                    context->IASetVertexBuffers(slot, 1, &slice, &stride, &zero_off);
+                }
+            } else {
+                const auto address = (std::uintptr_t{descriptor[1] & 0xffff} << 32) | descriptor[0];
+                UINT raw_bytes = descriptor[2];
+                if (!raw_bytes || raw_bytes > 65536u)
+                    raw_bytes = 65536u;
+                if (address && modules::readable_memory(address, 4)) {
+                    UINT copy_len = raw_bytes;
+                    while (copy_len > 4 && !modules::readable_memory(address, copy_len))
+                        copy_len /= 2;
+                    if (modules::readable_memory(address, copy_len)) {
+                        const UINT cap = std::max(copy_len, 4096u);
+                        auto &entry = stream_slice_vbs[{context, slot}];
+                        if (!entry.first || entry.second < cap) {
+                            if (entry.first)
+                                entry.first->Release();
+                            entry = {nullptr, 0};
+                            ID3D11Device *dev = nullptr;
+                            context->GetDevice(&dev);
+                            const D3D11_BUFFER_DESC bd{cap,
+                                                       D3D11_USAGE_DYNAMIC,
+                                                       D3D11_BIND_VERTEX_BUFFER,
+                                                       D3D11_CPU_ACCESS_WRITE,
+                                                       0,
+                                                       0};
+                            if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                                entry.second = cap;
+                            dev->Release();
+                        }
+                        if (auto *slice = entry.first) {
+                            D3D11_MAPPED_SUBRESOURCE mp{};
+                            if (SUCCEEDED(
+                                    context->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+                                std::memcpy(mp.pData, reinterpret_cast<const void *>(address),
+                                            copy_len);
+                                context->Unmap(slice, 0);
+                            }
+                            const UINT zero_off = 0;
+                            context->IASetVertexBuffers(slot, 1, &slice, &stride, &zero_off);
+                        }
+                    }
+                }
             }
         }
     }

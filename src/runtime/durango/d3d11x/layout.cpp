@@ -516,6 +516,40 @@ HRESULT STDMETHODCALLTYPE create_shader_resource_view(void *self, void *resource
         if (retry.Format != DXGI_FORMAT_UNKNOWN && retry.Format != desc->Format)
             result = device->CreateShaderResourceView(host, &retry, view ? &created : nullptr);
     }
+    if (result == E_INVALIDARG && desc && host) {
+        if (ID3D11Texture2D *tex = nullptr; SUCCEEDED(host->QueryInterface(&tex))) {
+            D3D11_TEXTURE2D_DESC of{};
+            tex->GetDesc(&of);
+            tex->Release();
+            const UINT max_mips = std::max(of.MipLevels, 1u);
+            auto clamped = *desc;
+            if (clamped.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+                clamped.Texture2D.MostDetailedMip =
+                    std::min(clamped.Texture2D.MostDetailedMip, max_mips - 1u);
+                const UINT rem = max_mips - clamped.Texture2D.MostDetailedMip;
+                if (clamped.Texture2D.MipLevels == 0 || clamped.Texture2D.MipLevels > rem)
+                    clamped.Texture2D.MipLevels = rem;
+                result =
+                    device->CreateShaderResourceView(host, &clamped, view ? &created : nullptr);
+            } else if (clamped.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) {
+                clamped.Texture2DArray.MostDetailedMip =
+                    std::min(clamped.Texture2DArray.MostDetailedMip, max_mips - 1u);
+                const UINT rem = max_mips - clamped.Texture2DArray.MostDetailedMip;
+                if (clamped.Texture2DArray.MipLevels == 0 || clamped.Texture2DArray.MipLevels > rem)
+                    clamped.Texture2DArray.MipLevels = rem;
+                result =
+                    device->CreateShaderResourceView(host, &clamped, view ? &created : nullptr);
+            } else if (clamped.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE) {
+                clamped.TextureCube.MostDetailedMip =
+                    std::min(clamped.TextureCube.MostDetailedMip, max_mips - 1u);
+                const UINT rem = max_mips - clamped.TextureCube.MostDetailedMip;
+                if (clamped.TextureCube.MipLevels == 0 || clamped.TextureCube.MipLevels > rem)
+                    clamped.TextureCube.MipLevels = rem;
+                result =
+                    device->CreateShaderResourceView(host, &clamped, view ? &created : nullptr);
+            }
+        }
+    }
     if (result == E_INVALIDARG && desc && desc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D &&
         desc->Format != DXGI_FORMAT_UNKNOWN) {
         if (ID3D11Texture2D *tex = nullptr; host && SUCCEEDED(host->QueryInterface(&tex))) {
@@ -1812,11 +1846,47 @@ void STDMETHODCALLTYPE set_shader_resource(void *self, void **view, UINT slot, U
 
 // IASetIndexBuffer through the in-object table takes the index size first, as the
 // hardware names it: 0 for 16-bit indices, 1 for 32-bit ones.
+std::mutex ib_slice_mutex;
+std::map<ID3D11DeviceContext *, std::pair<ID3D11Buffer *, UINT>> slice_ibs;
+
 void STDMETHODCALLTYPE set_index_buffer(void *self, UINT hardware_format, void *buffer,
                                         UINT offset) {
-    static_cast<ID3D11DeviceContext *>(unwrap(self))
-        ->IASetIndexBuffer(static_cast<ID3D11Buffer *>(unwrap(buffer)),
-                           hardware_format ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, offset);
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    auto *host = static_cast<ID3D11Buffer *>(unwrap(buffer));
+    const auto fmt = hardware_format ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    if (host) {
+        D3D11_BUFFER_DESC bd{};
+        host->GetDesc(&bd);
+        if (!(bd.BindFlags & D3D11_BIND_INDEX_BUFFER) && offset < bd.ByteWidth) {
+            const UINT copy_len = std::min(bd.ByteWidth - offset, 131072u);
+            const UINT cap = std::max(copy_len, 4096u);
+            ID3D11Buffer *slice = nullptr;
+            {
+                const std::lock_guard lock(ib_slice_mutex);
+                auto &entry = slice_ibs[ctx];
+                if (!entry.first || entry.second < cap) {
+                    if (entry.first)
+                        entry.first->Release();
+                    entry = {nullptr, 0};
+                    ID3D11Device *dev = nullptr;
+                    ctx->GetDevice(&dev);
+                    const D3D11_BUFFER_DESC sbd{
+                        cap, D3D11_USAGE_DEFAULT, D3D11_BIND_INDEX_BUFFER, 0, 0, 0};
+                    if (SUCCEEDED(dev->CreateBuffer(&sbd, nullptr, &entry.first)))
+                        entry.second = cap;
+                    dev->Release();
+                }
+                slice = entry.first;
+            }
+            if (slice) {
+                const D3D11_BOX box{offset, 0, 0, offset + copy_len, 1, 1};
+                ctx->CopySubresourceRegion(slice, 0, 0, 0, 0, host, 0, &box);
+                ctx->IASetIndexBuffer(slice, fmt, 0);
+                return;
+            }
+        }
+    }
+    ctx->IASetIndexBuffer(host, fmt, offset);
 }
 
 // State a title sets without calling anything: the console headers write the input layout,
@@ -1840,8 +1910,46 @@ template <class T> T read(void *object, std::size_t offset) {
 constexpr std::size_t command_write = 0x50 / 8, command_end = 0x58 / 8, scratch_bytes = 1 << 20;
 std::mutex scratch_mutex;
 std::map<void *, std::unique_ptr<std::byte[]>> scratch;
+void inherit_immediate_targets(ID3D11DeviceContext *host) {
+    if (!host || host->GetType() != D3D11_DEVICE_CONTEXT_DEFERRED)
+        return;
+    ID3D11RenderTargetView *rtvs[8]{};
+    ID3D11DepthStencilView *dsv = nullptr;
+    host->OMGetRenderTargets(8, rtvs, &dsv);
+    bool any = dsv != nullptr;
+    for (auto *r : rtvs)
+        if (r)
+            any = true;
+    if (!any) {
+        ID3D11Device *dev = nullptr;
+        ID3D11DeviceContext *imm = nullptr;
+        host->GetDevice(&dev);
+        dev->GetImmediateContext(&imm);
+        imm->OMGetRenderTargets(8, rtvs, &dsv);
+        host->OMSetRenderTargets(8, rtvs, dsv);
+        UINT nvp = 0;
+        host->RSGetViewports(&nvp, nullptr);
+        if (nvp == 0) {
+            D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+            UINT ic = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            imm->RSGetViewports(&ic, vps);
+            if (ic)
+                host->RSSetViewports(ic, vps);
+        }
+        imm->Release();
+        dev->Release();
+    }
+    for (auto *r : rtvs)
+        if (r)
+            r->Release();
+    if (dsv)
+        dsv->Release();
+}
+
 void apply_context_state(void *self) {
-    upload_placements(static_cast<ID3D11DeviceContext *>(unwrap(self)));
+    auto *const ctx_host = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    upload_placements(ctx_host);
+    inherit_immediate_targets(ctx_host);
     const std::byte *stream = nullptr;
     {
         const std::lock_guard lock(scratch_mutex);
@@ -1939,6 +2047,35 @@ void STDMETHODCALLTYPE draw_indexed(void *self, UINT64 count_and_start, INT base
     static_cast<ID3D11DeviceContext *>(unwrap(self))
         ->DrawIndexed(static_cast<UINT>(count_and_start >> 32), static_cast<UINT>(count_and_start),
                       base_vertex);
+}
+void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT64 count_and_start, INT base_vertex,
+                                              UINT instance_count) {
+    apply_context_state(self);
+    static_cast<ID3D11DeviceContext *>(unwrap(self))
+        ->DrawIndexedInstanced(static_cast<UINT>(count_and_start >> 32), instance_count,
+                               static_cast<UINT>(count_and_start), base_vertex, 0);
+}
+void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertex_count, UINT start_vertex,
+                                      UINT instance_count) {
+    apply_context_state(self);
+    static_cast<ID3D11DeviceContext *>(unwrap(self))
+        ->DrawInstanced(vertex_count, instance_count, start_vertex, 0);
+}
+void STDMETHODCALLTYPE execute_command_list(void *self, void *list, BOOL) {
+    auto *const host_list = static_cast<ID3D11CommandList *>(unwrap(list));
+    if (host_list)
+        static_cast<ID3D11DeviceContext *>(unwrap(self))->ExecuteCommandList(host_list, TRUE);
+}
+HRESULT STDMETHODCALLTYPE finish_command_list(void *self, BOOL restore, void **list) {
+    auto *const host = static_cast<ID3D11DeviceContext *>(unwrap(self));
+    ID3D11CommandList *created = nullptr;
+    const auto result = host->FinishCommandList(restore, list ? &created : nullptr);
+    auto *const words = static_cast<std::byte **>(self);
+    words[command_write] = nullptr;
+    words[command_end] = nullptr;
+    if (SUCCEEDED(result) && list)
+        *list = wrap(created, Kind::state);
+    return result;
 }
 
 // The fast and placement setters bind one thing at one slot; a placement address inside
@@ -2699,7 +2836,7 @@ std::array<Method, 134> context_methods() {
     methods[55] = custom(&set_min_lod);
     methods[56] = custom(&get_min_lod);
     set(57, {in(1), in(3)}); // ResolveSubresource
-    set(58, {in(1)});        // ExecuteCommandList
+    methods[58] = custom(&execute_command_list);
     set(68, {in_array(3, 2)});
     // what is bound, per stage: constant buffers, shader resources, samplers, shader
     for (std::size_t slot : {72, 77, 81, 100, 104, 109, 125, 126, 127, 128, 129, 130})
@@ -2723,7 +2860,7 @@ std::array<Method, 134> context_methods() {
     set(94, {out(1, Kind::state)});
     set(95);
     set(96);
-    set(114, {created(2, Kind::state)}); // FinishCommandList
+    methods[114] = custom(&finish_command_list); // FinishCommandList
     set(115, {in(1), in(6)});
     methods[116] = custom(&context_update_subresource1);
     set(117, {in(1)});
@@ -2839,6 +2976,8 @@ Layout context() {
     result.object[8 + object_table] = custom(&set_shader_resource<&Context::PSSetShaderResources>);
     result.object[19 + object_table] = custom(&set_index_buffer);
     result.object[12 + object_table] = custom(&draw_indexed);
+    result.object[20 + object_table] = custom(&draw_indexed_instanced);
+    result.object[21 + object_table] = custom(&draw_instanced);
     result.apply_state = &apply_context_state;
     result.object[25 + 123] = custom(&set_shader_resource<&Context::VSSetShaderResources>);
     result.object[31 + 123] = custom(&set_shader_resource<&Context::GSSetShaderResources>);

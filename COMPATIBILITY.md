@@ -26,9 +26,9 @@ further than its state says. Logs of a run are in `%APPDATA%\xvalkyrie\logs`.
 | Terraria                                 | `1738CA2A` | **Playable** | Main menu with the right picture; writes its save                                                                            |
 | Puyo Puyo Champions                      | `62B3A350` | **Menu**     | Direct3D 11.X. The autosave notice, waiting for A; reads the gamepad                                                         |
 | Crash Bandicoot N. Sane Trilogy          | `044D0F74` | **Menu**     | Title screen; the text under its logo is drawn without its transparency                                                      |
-| Mega Man 11                              | `1F337CFB` | **Intro**    | Direct3D 11.X. Presents 1,000+ frames, reads the gamepad, writes its save, and shows readable prompt text                    |
+| Mega Man 11                              | `1F337CFB` | **Menu**     | Direct3D 11.X. Main menu ("New Game / Load Game / Options / Extra Modes") after intro; reads the gamepad and writes saves     |
 | Overcooked                               | `145207D1` | **Menu**     | Unity. 3D main menu ("Campaign / Versus / Options / Credits") with shadows, gamepad input, and connected storage             |
-| Rock Band 4                              | `2DBB840F` | **Boots**    | Direct3D 11.X. Presents frames and reads the gamepad; the picture is black                                                   |
+| Rock Band 4                              | `2DBB840F` | **Intro**    | Direct3D 11.X. ESRB rating screen with the right picture; reads the gamepad and writes saves                                 |
 | SPACE JAM: A NEW LEGACY - THE GAME       | `622B018E` | **Menu**     | GDK title on Direct3D 12. Title screen with the right picture; A goes on into its opening story                              |
 | LEGO CITY UNDERCOVER                     | `27D78EC2` | **Menu**     | Main menu, reads the gamepad; the 3D scene behind it is black                                                                |
 | Minecraft (Bedrock)                      | `6CFA0C1E` | **Menu**     | Direct3D 12. Main menu at 1080p with 3D character, UI, audio, and saves                                                      |

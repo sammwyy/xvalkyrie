@@ -134,11 +134,16 @@ class Dispatcher : public Class<Dispatcher, ICoreDispatcher> {
             window_.wait_closed();
         return S_OK;
     }
-    // Runs the handler right away, on whatever thread asks.
+    // Runs immediately on the dispatcher thread, or queues for ProcessEvents from worker threads.
     STDMETHODIMP RunAsync(CoreDispatcherPriority, IDispatchedHandler *handler,
                           IAsyncAction **action) override {
         if (!handler || !action)
             return E_POINTER;
+        if (GetCurrentThreadId() != thread_) {
+            ComPtr<IDispatchedHandler> held(handler);
+            post([held] { held->Invoke(); });
+            return Make<CompletedAction>().CopyTo(action);
+        }
         const auto result = handler->Invoke();
         if (FAILED(result))
             return result;
