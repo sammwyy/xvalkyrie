@@ -23,7 +23,7 @@ both consoles (`formats/pe`, `loader`, `runtime/common`).
 - [x] Parses and maps a real ERA title (74k relocations, 502 imports)
 - [x] Static TLS, with index 0 for executables built with /GA
 - [x] Title-local DLLs: mapped like the executable, `DllMain` called before the entry point
-- [ ] Delay-load imports
+- [x] Delay-load imports, bound at map time like regular imports (the lazy helper path is out of scope)
 - [x] `LoadLibrary` / `GetProcAddress` going through the resolver
 - [ ] Guest command line
 

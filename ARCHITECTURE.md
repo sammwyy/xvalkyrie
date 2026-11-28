@@ -399,8 +399,11 @@ Running in-process means a few things have to be faked:
 - A title's own DLLs are looked for from the executable's folder up to its
   package root, the folder with the `AppxManifest.xml`.
 
-Things that do not work yet: delay-load imports. The title has a process of its
-own, away from the window, but no isolation from the host of any kind.
+Things that do not work yet: the lazy `__delayLoadHelper` path. Delay-load
+import slots are bound at map time like regular imports, so a delayed import
+gets its address when the image is mapped, not on first use. The title has a
+process of its own, away from the window, but no isolation from the host of
+any kind.
 
 ## Graphics
 

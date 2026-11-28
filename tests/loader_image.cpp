@@ -1,3 +1,4 @@
+#include "formats/pe/inspect.hpp"
 #include "loader/image.hpp"
 #include <catch2/catch.hpp>
 #include <fstream>
@@ -7,16 +8,22 @@
 namespace {
 using xv::loader::MappedImage;
 constexpr std::uint64_t preferred = 0x140000000;
-std::vector<std::uint8_t> fixture() {
-    std::ifstream input("synthetic.pe", std::ios::binary);
+std::vector<std::uint8_t> fixture(const char *name = "synthetic.pe") {
+    std::ifstream input(name, std::ios::binary);
     std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(input), {}};
-    REQUIRE(bytes.size() == 1024);
+    REQUIRE(!bytes.empty());
     return bytes;
 }
 void put(std::vector<std::uint8_t> &bytes, std::size_t pos, std::uint64_t value,
          std::size_t width = 4) {
     for (std::size_t i = 0; i < width; ++i)
         bytes.at(pos + i) = static_cast<std::uint8_t>(value >> (8 * i));
+}
+std::uint32_t get32(const std::vector<std::uint8_t> &bytes, std::size_t pos) {
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < 4; ++i)
+        value |= static_cast<std::uint32_t>(bytes.at(pos + i)) << (8 * i);
+    return value;
 }
 } // namespace
 
@@ -86,6 +93,64 @@ TEST_CASE("import slots") {
         CHECK(image.read64(0x1050) == xv::loader::unresolved_tag);
         CHECK(image.report().at("imports").at("resolved") == 1);
         CHECK(image.report().at("imports").at("unresolved").size() == 1);
+    }
+}
+
+TEST_CASE("delay import slots") {
+    // corpus "delay": KERNEL32.dll imports regularly; dxcompiler_xs.dll (#1) and
+    // title-local.dll (Probe) delayed
+    const auto pe = xv::pe::inspect(fixture("delay.pe"));
+    const auto &delayed = pe.at("directory_contents").at("delay_imports");
+    REQUIRE(delayed.size() == 2);
+    const auto iat = [&](std::size_t index) {
+        return delayed[index].at("iat_rva").get<std::uint64_t>();
+    };
+    SECTION("no resolver: placeholders and per-symbol entries") {
+        const MappedImage image(fixture("delay.pe"), {.guest_base = preferred, .resolve = {}});
+        const auto &report = image.report().at("delay_imports");
+        CHECK(report.at("slots") == 2);
+        CHECK(report.at("resolved") == 0);
+        CHECK(report.at("unresolved")[0].at("module") == "dxcompiler_xs.dll");
+        CHECK(report.at("unresolved")[0].at("symbol") == "#1");
+        CHECK(report.at("unresolved")[0].at("slot_va") == preferred + iat(0));
+        CHECK(report.at("unresolved")[1].at("module") == "title-local.dll");
+        CHECK(report.at("unresolved")[1].at("symbol") == "Probe");
+        CHECK(report.at("unresolved")[1].at("slot_va") == preferred + iat(1));
+        for (std::uint64_t i = 0; i < 2; ++i) {
+            const auto value = image.read64(iat(i));
+            CHECK(value == (xv::loader::unresolved_tag | i));
+            CHECK((value >> 47) != 0); // non-canonical, so calling one faults
+        }
+        CHECK(image.report().at("imports").at("slots") == 2); // regular imports as before
+    }
+    SECTION("with resolver: bound slot, missing symbol keeps the placeholder") {
+        const MappedImage image(fixture("delay.pe"),
+                                {.guest_base = preferred,
+                                 .resolve = [](std::string_view module, std::string_view symbol)
+                                     -> std::optional<std::uint64_t> {
+                                     if (module == "title-local.dll" && symbol == "Probe")
+                                         return 0x7000'0000'2000;
+                                     return std::nullopt;
+                                 }});
+        CHECK(image.read64(iat(1)) == 0x7000'0000'2000);
+        CHECK(image.read64(iat(0)) == xv::loader::unresolved_tag);
+        const auto &report = image.report().at("delay_imports");
+        CHECK(report.at("slots") == 2);
+        CHECK(report.at("resolved") == 1);
+        CHECK(report.at("unresolved").size() == 1);
+        CHECK(report.at("unresolved")[0].at("module") == "dxcompiler_xs.dll");
+    }
+    SECTION("delay descriptor without a name table keeps its status") {
+        auto bytes = fixture("delay.pe");
+        const auto directory = get32(bytes, 152 + 112 + 8 * 13); // delay import directory RVA
+        put(bytes, 512 + directory - 0x1000 + 32 + 16, 0);       // second descriptor's name table
+        const MappedImage image(bytes, {.guest_base = preferred, .resolve = {}});
+        const auto &report = image.report().at("delay_imports");
+        CHECK(report.at("slots") == 1); // only dxcompiler_xs.dll has symbols to bind
+        REQUIRE(report.at("modules_without_symbols").size() == 1);
+        CHECK(report.at("modules_without_symbols")[0].at("module") == "title-local.dll");
+        CHECK(report.at("modules_without_symbols")[0].at("status") ==
+              "delay descriptor without name table; symbols unknown");
     }
 }
 

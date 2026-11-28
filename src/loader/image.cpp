@@ -129,11 +129,26 @@ MappedImage::MappedImage(std::span<const std::uint8_t> file, const json &pe,
     auto unresolved = json::array();
     std::uint64_t slots = 0, resolved = 0;
     auto opaque = json::array();
-    if (contents.contains("imports")) {
-        for (const auto &module : contents.at("imports")) {
+    auto delay_unresolved = json::array();
+    auto delay_opaque = json::array();
+    std::uint64_t delay_slots = 0, delay_resolved = 0;
+    // One binding pass for a list of import modules: every IAT slot gets the resolver's
+    // answer, or the unresolved placeholder. Delay-load descriptors bind exactly the same
+    // way; the mapper runs no code, so the lazy __delayLoadHelper2 path stays out of scope.
+    // The delay name table (INT) keeps its entries, so a host delay helper could still
+    // resolve. Descriptor layout follows the Microsoft PE Format documentation,
+    // "Delay-Load Import Tables (Image Only)":
+    // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#delay-load-import-tables-image-only
+    const auto bind = [&](const json &modules, bool delay_load, json &unresolved_out,
+                          json &opaque_out, std::uint64_t &slots_out, std::uint64_t &resolved_out) {
+        for (const auto &module : modules) {
             const auto &name = module.at("module").get_ref<const std::string &>();
             if (!module.contains("symbols")) {
-                opaque.push_back(name);
+                // delay descriptors without a name table keep the status pe::inspect gave them
+                if (delay_load)
+                    opaque_out.push_back({{"module", name}, {"status", module.at("status")}});
+                else
+                    opaque_out.push_back(name);
                 continue;
             }
             auto rva = module.at("iat_rva").get<std::uint64_t>();
@@ -141,24 +156,25 @@ MappedImage::MappedImage(std::span<const std::uint8_t> file, const json &pe,
                 const auto label = import_label(symbol);
                 auto value = options.resolve ? options.resolve(name, label) : std::nullopt;
                 if (value) {
-                    ++resolved;
+                    ++resolved_out;
                 } else {
-                    value = unresolved_tag | slots;
-                    unresolved.push_back({{"module", name},
-                                          {"symbol", label},
-                                          {"slot_va", base_ + rva},
-                                          {"slot_value", *value}});
+                    value = unresolved_tag | slots_out;
+                    unresolved_out.push_back({{"module", name},
+                                              {"symbol", label},
+                                              {"slot_va", base_ + rva},
+                                              {"slot_value", *value}});
                 }
                 std::memcpy(slot(rva), &*value, 8);
-                ++slots;
+                ++slots_out;
                 rva += 8;
             }
         }
-    }
-    auto delayed = json::array();
+    };
+    if (contents.contains("imports"))
+        bind(contents.at("imports"), false, unresolved, opaque, slots, resolved);
     if (contents.contains("delay_imports"))
-        for (const auto &module : contents.at("delay_imports"))
-            delayed.push_back(module.at("module"));
+        bind(contents.at("delay_imports"), true, delay_unresolved, delay_opaque, delay_slots,
+             delay_resolved);
 
     // sections are page aligned (checked above) so they never share a page
     memory_.protect(0, static_cast<std::size_t>(size_), host::Access::none);
@@ -183,8 +199,12 @@ MappedImage::MappedImage(std::span<const std::uint8_t> file, const json &pe,
          {{"slots", slots},
           {"resolved", resolved},
           {"unresolved", std::move(unresolved)},
-          {"modules_without_symbols", std::move(opaque)},
-          {"delay_load_modules_untouched", std::move(delayed)}}},
+          {"modules_without_symbols", std::move(opaque)}}},
+        {"delay_imports",
+         {{"slots", delay_slots},
+          {"resolved", delay_resolved},
+          {"unresolved", std::move(delay_unresolved)},
+          {"modules_without_symbols", std::move(delay_opaque)}}},
         {"tls", contents.contains("tls") ? "declared; template not instantiated, callbacks not run"
                                          : "none declared"},
         {"entry_va", entry ? json(base_ + entry) : json(nullptr)},
