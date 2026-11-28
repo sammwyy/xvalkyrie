@@ -91,3 +91,68 @@ TEST_CASE("unwritten shader-visible heap slots read as null textures without dro
     signature->Release();
     results->Release();
 }
+
+TEST_CASE("structured buffer views with explicit formats and cross-dimension texture views keep "
+          "the device alive") {
+    if (!device())
+        return;
+    std::uint64_t buf_addr = 0;
+    auto *const buf = buffer(4096, buf_addr);
+    const Heap cbv_srv_uav(8);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer = {0, 4, 16, D3D12_BUFFER_SRV_FLAG_NONE};
+    title().call<void>(device(), 18, buf, &srv, cbv_srv_uav.cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer = {0, 4, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    title().call<void>(device(), 19, buf, static_cast<ID3D12Resource *>(nullptr), &uav,
+                       cbv_srv_uav.cpu + 32);
+
+    const D3D12_HEAP_PROPERTIES def_heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC tex_desc{};
+    tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    tex_desc.Width = 4;
+    tex_desc.Height = 4;
+    tex_desc.DepthOrArraySize = 1;
+    tex_desc.MipLevels = 2;
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex_desc.SampleDesc = {1, 0};
+    tex_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *tex = nullptr;
+    REQUIRE(title().call(device(), 27, &def_heap, D3D12_HEAP_FLAG_NONE, &tex_desc,
+                         D3D12_RESOURCE_STATE_COMMON, static_cast<D3D12_CLEAR_VALUE *>(nullptr),
+                         &__uuidof(ID3D12Resource), reinterpret_cast<void **>(&tex)) == S_OK);
+    REQUIRE(tex);
+
+    // Map (8) on a multi-mip default texture returns CPU scratch covering GetResourceAllocationInfo
+    void *mapped = nullptr;
+    REQUIRE(title().call(tex, 8, 0u, static_cast<D3D12_RANGE *>(nullptr), &mapped) == S_OK);
+    REQUIRE(mapped);
+    const auto alloc = device()->GetResourceAllocationInfo(0, 1, &tex_desc);
+    std::memset(mapped, 0, static_cast<std::size_t>(alloc.SizeInBytes));
+    title().call<void>(tex, 9, 0u, static_cast<D3D12_RANGE *>(nullptr));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv3d{};
+    srv3d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv3d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srv3d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv3d.Texture3D = {0, 1, 0.f};
+    title().call<void>(device(), 18, tex, &srv3d, cbv_srv_uav.cpu + 64);
+
+    const Heap rtv_heap(4, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_RENDER_TARGET_VIEW_DESC rtv3d{};
+    rtv3d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtv3d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+    rtv3d.Texture3D = {0, 5, 1};
+    title().call<void>(device(), 20, tex, &rtv3d, rtv_heap.cpu);
+
+    CHECK(removed_reason() == S_OK);
+    tex->Release();
+    buf->Release();
+}

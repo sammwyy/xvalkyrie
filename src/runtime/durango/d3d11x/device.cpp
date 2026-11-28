@@ -88,6 +88,7 @@ HRESULT make_swap_chain(IDXGIFactory2 *factory, IUnknown *device,
         host.BufferCount = std::max(host.BufferCount, 2u);
         host.SampleDesc = {1, 0};
     }
+    host.BufferUsage |= DXGI_USAGE_SHADER_INPUT;
     host.Flags &= DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE |
                   DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
                   DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
@@ -129,6 +130,30 @@ HRESULT STDMETHODCALLTYPE create_swap_chain(Forwarder *self, IUnknown *device, I
     return make_swap_chain(static_cast<IDXGIFactory2 *>(forwarder_host(self)), device, description,
                            swap_chain);
 }
+// IDXGIFactory::CreateSwapChain (slot 10): converted to DXGI_SWAP_CHAIN_DESC1 on the title window
+HRESULT STDMETHODCALLTYPE create_swap_chain_legacy(Forwarder *self, IUnknown *device,
+                                                   DXGI_SWAP_CHAIN_DESC *description,
+                                                   IDXGISwapChain **swap_chain) {
+    if (!description || !swap_chain)
+        return E_INVALIDARG;
+    DXGI_SWAP_CHAIN_DESC1 desc1{};
+    desc1.Width = description->BufferDesc.Width;
+    desc1.Height = description->BufferDesc.Height;
+    desc1.Format = description->BufferDesc.Format;
+    desc1.SampleDesc = description->SampleDesc;
+    desc1.BufferUsage = description->BufferUsage;
+    desc1.BufferCount = description->BufferCount;
+    desc1.Scaling = DXGI_SCALING_STRETCH;
+    desc1.SwapEffect = description->SwapEffect;
+    desc1.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc1.Flags = description->Flags;
+    IDXGISwapChain1 *created = nullptr;
+    const auto result = make_swap_chain(static_cast<IDXGIFactory2 *>(forwarder_host(self)), device,
+                                        &desc1, &created);
+    if (SUCCEEDED(result))
+        *swap_chain = created;
+    return result;
+}
 // the host's factory up to IDXGIFactory7 where it has it, 32 methods, else IDXGIFactory2
 bool latest_factory = false;
 HRESULT factory_query(Forwarder *self, REFIID iid, void **object) {
@@ -143,8 +168,9 @@ void *factory_forwarder(IDXGIFactory2 *factory) {
     latest_factory = SUCCEEDED(factory->QueryInterface(&latest));
     if (latest_factory)
         factory->Release();
-    return make_forwarder(latest_factory ? latest : factory, latest_factory ? 32 : 25,
-                          &factory_query, {{16, slot(&create_swap_chain)}}, dxgi_inserted);
+    return make_forwarder(
+        latest_factory ? latest : factory, latest_factory ? 32 : 25, &factory_query,
+        {{10, slot(&create_swap_chain_legacy)}, {16, slot(&create_swap_chain)}}, dxgi_inserted);
 }
 
 // IDXGIObject::GetParent of the adapter

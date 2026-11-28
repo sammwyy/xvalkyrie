@@ -118,9 +118,32 @@ HRESULT STDMETHODCALLTYPE create_texture2d(void *self, const D3D11_TEXTURE2D_DES
         if (host.SampleDesc.Quality >= levels)
             host.SampleDesc.Quality = 0;
     }
-    // the console lets the CPU read a dynamic texture too
-    if (host.Usage == D3D11_USAGE_DYNAMIC)
+    // the console lets the CPU read a dynamic texture too, and write a default one on UMA
+    if (host.Usage == D3D11_USAGE_DYNAMIC) {
         host.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    } else if (host.Usage == D3D11_USAGE_DEFAULT && host.CPUAccessFlags) {
+        if ((host.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) &&
+            host.BindFlags == D3D11_BIND_SHADER_RESOURCE && host.MipLevels == 1 &&
+            host.ArraySize == 1 && host.SampleDesc.Count == 1) {
+            host.Usage = D3D11_USAGE_DYNAMIC;
+            host.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        } else {
+            host.CPUAccessFlags = 0;
+        }
+    }
+    host.Width = std::max(host.Width, 1u);
+    host.Height = std::max(host.Height, 1u);
+    if (host.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) {
+        const bool also_depth = (host.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+        if (host.Format == DXGI_FORMAT_D16_UNORM)
+            host.Format = also_depth ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R16_UNORM;
+        else if (host.Format == DXGI_FORMAT_D32_FLOAT)
+            host.Format = also_depth ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R32_FLOAT;
+        else if (host.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)
+            host.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        else if (host.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+            host.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    }
     ID3D11Texture2D *created = nullptr;
     const auto result = device->CreateTexture2D(&host, initial, texture ? &created : nullptr);
     if (FAILED(result)) {

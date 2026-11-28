@@ -156,25 +156,33 @@ std::wstring console_path(const wchar_t *name) {
         return {};
     const std::wstring_view path(name);
     const auto drive = [&](std::wstring_view prefix) {
-        return path.size() > prefix.size() &&
+        return path.size() >= prefix.size() &&
                CompareStringOrdinal(path.data(), static_cast<int>(prefix.size()), prefix.data(),
                                     static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL &&
-               (path[prefix.size()] == L'\\' || path[prefix.size()] == L'/');
+               (path.size() == prefix.size() || path[prefix.size()] == L'\\' ||
+                path[prefix.size()] == L'/');
+    };
+    const auto after_drive = [&](std::size_t colon) {
+        const auto pos = colon + 1;
+        return pos < path.size() && (path[pos] == L'\\' || path[pos] == L'/') ? path.substr(pos + 1)
+                                                                              : path.substr(pos);
     };
     std::error_code error;
     if (drive(L"G:") || drive(L"GAME:")) {
         // nothing is above the root of a drive: G:\..\data is G:\data
         std::filesystem::path rest;
         for (const auto &part :
-             std::filesystem::path(path.substr(path.find(L':') + 2)).lexically_normal())
+             std::filesystem::path(after_drive(path.find(L':'))).lexically_normal())
             if (part != L"..")
                 rest /= part;
-        return (package_directory(std::filesystem::current_path(error)) / rest).wstring();
+        const auto joined = package_directory(std::filesystem::current_path(error)) / rest;
+        return joined.wstring();
     }
-    if (drive(L"T:")) {
+    if (drive(L"T:") && !save_directory().empty()) {
         const auto folder = save_directory() / "Temp";
         std::filesystem::create_directories(folder, error);
-        return (folder / path.substr(3)).wstring();
+        const auto tail = after_drive(1);
+        return tail.empty() ? folder.wstring() : (folder / tail).wstring();
     }
     // C:\Users\DefaultUser and C:\Users\<Xbox user id> are where a GDK title keeps what it
     // writes on the console. On the host they are another user's folders, or nobody's.
@@ -207,11 +215,32 @@ std::wstring console_path(const wchar_t *name) {
                 return inside;
         }
     }
+    // A relative path whose `..` climbs above the package's root (as UE3's `../../Engine/`
+    // does on a console where the package is `G:\`): clamped at the package's root when the
+    // host has nothing at the unclamped path.
+    if (path.find(L':') == std::wstring_view::npos && !path.empty() && path[0] != L'\\' &&
+        path[0] != L'/' && path.find(L"..") != std::wstring_view::npos &&
+        GetFileAttributesW(name) == INVALID_FILE_ATTRIBUTES) {
+        const auto cwd = std::filesystem::current_path(error);
+        const auto package = package_directory(cwd);
+        std::error_code rel_err;
+        auto rel = std::filesystem::relative(cwd, package, rel_err);
+        if (rel_err || rel.native().starts_with(L".."))
+            rel.clear();
+        std::filesystem::path clamped;
+        for (const auto &part : (rel / path).lexically_normal())
+            if (part != L".." && part != L".")
+                clamped /= part;
+        const auto candidate = (package / clamped).wstring();
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return candidate;
+    }
     // Any other drive of the console is a folder of its own, kept apart for each title:
     // nand\<title>\disk_<letter> in the configuration folder. Paths the host handed out
     // stay the host's: the title's dump, the user's folders, the system's.
-    if (path.size() > 2 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/') &&
-        iswalpha(path[0]) && !save_directory().empty()) {
+    if (path.size() >= 2 && path[1] == L':' &&
+        (path.size() == 2 || path[2] == L'\\' || path[2] == L'/') && iswalpha(path[0]) &&
+        !save_directory().empty()) {
         static const std::vector<std::wstring> hosts = [] {
             std::vector<std::wstring> folders;
             std::error_code ignored;
@@ -238,7 +267,7 @@ std::wstring console_path(const wchar_t *name) {
                               save_directory().filename() /
                               (std::wstring(L"disk_") + static_cast<wchar_t>(towlower(path[0])));
             std::filesystem::create_directories(disk, error);
-            return (disk / path.substr(3)).wstring();
+            return path.size() > 3 ? (disk / path.substr(3)).wstring() : disk.wstring();
         }
     }
     return std::wstring(path);

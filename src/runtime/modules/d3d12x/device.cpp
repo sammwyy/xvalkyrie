@@ -400,12 +400,17 @@ bool title_called_slot(const void *address, std::size_t index) {
     // with an 8-bit displacement: FF 50+r d8
     if (offset < 0x80 && code[-1] == offset && code[-3] == 0xff && (code[-2] & 0xf8) == 0x50)
         return true;
-    // `call reg` (FF D0+r, with a prefix for r8 to r15): the slot was loaded into the register
-    // first, with `mov reg, [reg + Index * 8]` a few instructions back. Titles built against
-    // the GDK's header call this way.
-    if (code[-2] == 0xff && (code[-1] & 0xf8) == 0xd0) {
-        for (const auto *at = code - 3; at > code - 160; --at) {
+    // `call reg` (FF D0+r, with a prefix for r8 to r15), or Control Flow Guard's
+    // `call [rip + disp32]` (FF 15 disp32, target in RAX): the slot was loaded into the
+    // register first, with `mov reg, [reg + Index * 8]` a few instructions back.
+    std::int32_t rip_disp = 0;
+    std::memcpy(&rip_disp, code - 4, 4);
+    const bool cfg_call = code[-6] == 0xff && code[-5] == 0x15 && title_code(code + rip_disp);
+    if ((code[-2] == 0xff && (code[-1] & 0xf8) == 0xd0) || cfg_call) {
+        for (const auto *at = code - (cfg_call ? 7 : 3); at > code - 160; --at) {
             if (at[0] != 0x8b)
+                continue;
+            if (cfg_call && ((at[1] & 0x38) != 0 || (at[-1] & 0xfb) != 0x48))
                 continue;
             const auto mode = at[1] >> 6;
             const std::size_t skip = (at[1] & 7) == 4 ? 3 : 2; // a SIB byte follows
@@ -418,6 +423,8 @@ bool title_called_slot(const void *address, std::size_t index) {
                 loaded = 0;
             if (loaded == offset && (mode != 0 || offset == 0))
                 return true;
+            if (cfg_call)
+                return false;
         }
         return false;
     }
@@ -923,6 +930,10 @@ void upload_scratch(ID3D12CommandQueue *queue) {
 }
 HRESULT STDMETHODCALLTYPE map_resource(ID3D12Resource *self, UINT subresource,
                                        const D3D12_RANGE *range, void **data) {
+    if (data && self->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        *data = scratch_memory(self);
+        return *data ? S_OK : E_OUTOFMEMORY;
+    }
     using Map = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, const D3D12_RANGE *, void **);
     const auto result = original<Map>(self, 8)(self, subresource, range, data);
     if (SUCCEEDED(result) || !data)
@@ -2812,6 +2823,61 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
     // The console views a multisampled texture as a plain one and a typeless one without a
     // format; the host removes the device over either
     if (resource && desc) {
+        if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+            (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ||
+             view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)) {
+            const auto mip = view.Texture2D.MostDetailedMip;
+            const auto levels = view.Texture2D.MipLevels;
+            const auto clamp = view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+                                   ? view.Texture2DArray.ResourceMinLODClamp
+                                   : view.Texture2D.ResourceMinLODClamp;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Texture3D = {mip, levels, clamp};
+            desc = &view;
+        } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                   (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D ||
+                    view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY)) {
+            if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY) {
+                const auto a = view.Texture1DArray;
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                view.Texture2DArray = {a.MostDetailedMip, a.MipLevels, a.FirstArraySlice,
+                                       a.ArraySize,       0,           a.ResourceMinLODClamp};
+            } else {
+                const auto a = view.Texture1D;
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                view.Texture2D = {a.MostDetailedMip, a.MipLevels, 0, a.ResourceMinLODClamp};
+            }
+            desc = &view;
+        } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+                   (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ||
+                    view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)) {
+            if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+                const auto a = view.Texture2DArray;
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                view.Texture1DArray = {a.MostDetailedMip, a.MipLevels, a.FirstArraySlice,
+                                       a.ArraySize, a.ResourceMinLODClamp};
+            } else {
+                const auto a = view.Texture2D;
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                view.Texture1D = {a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp};
+            }
+            desc = &view;
+        } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                   view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D) {
+            const auto a = view.Texture3D;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Texture2D = {a.MostDetailedMip, a.MipLevels, 0, a.ResourceMinLODClamp};
+            desc = &view;
+        } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && of.DepthOrArraySize < 6 &&
+                   (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE ||
+                    view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)) {
+            const auto mip = view.TextureCube.MostDetailedMip;
+            const auto levels = view.TextureCube.MipLevels;
+            const auto clamp = view.TextureCube.ResourceMinLODClamp;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {mip, levels, 0, of.DepthOrArraySize, 0, clamp};
+            desc = &view;
+        }
         if (of.SampleDesc.Count > 1 && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
             desc = &view;
@@ -2828,8 +2894,10 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
             desc = &view;
         }
         if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-            if (console == Target::scarlett && !view.Buffer.StructureByteStride &&
-                !(view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) {
+            if (view.Buffer.StructureByteStride)
+                view.Format = DXGI_FORMAT_UNKNOWN;
+            else if (console == Target::scarlett && !view.Buffer.StructureByteStride &&
+                     !(view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) {
                 switch (view.Format) {
                 case DXGI_FORMAT_R32G32B32A32_UINT:
                 case DXGI_FORMAT_R32G32B32A32_SINT:
@@ -2973,10 +3041,42 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
             view.Format = format;
             desc = &view;
         }
+        if (resource) {
+            const auto of = resource->GetDesc();
+            if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                (view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D ||
+                 view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)) {
+                const auto mip = view.Texture2D.MipSlice;
+                const auto first = view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+                                       ? view.Texture2DArray.FirstArraySlice
+                                       : 0u;
+                const auto size = view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+                                      ? view.Texture2DArray.ArraySize
+                                      : ~0u;
+                view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                view.Texture3D = {mip, first, size};
+                desc = &view;
+            } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                       (view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1D ||
+                        view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY)) {
+                if (view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY) {
+                    const auto a = view.Texture1DArray;
+                    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                    view.Texture2DArray = {a.MipSlice, a.FirstArraySlice, a.ArraySize, 0};
+                } else {
+                    const auto mip = view.Texture1D.MipSlice;
+                    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                    view.Texture2D = {mip, 0};
+                }
+                desc = &view;
+            }
+        }
     }
     if (resource && desc && view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        if (console == Target::scarlett && !view.Buffer.StructureByteStride &&
-            !(view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
+        if (view.Buffer.StructureByteStride)
+            view.Format = DXGI_FORMAT_UNKNOWN;
+        else if (console == Target::scarlett && !view.Buffer.StructureByteStride &&
+                 !(view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
             switch (view.Format) {
             case DXGI_FORMAT_R32G32B32A32_UINT:
             case DXGI_FORMAT_R32G32B32A32_SINT:
@@ -3184,6 +3284,62 @@ void STDMETHODCALLTYPE create_target_view(ID3D12Device *self, ID3D12Resource *re
                                   Index == 20 ? FormatUse::target_view : FormatUse::depth_view));
         if (view.Format == DXGI_FORMAT_UNKNOWN)
             view.Format = depth;
+        if constexpr (Index == 20) {
+            if (resource) {
+                const auto of = resource->GetDesc();
+                if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                    (view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D ||
+                     view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY)) {
+                    const auto mip = view.Texture2D.MipSlice;
+                    const auto first = view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+                                           ? view.Texture2DArray.FirstArraySlice
+                                           : 0u;
+                    const auto size = view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+                                          ? view.Texture2DArray.ArraySize
+                                          : ~0u;
+                    view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+                    view.Texture3D = {mip, first, size};
+                } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                           (view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D ||
+                            view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY)) {
+                    if (view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY) {
+                        const auto a = view.Texture1DArray;
+                        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                        view.Texture2DArray = {a.MipSlice, a.FirstArraySlice, a.ArraySize, 0};
+                    } else {
+                        const auto mip = view.Texture1D.MipSlice;
+                        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                        view.Texture2D = {mip, 0};
+                    }
+                } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+                           (view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D ||
+                            view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY)) {
+                    if (view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) {
+                        const auto a = view.Texture2DArray;
+                        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+                        view.Texture1DArray = {a.MipSlice, a.FirstArraySlice, a.ArraySize};
+                    } else {
+                        const auto mip = view.Texture2D.MipSlice;
+                        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1D;
+                        view.Texture1D = {mip};
+                    }
+                } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                           view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D) {
+                    const auto a = view.Texture3D;
+                    const auto mip =
+                        std::min<UINT>(a.MipSlice, std::max<UINT>(of.MipLevels, 1) - 1);
+                    if (a.FirstWSlice >= of.DepthOrArraySize) {
+                        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                        view.Texture2D = {mip, 0};
+                    } else {
+                        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                        view.Texture2DArray = {
+                            mip, a.FirstWSlice,
+                            std::min<UINT>(a.WSize, of.DepthOrArraySize - a.FirstWSlice), 0};
+                    }
+                }
+            }
+        }
         desc = &view;
     } else if constexpr (Index == 21) {
         if (depth != DXGI_FORMAT_UNKNOWN) {
@@ -5727,8 +5883,7 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
         note_dropped(*resource, dropped, title_mips);
         console_resource(*resource);
         track_buffer(static_cast<ID3D12Resource *>(*resource), console == Target::scarlett);
-        if (console == Target::scarlett)
-            mappable_resource(*resource);
+        mappable_resource(*resource);
     }
     if (FAILED(result) && heap && desc) {
         std::fprintf(stderr,
@@ -8874,8 +9029,8 @@ void *make_list_proxy(List *host, UINT title_type = UINT_MAX) {
         return true;
     }();
     static_cast<void>(filled);
-    proxy->vtable = console == Target::scarlett ? layout_list_vtable.data() : list_vtable.data();
-    if (console == Target::scarlett && std::getenv("XV_D3D_LOST")) {
+    proxy->vtable = layout_list_vtable.data();
+    if (std::getenv("XV_D3D_LOST")) {
         for (std::size_t slot = 0; slot < 3; ++slot)
             checked_list_vtable[slot] = layout_list_vtable[slot];
         proxy->vtable = checked_list_vtable.data();
@@ -9889,8 +10044,11 @@ HRESULT STDMETHODCALLTYPE create_placed_resource(ID3D12Device *self, ID3D12Heap 
     clear = host_clear_value(self, host_clear(clear, cleared), host.Flags, cleared_host);
     const auto result = original<Create>(self, 29)(self, heap, offset, desc ? &host : nullptr,
                                                    host_state(state), clear, iid, resource);
-    if (SUCCEEDED(result) && resource && *resource)
+    if (SUCCEEDED(result) && resource && *resource) {
+        console_resource(*resource);
         track_buffer(static_cast<ID3D12Resource *>(*resource));
+        mappable_resource(*resource);
+    }
     return result;
 }
 HRESULT STDMETHODCALLTYPE create_reserved_resource(ID3D12Device *self,
@@ -9908,8 +10066,11 @@ HRESULT STDMETHODCALLTYPE create_reserved_resource(ID3D12Device *self,
     clear = host_clear_value(self, clear, host.Flags, cleared_host);
     const auto result = original<Create>(self, 30)(self, desc ? &host : nullptr, host_state(state),
                                                    clear, iid, resource);
-    if (SUCCEEDED(result) && resource && *resource)
+    if (SUCCEEDED(result) && resource && *resource) {
+        console_resource(*resource);
         track_buffer(static_cast<ID3D12Resource *>(*resource));
+        mappable_resource(*resource);
+    }
     return result;
 }
 // slot 60: CreateGraphicsPipelineStateX, the pipeline and the console's extensions of it

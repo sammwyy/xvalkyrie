@@ -347,3 +347,58 @@ TEST_CASE("the title's last Release of a fence whose value it reads gives 0 whil
     CHECK(not_last == 0);
     CHECK(title.call<ULONG>(moving, 2) == 0);
 }
+
+TEST_CASE(
+    "control flow guard indirect calls reach the console vtable for both slot 0 and later slots") {
+    // Layout in executable memory:
+    //   [0x00..0x07]: pointer to [0x08] (__guard_dispatch_icall_fptr)
+    //   [0x08..0x0a]: ff e0 (jmp rax)
+    //   [0x20..0x3f]: sub rsp, 28h; mov rax, [rcx]; mov rax, [rax]; call [rip - disp]; add rsp,
+    //   28h; ret [0x40..0x6f]: sub rsp, 28h; mov rax, [rcx]; mov rax, [rax + 0x60]; call [rip -
+    //   disp]; add rsp, 28h; ret
+    auto *const page = static_cast<std::uint8_t *>(
+        VirtualAlloc(nullptr, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    REQUIRE(page);
+    const auto thunk = reinterpret_cast<std::uint64_t>(page + 8);
+    std::memcpy(page, &thunk, 8);
+    page[8] = 0xff;
+    page[9] = 0xe0; // jmp rax
+
+    static constexpr std::uint8_t slot0[]{
+        0x48, 0x83, 0xec, 0x28,             // sub rsp, 28h
+        0x48, 0x8b, 0x01,                   // mov rax, [rcx]
+        0x48, 0x8b, 0x00,                   // mov rax, [rax]
+        0xff, 0x15, 0xd0, 0xff, 0xff, 0xff, // call [rip - 0x30] -> [page + 0]
+        0x48, 0x83, 0xc4, 0x28,             // add rsp, 28h
+        0xc3                                // ret
+    };
+    std::memcpy(page + 0x20, slot0, sizeof slot0);
+
+    static constexpr std::uint8_t slot12[]{
+        0x48, 0x83, 0xec, 0x28,                   // sub rsp, 28h
+        0x48, 0x8b, 0x01,                         // mov rax, [rcx]
+        0x48, 0x8b, 0x80, 0x60, 0x00, 0x00, 0x00, // mov rax, [rax + 60h] (slot 12)
+        0xff, 0x15, 0xac, 0xff, 0xff, 0xff,       // call [rip - 0x54] -> [page + 0]
+        0x48, 0x83, 0xc4, 0x28,                   // add rsp, 28h
+        0xc3                                      // ret
+    };
+    std::memcpy(page + 0x40, slot12, sizeof slot12);
+    FlushInstructionCache(GetCurrentProcess(), page, 256);
+    d3d12x::call_as_title(page, 256);
+
+    auto *const fence = title_fence(77);
+    using Call0 = HRESULT(STDMETHODCALLTYPE *)(void *, REFIID, void **);
+    using Call12 = std::uint64_t(STDMETHODCALLTYPE *)(void *);
+    IUnknown *queried = nullptr;
+    CHECK(reinterpret_cast<Call0>(page + 0x20)(fence, __uuidof(IUnknown),
+                                               reinterpret_cast<void **>(&queried)) == S_OK);
+    REQUIRE(queried);
+    queried->Release();
+    const auto gpu_addr = reinterpret_cast<Call12>(page + 0x40)(fence);
+    REQUIRE(gpu_addr != 0);
+    CHECK(*reinterpret_cast<const std::uint64_t *>(gpu_addr) == 77);
+
+    d3d12x::stop_calling_as_title(page);
+    VirtualFree(page, 0, MEM_RELEASE);
+    fence->Release();
+}
