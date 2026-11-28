@@ -33,11 +33,11 @@ further than its state says. Logs of a run are in `%APPDATA%\xvalkyrie\logs`.
 | LEGO CITY UNDERCOVER                     | `27D78EC2` | **Menu**     | Main menu, reads the gamepad; the 3D scene behind it is black                                                                |
 | Minecraft (Bedrock)                      | `6CFA0C1E` | **Menu**     | Direct3D 12. Main menu at 1080p with 3D character, UI, audio, and saves                                                      |
 | Puyo Puyo Tetris 2                       | `6AA460A3` | **Menu**     | Direct3D 12. Main menu with the right picture; reads the gamepad                                                             |
-| Rocket League                            | `214E91AC` | **Boots**    | Unreal Engine 3. Loads its menu map (`MENU_Beach_p`) and presents frames, the picture is black                               |
+| Rocket League                            | `214E91AC` | **Intro**    | Unreal Engine 3. Renders the 3D `MENU_Beach_p` scene, reads the gamepad, and opens its save container; UI overlay is missing  |
 | 1001 Spikes                              | `6B2E4F1B` | **Menu**     | Main menu with the right picture; reads the gamepad                                                                          |
 | 7 Days to Die                            | `039D30F6` | **Menu**     | Unity. 1080p title screen ("7 Days to Die / Press Menu"); 1,000+ frames                                                      |
 | A KING'S TALE: FINAL FANTASY XV          | `05401907` | **Menu**     | Direct3D 11.X. Pixel-art title screen at 1080p after intro logos; 1,000+ frames, audio, reads the gamepad                    |
-| Cyberpunk 2077                           | `0D42AD14` | **Nothing**  |                                                                                                                              |
+| Cyberpunk 2077                           | `0D42AD14` | **Nothing**  | Launcher package (`cpLauncher.exe`) starts CoreApplication, then stops with missing `engine/` and `r6/` data archives         |
 | Dance Central Spotlight                  | `295F3C44` | **In-game**  | First kits. Harmonix intro, loading screen, and in-game pause menu; 1,000+ frames, reads the gamepad and writes saves        |
 | DARK SOULS: REMASTERED NETWORK TEST VER. | `27EDC966` | **Menu**     |                                                                                                                              |
 | FIFA 15                                  | `64B02253` | **Intro**    | First kits. Its opening screen with the right picture                                                                        |

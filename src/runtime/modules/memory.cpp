@@ -133,10 +133,11 @@ void release_page(Physical &state, ULONG_PTR number) {
                      static_cast<unsigned long long>(state.where.find(number)->second), 10);
         std::fflush(stderr);
     }
-    if (state.view)
-        VirtualAlloc(state.view + number * page, page, MEM_RESET, PAGE_READWRITE);
-    for (auto [at, end] = state.mapped_at.equal_range(number); at != end; ++at)
-        VirtualAlloc(reinterpret_cast<void *>(at->second), page, MEM_RESET, PAGE_READWRITE);
+    if (!state.mapped_at.contains(number) && state.view) {
+        const auto err = GetLastError();
+        DiscardVirtualMemory(state.view + number * page, page);
+        SetLastError(err);
+    }
     state.used[number] = false;
     state.dirty[number] = true;
 }
@@ -159,25 +160,25 @@ void unmap(Physical &state, Reservation &reservation, std::uintptr_t address,
     const auto view = reservation.views.find(address);
     if (view == reservation.views.end())
         return;
-    if (view->second.owned)
-        VirtualAlloc(reinterpret_cast<void *>(address), page, MEM_RESET, PAGE_READWRITE);
+    const auto page_num = view->second.page;
+    const bool owned = view->second.owned;
+    for (auto [at, end] = state.mapped_at.equal_range(page_num); at != end; ++at)
+        if (at->second == address) {
+            state.mapped_at.erase(at);
+            break;
+        }
     UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void *>(address),
                      MEM_PRESERVE_PLACEHOLDER);
     if (state.check) {
-        const auto [first, last] = state.where.equal_range(view->second.page);
+        const auto [first, last] = state.where.equal_range(page_num);
         for (auto entry = first; entry != last; ++entry)
             if (entry->second == address) {
                 state.where.erase(entry);
                 break;
             }
     }
-    if (view->second.owned)
-        release_page(state, view->second.page);
-    for (auto [at, end] = state.mapped_at.equal_range(view->second.page); at != end; ++at)
-        if (at->second == address) {
-            state.mapped_at.erase(at);
-            break;
-        }
+    if (owned)
+        release_page(state, page_num);
     reservation.views.erase(view);
 }
 // the title's memory mapped or committed since take_newly_mapped, a page's run at a time

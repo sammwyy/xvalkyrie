@@ -150,7 +150,18 @@ std::map<std::tuple<ID3D11DeviceContext *, bool, UINT>, std::pair<ID3D11Buffer *
     stream_slice_cbs;
 std::map<std::pair<ID3D11DeviceContext *, UINT>, std::pair<ID3D11Buffer *, UINT>> stream_slice_vbs;
 
-void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t base, bool pixel) {
+void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t base, UINT stage) {
+    using Set = void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11Buffer *const *);
+    using Set1 = void (STDMETHODCALLTYPE ID3D11DeviceContext1::*)(UINT, UINT, ID3D11Buffer *const *,
+                                                                  const UINT *, const UINT *);
+    constexpr Set plain[] = {
+        &ID3D11DeviceContext::VSSetConstantBuffers, &ID3D11DeviceContext::HSSetConstantBuffers,
+        &ID3D11DeviceContext::DSSetConstantBuffers, &ID3D11DeviceContext::GSSetConstantBuffers,
+        &ID3D11DeviceContext::PSSetConstantBuffers};
+    constexpr Set1 ranged[] = {
+        &ID3D11DeviceContext1::VSSetConstantBuffers1, &ID3D11DeviceContext1::HSSetConstantBuffers1,
+        &ID3D11DeviceContext1::DSSetConstantBuffers1, &ID3D11DeviceContext1::GSSetConstantBuffers1,
+        &ID3D11DeviceContext1::PSSetConstantBuffers1};
     ID3D11DeviceContext1 *latest = nullptr;
     context->QueryInterface(&latest);
     for (UINT slot = 0; slot < slots; ++slot) {
@@ -170,25 +181,20 @@ void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t
                                             desc.ByteWidth - offset) +
                                    255) /
                                       256 * 16);
-                if (pixel)
-                    latest->PSSetConstantBuffers1(slot, 1, &buffer, &first, &count);
-                else
-                    latest->VSSetConstantBuffers1(slot, 1, &buffer, &first, &count);
-            } else if (pixel) {
-                context->PSSetConstantBuffers(slot, 1, &buffer);
+                (latest->*ranged[stage])(slot, 1, &buffer, &first, &count);
             } else {
-                context->VSSetConstantBuffers(slot, 1, &buffer);
+                (context->*plain[stage])(slot, 1, &buffer);
             }
             continue;
         }
-        const UINT raw_bytes = descriptor[2] ? std::min(descriptor[2], 65536u) : 4096u;
+        const UINT raw_bytes = (descriptor[2] > 256u) ? std::min(descriptor[2], 65536u) : 4096u;
         if (!address || !modules::readable_memory(address, 16))
             continue;
         UINT copy_len = raw_bytes;
         while (copy_len > 16 && !modules::readable_memory(address, copy_len))
             copy_len /= 2;
         const UINT aligned = (std::max(copy_len, 256u) + 255u) & ~255u;
-        auto &entry = stream_slice_cbs[{context, pixel, slot}];
+        auto &entry = stream_slice_cbs[{context, stage == 4, slot + stage * 16}];
         if (!entry.first || entry.second < aligned) {
             if (entry.first)
                 entry.first->Release();
@@ -209,10 +215,7 @@ void constants(ID3D11DeviceContext *context, const Stream &stream, std::uint32_t
                 std::memcpy(mapped.pData, reinterpret_cast<const void *>(address), copy_len);
                 context->Unmap(slice, 0);
             }
-            if (pixel)
-                context->PSSetConstantBuffers(slot, 1, &slice);
-            else
-                context->VSSetConstantBuffers(slot, 1, &slice);
+            (context->*plain[stage])(slot, 1, &slice);
         }
     }
     if (latest)
@@ -302,10 +305,13 @@ bool buffer_offset(ID3D11Buffer *host, std::uint64_t address, UINT &offset) {
 void describe_buffer(void *object, ID3D11Buffer *host, const void *address) {
     if (address) {
         put_buffer(object, host, reinterpret_cast<std::uintptr_t>(address));
+        const std::uint64_t base = reinterpret_cast<std::uintptr_t>(address) & 0xffffffffffffull;
+        std::memcpy(static_cast<std::byte *>(object) + 0x30, &base, sizeof base);
         return;
     }
     const std::uint64_t zero = 0;
     std::memcpy(static_cast<std::byte *>(object) + 0x20, &zero, sizeof zero);
+    std::memcpy(static_cast<std::byte *>(object) + 0x30, &zero, sizeof zero);
     const std::lock_guard lock(mutex);
     for (auto [it, end] = addresses_of.equal_range(host); it != end;) {
         if (const auto b = buffers.find(it->second);
@@ -374,7 +380,7 @@ void apply_descriptors(ID3D11DeviceContext *context, const std::byte *start, con
             } else {
                 const auto address = (std::uintptr_t{descriptor[1] & 0xffff} << 32) | descriptor[0];
                 UINT raw_bytes = descriptor[2];
-                if (!raw_bytes || raw_bytes > 65536u)
+                if (raw_bytes <= 256u || raw_bytes > 65536u)
                     raw_bytes = 65536u;
                 if (address && modules::readable_memory(address, 4)) {
                     UINT copy_len = raw_bytes;
@@ -382,7 +388,7 @@ void apply_descriptors(ID3D11DeviceContext *context, const std::byte *start, con
                         copy_len /= 2;
                     if (modules::readable_memory(address, copy_len)) {
                         const UINT cap = std::max(copy_len, 4096u);
-                        auto &entry = stream_slice_vbs[{context, slot}];
+                        auto &entry = stream_slice_vbs[{context, slot + 64}];
                         if (!entry.first || entry.second < cap) {
                             if (entry.first)
                                 entry.first->Release();
@@ -415,7 +421,10 @@ void apply_descriptors(ID3D11DeviceContext *context, const std::byte *start, con
             }
         }
     }
-    constants(context, stream, vertex_constants, false);
-    constants(context, stream, pixel_constants, true);
+    constants(context, stream, vertex_constants, 0);
+    constants(context, stream, 0x2fb0, 1);
+    constants(context, stream, 0x4320, 2);
+    constants(context, stream, 0x5690, 3);
+    constants(context, stream, pixel_constants, 4);
 }
 } // namespace xv::runtime::durango::d3d11x

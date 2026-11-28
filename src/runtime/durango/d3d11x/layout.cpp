@@ -2155,12 +2155,57 @@ void STDMETHODCALLTYPE set_placed_vertex_buffer(void *self, UINT slot, void *buf
 void STDMETHODCALLTYPE set_fast_index_buffer(void *self, UINT hardware_format, void *buffer) {
     set_index_buffer(self, hardware_format, buffer, 0);
 }
+std::mutex up_ib_mutex;
+std::map<ID3D11DeviceContext *, std::pair<ID3D11Buffer *, UINT>> up_ibs;
+
 void STDMETHODCALLTYPE set_placed_index_buffer(void *self, UINT hardware_format, void *buffer,
                                                void *address) {
     auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
     auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
+    const auto addr = reinterpret_cast<std::uintptr_t>(address);
     UINT offset = 0;
-    resolve_placed_buffer(ctx, buffer, host, reinterpret_cast<std::uintptr_t>(address), offset);
+    if (host && addr && !buffer_offset(host, addr, offset) && readable_memory(addr, 4)) {
+        D3D11_BUFFER_DESC desc{};
+        host->GetDesc(&desc);
+        if (desc.ByteWidth <= 256u) {
+            UINT copy_len = 65536u;
+            while (copy_len > 4 && !readable_memory(addr, copy_len))
+                copy_len /= 2;
+            ID3D11Buffer *slice = nullptr;
+            {
+                const std::lock_guard lock(up_ib_mutex);
+                auto &entry = up_ibs[ctx];
+                if (!entry.first || entry.second < 65536u) {
+                    if (entry.first)
+                        entry.first->Release();
+                    entry = {nullptr, 0};
+                    ID3D11Device *dev = nullptr;
+                    ctx->GetDevice(&dev);
+                    const D3D11_BUFFER_DESC bd{65536u,
+                                               D3D11_USAGE_DYNAMIC,
+                                               D3D11_BIND_INDEX_BUFFER,
+                                               D3D11_CPU_ACCESS_WRITE,
+                                               0,
+                                               0};
+                    if (SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &entry.first)))
+                        entry.second = 65536u;
+                    dev->Release();
+                }
+                slice = entry.first;
+            }
+            if (slice && readable_memory(addr, copy_len)) {
+                D3D11_MAPPED_SUBRESOURCE mp{};
+                if (SUCCEEDED(ctx->Map(slice, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+                    std::memcpy(mp.pData, address, copy_len);
+                    ctx->Unmap(slice, 0);
+                }
+                ctx->IASetIndexBuffer(
+                    slice, hardware_format ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
+                return;
+            }
+        }
+    }
+    resolve_placed_buffer(ctx, buffer, host, addr, offset);
     set_index_buffer(self, hardware_format, buffer, offset);
 }
 
