@@ -1455,6 +1455,40 @@ void average(ID3D11Texture2D *texture, const char *what) {
         if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
             d3d12x::report_picture(static_cast<const std::uint8_t *>(mapped.pData), mapped.RowPitch,
                                    desc.Width, desc.Height, desc.Format, what);
+            if (const auto *bmp = std::getenv("XV_D3D_PROBE_BMP");
+                bmp && *bmp && std::strcmp(what, "back buffer") == 0 &&
+                (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                 desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
+                if (auto *out = std::fopen(bmp, "wb")) {
+                    const UINT w = desc.Width, h = desc.Height, bytes = w * 4 * h;
+                    std::uint8_t hdr[54]{'B', 'M'};
+                    const UINT fsz = 54 + bytes, off = 54, dib = 40;
+                    const INT32 sw = static_cast<INT32>(w), sh = -static_cast<INT32>(h);
+                    const UINT16 planes = 1, bpp = 32;
+                    std::memcpy(hdr + 2, &fsz, 4);
+                    std::memcpy(hdr + 10, &off, 4);
+                    std::memcpy(hdr + 14, &dib, 4);
+                    std::memcpy(hdr + 18, &sw, 4);
+                    std::memcpy(hdr + 22, &sh, 4);
+                    std::memcpy(hdr + 26, &planes, 2);
+                    std::memcpy(hdr + 28, &bpp, 2);
+                    std::fwrite(hdr, 1, 54, out);
+                    std::vector<std::uint8_t> row(w * 4);
+                    for (UINT y = 0; y < h; ++y) {
+                        const auto *src =
+                            static_cast<const std::uint8_t *>(mapped.pData) + y * mapped.RowPitch;
+                        for (UINT x = 0; x < w; ++x) {
+                            const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
+                            row[x * 4 + 0] = src[x * 4 + (rgba ? 2 : 0)];
+                            row[x * 4 + 1] = src[x * 4 + 1];
+                            row[x * 4 + 2] = src[x * 4 + (rgba ? 0 : 2)];
+                            row[x * 4 + 3] = 255;
+                        }
+                        std::fwrite(row.data(), 1, w * 4, out);
+                    }
+                    std::fclose(out);
+                }
+            }
             context->Unmap(staging, 0);
         }
         staging->Release();
@@ -1466,20 +1500,149 @@ bool probing() {
     static const bool enabled = std::getenv("XV_D3D_PROBE") != nullptr;
     return enabled;
 }
-void probe(IDXGISwapChain *swap_chain) {
-    static std::atomic<int> frames{0};
-    // XV_D3D_PROBE=<frame>, 300 when it is not a number
+int probe_target_frame() {
     static const int at = [] {
         const auto *const text = std::getenv("XV_D3D_PROBE");
         const int frame = text ? std::atoi(text) : 0;
         return frame > 1 ? frame : 300;
     }();
-    if (!probing() || ++frames != at)
+    return at;
+}
+std::atomic<int> probe_frames{0};
+std::mutex probe_rt_mutex;
+std::vector<ID3D11Texture2D *> probe_rts;
+std::atomic<int> probe_draws_logged{0};
+
+void probe_draw(ID3D11DeviceContext *host) {
+    if (!probing() || probe_frames.load(std::memory_order_relaxed) != probe_target_frame() - 1)
         return;
+    ID3D11RenderTargetView *rtv = nullptr;
+    ID3D11DepthStencilView *dsv = nullptr;
+    host->OMGetRenderTargets(1, &rtv, &dsv);
+    UINT rtw = 0, rth = 0, rtf = 0;
+    if (rtv) {
+        ID3D11Resource *res = nullptr;
+        rtv->GetResource(&res);
+        if (res) {
+            D3D11_RESOURCE_DIMENSION dim{};
+            res->GetType(&dim);
+            if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+                auto *tex = static_cast<ID3D11Texture2D *>(res);
+                D3D11_TEXTURE2D_DESC td{};
+                tex->GetDesc(&td);
+                rtw = td.Width;
+                rth = td.Height;
+                rtf = static_cast<UINT>(td.Format);
+                const std::lock_guard lock(probe_rt_mutex);
+                if (probe_rts.size() < 8 &&
+                    std::find(probe_rts.begin(), probe_rts.end(), tex) == probe_rts.end()) {
+                    tex->AddRef();
+                    probe_rts.push_back(tex);
+                }
+            }
+            res->Release();
+        }
+    }
+    const int n = ++probe_draws_logged;
+    if (n <= 20) {
+        UINT nvp = 1, nsc = 1;
+        D3D11_VIEWPORT vp{};
+        D3D11_RECT sc{};
+        host->RSGetViewports(&nvp, &vp);
+        host->RSGetScissorRects(&nsc, &sc);
+        ID3D11VertexShader *vs = nullptr;
+        ID3D11PixelShader *ps = nullptr;
+        ID3D11InputLayout *il = nullptr;
+        D3D11_PRIMITIVE_TOPOLOGY topo{};
+        ID3D11Buffer *vb = nullptr;
+        ID3D11Buffer *vcbs[14]{}, *pcbs[14]{};
+        UINT vbs = 0, vbo = 0, vmask = 0, pmask = 0;
+        ID3D11ShaderResourceView *psrv = nullptr;
+        ID3D11RasterizerState *rs = nullptr;
+        ID3D11DepthStencilState *dss = nullptr;
+        ID3D11BlendState *bs = nullptr;
+        D3D11_RASTERIZER_DESC rsd{};
+        D3D11_DEPTH_STENCIL_DESC dsd{};
+        D3D11_BLEND_DESC bsd{};
+        host->VSGetShader(&vs, nullptr, nullptr);
+        host->PSGetShader(&ps, nullptr, nullptr);
+        host->IAGetInputLayout(&il);
+        host->IAGetPrimitiveTopology(&topo);
+        host->IAGetVertexBuffers(0, 1, &vb, &vbs, &vbo);
+        host->VSGetConstantBuffers(0, 14, vcbs);
+        host->PSGetConstantBuffers(0, 14, pcbs);
+        host->PSGetShaderResources(0, 1, &psrv);
+        host->RSGetState(&rs);
+        host->OMGetDepthStencilState(&dss, nullptr);
+        host->OMGetBlendState(&bs, nullptr, nullptr);
+        if (rs) {
+            rs->GetDesc(&rsd);
+            rs->Release();
+        }
+        if (dss) {
+            dss->GetDesc(&dsd);
+            dss->Release();
+        }
+        if (bs) {
+            bs->GetDesc(&bsd);
+            bs->Release();
+        }
+        for (UINT s = 0; s < 14; ++s) {
+            if (vcbs[s]) {
+                vmask |= 1u << s;
+                vcbs[s]->Release();
+            }
+            if (pcbs[s]) {
+                pmask |= 1u << s;
+                pcbs[s]->Release();
+            }
+        }
+        std::fprintf(
+            stderr,
+            "[Probe] draw #%d: rtv=%ux%u(fmt %u) dsv=%d vp=%.0fx%.0f sc=%ld,%ld..%ld,%ld(en=%d) "
+            "cull=%d z=%d(fn=%d) wmask=0x%x vs=%d ps=%d il=%d topo=%u vb=%d(s=%u,o=%u) "
+            "vcbs=0x%x pcbs=0x%x psrv0=%d\n",
+            n, rtw, rth, rtf, dsv != nullptr, vp.Width, vp.Height, sc.left, sc.top, sc.right,
+            sc.bottom, rsd.ScissorEnable, static_cast<int>(rsd.CullMode), dsd.DepthEnable,
+            static_cast<int>(dsd.DepthFunc), bsd.RenderTarget[0].RenderTargetWriteMask,
+            vs != nullptr, ps != nullptr, il != nullptr, static_cast<unsigned>(topo), vb != nullptr,
+            vbs, vbo, vmask, pmask, psrv != nullptr);
+        std::fflush(stderr);
+        if (vs)
+            vs->Release();
+        if (ps)
+            ps->Release();
+        if (il)
+            il->Release();
+        if (vb)
+            vb->Release();
+        if (psrv)
+            psrv->Release();
+    }
+    if (rtv)
+        rtv->Release();
+    if (dsv)
+        dsv->Release();
+}
+
+void probe(IDXGISwapChain *swap_chain) {
+    if (!probing() || ++probe_frames != probe_target_frame())
+        return;
+    std::fprintf(stderr, "[Probe] frame %d total draws=%d\n", probe_target_frame(),
+                 probe_draws_logged.load());
     ID3D11Texture2D *buffer = nullptr;
     if (SUCCEEDED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&buffer)))) {
         average(buffer, "back buffer");
         buffer->Release();
+        std::vector<ID3D11Texture2D *> rts;
+        {
+            const std::lock_guard lock(probe_rt_mutex);
+            rts.swap(probe_rts);
+        }
+        for (std::size_t i = 0; i < rts.size(); ++i) {
+            average(rts[i], ("render target " + std::to_string(i)).c_str());
+            rts[i]->Release();
+        }
         return;
     }
     // a Direct3D 12 swap chain: the buffer about to be presented, read back on the host
@@ -1689,25 +1852,40 @@ void apply_context_state(void *self) {
         apply_descriptors(static_cast<ID3D11DeviceContext *>(unwrap(self)), stream,
                           static_cast<std::byte **>(self)[command_write]);
     restore_pixel_views(self);
-    if (!state::read<std::uint32_t>(self, state::dirty))
+    const auto dirty = state::read<std::uint32_t>(self, state::dirty);
+    if (!dirty) {
+        probe_draw(static_cast<ID3D11DeviceContext *>(unwrap(self)));
         return;
+    }
     const std::uint32_t clean = 0;
     std::memcpy(static_cast<char *>(self) + state::dirty, &clean, sizeof clean);
     auto *const host = static_cast<ID3D11DeviceContext *>(unwrap(self));
-    auto *const vs =
+    auto *vs =
         static_cast<ID3D11VertexShader *>(unwrap(state::read<void *>(self, state::vertex_shader)));
-    host->IASetInputLayout(
-        static_cast<ID3D11InputLayout *>(unwrap(state::read<void *>(self, state::input_layout))));
-    host->VSSetShader(vs, nullptr, 0);
-    host->PSSetShader(
-        static_cast<ID3D11PixelShader *>(unwrap(state::read<void *>(self, state::pixel_shader))),
-        nullptr, 0);
+    if (dirty & 0x08u)
+        host->IASetInputLayout(static_cast<ID3D11InputLayout *>(
+            unwrap(state::read<void *>(self, state::input_layout))));
+    if (dirty & 0x10u)
+        host->VSSetShader(vs, nullptr, 0);
+    if (dirty & 0x120u)
+        host->PSSetShader(static_cast<ID3D11PixelShader *>(
+                              unwrap(state::read<void *>(self, state::pixel_shader))),
+                          nullptr, 0);
+    if (!(dirty & (0x04u | 0x10u))) {
+        probe_draw(host);
+        return;
+    }
     const auto value = state::read<std::uint64_t>(self, state::topology);
     const auto prim = (value & 0xffffffffull) == 0xc0009e00ull ? ((value >> 37) & 0x3full) : 0ull;
     if (prim == 0x11ull || prim == 0x13ull) {
         const bool quad = prim == 0x13ull;
         host->IASetPrimitiveTopology(quad ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ
                                           : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11VertexShader *queried_vs = nullptr;
+        if (!vs) {
+            host->VSGetShader(&queried_vs, nullptr, nullptr);
+            vs = queried_vs;
+        }
         ID3D11GeometryShader *gs = nullptr;
         if (vs) {
             const std::lock_guard lock(rect_gs_mutex);
@@ -1728,7 +1906,10 @@ void apply_context_state(void *self) {
             }
             rect_gs_bound[self] = true;
         }
+        if (queried_vs)
+            queried_vs->Release();
         host->GSSetShader(gs, nullptr, 0);
+        probe_draw(host);
         return;
     }
     {
@@ -1750,6 +1931,7 @@ void apply_context_state(void *self) {
             std::fprintf(stderr, "[Runtime] unknown console topology word 0x%llx\n",
                          static_cast<unsigned long long>(value));
     }
+    probe_draw(host);
 }
 // DrawIndexed through the in-object table: (index count << 32 | first index, base vertex)
 void STDMETHODCALLTYPE draw_indexed(void *self, UINT64 count_and_start, INT base_vertex) {
@@ -1779,24 +1961,69 @@ void STDMETHODCALLTYPE set_fast_vertex_buffer(void *self, UINT slot, void *buffe
     static_cast<ID3D11DeviceContext *>(unwrap(self))
         ->IASetVertexBuffers(slot, 1, &host, &stride, &offset);
 }
+void resolve_placed_buffer(ID3D11DeviceContext *ctx, void *object, ID3D11Buffer *host,
+                           std::uintptr_t addr, UINT &offset) {
+    offset = 0;
+    if (!host || !addr)
+        return;
+    if (buffer_offset(host, addr, offset))
+        return;
+    D3D11_BUFFER_DESC desc{};
+    host->GetDesc(&desc);
+    if (!readable_memory(addr, 4)) {
+        if (addr < desc.ByteWidth)
+            offset = static_cast<UINT>(addr);
+        return;
+    }
+    if (readable_memory(addr, desc.ByteWidth)) {
+        if (desc.Usage == D3D11_USAGE_DYNAMIC) {
+            D3D11_MAPPED_SUBRESOURCE mp{};
+            if (SUCCEEDED(ctx->Map(host, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+                std::memcpy(mp.pData, reinterpret_cast<const void *>(addr), desc.ByteWidth);
+                ctx->Unmap(host, 0);
+            }
+        } else if (desc.Usage == D3D11_USAGE_DEFAULT) {
+            ctx->UpdateSubresource(host, 0, nullptr, reinterpret_cast<const void *>(addr), 0, 0);
+        }
+        describe_buffer(object, host, reinterpret_cast<void *>(addr));
+        track_placement(host, reinterpret_cast<const void *>(addr));
+        return;
+    }
+    UINT avail = desc.ByteWidth;
+    while (avail > 16 && !readable_memory(addr, avail))
+        avail /= 2;
+    if (!readable_memory(addr, avail))
+        return;
+    if (desc.Usage == D3D11_USAGE_DYNAMIC) {
+        D3D11_MAPPED_SUBRESOURCE mp{};
+        if (SUCCEEDED(ctx->Map(host, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+            std::memcpy(mp.pData, reinterpret_cast<const void *>(addr), avail);
+            ctx->Unmap(host, 0);
+        }
+    } else if (desc.Usage == D3D11_USAGE_DEFAULT &&
+               !(desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+        const D3D11_BOX box{0, 0, 0, avail, 1, 1};
+        ctx->UpdateSubresource(host, 0, &box, reinterpret_cast<const void *>(addr), 0, 0);
+    }
+}
+
 void STDMETHODCALLTYPE set_placed_vertex_buffer(void *self, UINT slot, void *buffer, void *address,
                                                 UINT stride) {
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
     auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
     UINT offset = 0;
-    if (host && address)
-        buffer_offset(host, reinterpret_cast<std::uintptr_t>(address), offset);
-    static_cast<ID3D11DeviceContext *>(unwrap(self))
-        ->IASetVertexBuffers(slot, 1, &host, &stride, &offset);
+    resolve_placed_buffer(ctx, buffer, host, reinterpret_cast<std::uintptr_t>(address), offset);
+    ctx->IASetVertexBuffers(slot, 1, &host, &stride, &offset);
 }
 void STDMETHODCALLTYPE set_fast_index_buffer(void *self, UINT hardware_format, void *buffer) {
     set_index_buffer(self, hardware_format, buffer, 0);
 }
 void STDMETHODCALLTYPE set_placed_index_buffer(void *self, UINT hardware_format, void *buffer,
                                                void *address) {
+    auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
     auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
     UINT offset = 0;
-    if (host && address)
-        buffer_offset(host, reinterpret_cast<std::uintptr_t>(address), offset);
+    resolve_placed_buffer(ctx, buffer, host, reinterpret_cast<std::uintptr_t>(address), offset);
     set_index_buffer(self, hardware_format, buffer, offset);
 }
 
@@ -1849,12 +2076,7 @@ void STDMETHODCALLTYPE set_fast_resources(void *self, const UINT *table, const U
                 const UINT stride = static_cast<UINT>(extra >> 48);
                 const auto low = extra & 0xffffffffffffull;
                 UINT offset = 0;
-                if (buffer && low && !buffer_offset(buffer, low, offset)) {
-                    D3D11_BUFFER_DESC desc{};
-                    buffer->GetDesc(&desc);
-                    if (low < desc.ByteWidth)
-                        offset = static_cast<UINT>(low);
-                }
+                resolve_placed_buffer(context, object, buffer, low, offset);
                 context->IASetVertexBuffers(slot + i, 1, &buffer, &stride, &offset);
             } else if (kind == 1 && stage < 6) {
                 auto *buffer = static_cast<Buffer *>(host);
@@ -2183,6 +2405,14 @@ void STDMETHODCALLTYPE set_shader(void *self, void *shader) {
     if constexpr (std::is_same_v<Shader, ID3D11GeometryShader>) {
         const std::lock_guard lock(rect_gs_mutex);
         rect_gs_bound[self] = false;
+    } else if constexpr (std::is_same_v<Shader, ID3D11VertexShader>) {
+        std::memcpy(static_cast<char *>(self) + state::vertex_shader, &shader, sizeof shader);
+        const auto d = state::read<std::uint32_t>(self, state::dirty) & ~0x10u;
+        std::memcpy(static_cast<char *>(self) + state::dirty, &d, sizeof d);
+    } else if constexpr (std::is_same_v<Shader, ID3D11PixelShader>) {
+        std::memcpy(static_cast<char *>(self) + state::pixel_shader, &shader, sizeof shader);
+        const auto d = state::read<std::uint32_t>(self, state::dirty) & ~0x120u;
+        std::memcpy(static_cast<char *>(self) + state::dirty, &d, sizeof d);
     }
     (static_cast<ID3D11DeviceContext *>(unwrap(self))->*Set)(static_cast<Shader *>(unwrap(shader)),
                                                              nullptr, 0);
@@ -2355,7 +2585,7 @@ template <UINT Stage>
 void STDMETHODCALLTYPE set_placed_cb(void *self, UINT slot, void *buffer, void *address) {
     auto *const ctx = static_cast<ID3D11DeviceContext *>(unwrap(self));
     auto *const host = static_cast<ID3D11Buffer *>(unwrap(buffer));
-    if (!host || !address) {
+    if (!address) {
         using Set =
             void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11Buffer *const *);
         constexpr Set plain[] = {
@@ -2366,10 +2596,11 @@ void STDMETHODCALLTYPE set_placed_cb(void *self, UINT slot, void *buffer, void *
         return;
     }
     D3D11_BUFFER_DESC desc{};
-    host->GetDesc(&desc);
+    if (host)
+        host->GetDesc(&desc);
     UINT offset = 0;
     const auto addr = reinterpret_cast<std::uintptr_t>(address);
-    const bool inside = buffer_offset(host, addr, offset);
+    const bool inside = host && buffer_offset(host, addr, offset);
     ID3D11DeviceContext1 *c1 = nullptr;
     if (FAILED(ctx->QueryInterface(&c1)))
         return;
@@ -2379,15 +2610,12 @@ void STDMETHODCALLTYPE set_placed_cb(void *self, UINT slot, void *buffer, void *
         &ID3D11DeviceContext1::VSSetConstantBuffers1, &ID3D11DeviceContext1::HSSetConstantBuffers1,
         &ID3D11DeviceContext1::DSSetConstantBuffers1, &ID3D11DeviceContext1::GSSetConstantBuffers1,
         &ID3D11DeviceContext1::PSSetConstantBuffers1, &ID3D11DeviceContext1::CSSetConstantBuffers1};
-    if (inside && offset % 256 == 0) {
-        const UINT fc = offset / 16;
-        const UINT nc = std::min(4096u, ((desc.ByteWidth - offset) / 16 + 15u) & ~15u);
-        (c1->*setters[Stage])(slot, 1, &host, &fc, &nc);
-        c1->Release();
-        return;
-    }
-    const UINT avail = inside && desc.ByteWidth > offset ? desc.ByteWidth - offset : desc.ByteWidth;
-    const UINT copy_len = std::min(avail ? avail : 4096u, 4096u);
+    const UINT avail =
+        host ? (inside && desc.ByteWidth > offset ? desc.ByteWidth - offset : desc.ByteWidth)
+             : 4096u;
+    UINT copy_len = std::min(avail ? avail : 4096u, 4096u);
+    while (copy_len > 16 && !readable_memory(addr, copy_len))
+        copy_len /= 2;
     const UINT aligned_bytes = (std::max(copy_len, 256u) + 255u) & ~255u;
     ID3D11Buffer *slice = nullptr;
     {
@@ -2420,8 +2648,9 @@ void STDMETHODCALLTYPE set_placed_cb(void *self, UINT slot, void *buffer, void *
         }
         const UINT fc = 0, nc = aligned_bytes / 16;
         (c1->*setters[Stage])(slot, 1, &slice, &fc, &nc);
-    } else {
-        const UINT fc = 0, nc = std::min(4096u, (desc.ByteWidth / 16 + 15u) & ~15u);
+    } else if (host) {
+        const UINT fc = inside ? (offset / 16) & ~15u : 0u;
+        const UINT nc = std::min(4096u, (desc.ByteWidth / 16 + 15u) & ~15u);
         (c1->*setters[Stage])(slot, 1, &host, &fc, &nc);
     }
     c1->Release();
@@ -2685,8 +2914,10 @@ Layout earliest_layout(const Layout &later, Kind kind, std::size_t table) {
     // ones keep theirs of what changed
     result.out_of_line = table == 54 ? 0x168 : 0;
     result.apply_state = [](void *self) {
-        upload_placements(static_cast<ID3D11DeviceContext *>(unwrap(self)));
+        auto *const host = static_cast<ID3D11DeviceContext *>(unwrap(self));
+        upload_placements(host);
         restore_pixel_views(self);
+        probe_draw(host);
     };
     return result;
 }

@@ -321,6 +321,8 @@ void upload(ID3D11DeviceContext *context, const Placement &placement) {
         }
         return;
     }
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        return;
     D3D11_TEXTURE2D_DESC desc;
     static_cast<ID3D11Texture2D *>(resource)->GetDesc(&desc);
     if (desc.Usage != D3D11_USAGE_DEFAULT || desc.SampleDesc.Count > 1)
@@ -352,11 +354,14 @@ void track_placement(ID3D11Resource *resource, const void *address, UINT tile_mo
     const std::lock_guard lock(mutex);
     if (!handler)
         handler = AddVectoredExceptionHandler(1, &written);
-    // a resource placed where an older one was replaces it
-    if (const auto old = placements.find(start); old != placements.end()) {
-        protect(old->second, PAGE_READWRITE); // the new one may not cover all of it
-        release(old->second);
-        placements.erase(old);
+    for (auto it = placements.begin(); it != placements.end();) {
+        if (it->first == start || it->second.resource == resource) {
+            protect(it->second, PAGE_READWRITE);
+            release(it->second);
+            it = placements.erase(it);
+        } else {
+            ++it;
+        }
     }
     resource->AddRef();
     largest = std::max<std::uintptr_t>(largest, bytes);

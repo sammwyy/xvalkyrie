@@ -27,31 +27,31 @@ further than its state says. Logs of a run are in `%APPDATA%\xvalkyrie\logs`.
 | Puyo Puyo Champions                      | `62B3A350` | **Menu**     | Direct3D 11.X. The autosave notice, waiting for A; reads the gamepad                                                         |
 | Crash Bandicoot N. Sane Trilogy          | `044D0F74` | **Menu**     | Title screen; the text under its logo is drawn without its transparency                                                      |
 | Mega Man 11                              | `1F337CFB` | **Intro**    | Direct3D 11.X. Presents 1,000+ frames, reads the gamepad, writes its save, and shows readable prompt text                    |
-| Overcooked                               | `145207D1` | **Boots**    | Unity. Presents frames, a plain blue picture                                                                                 |
-| Rock Band 4                              | `2DBB840F` | **Boots**    | Direct3D 11.X. Presents frames, the picture is black; its Xbox Live library throws on start                                  |
+| Overcooked                               | `145207D1` | **Menu**     | Unity. 3D main menu ("Campaign / Versus / Options / Credits") with shadows, gamepad input, and connected storage             |
+| Rock Band 4                              | `2DBB840F` | **Boots**    | Direct3D 11.X. Presents frames and reads the gamepad; the picture is black                                                   |
 | SPACE JAM: A NEW LEGACY - THE GAME       | `622B018E` | **Menu**     | GDK title on Direct3D 12. Title screen with the right picture; A goes on into its opening story                              |
 | LEGO CITY UNDERCOVER                     | `27D78EC2` | **Menu**     | Main menu, reads the gamepad; the 3D scene behind it is black                                                                |
 | Minecraft (Bedrock)                      | `6CFA0C1E` | **Menu**     | Direct3D 12. Main menu at 1080p with 3D character, UI, audio, and saves                                                      |
 | Puyo Puyo Tetris 2                       | `6AA460A3` | **Menu**     | Direct3D 12. Main menu with the right picture; reads the gamepad                                                             |
 | Rocket League                            | `214E91AC` | **Boots**    | Unreal Engine 3. Loads its menu map (`MENU_Beach_p`) and presents frames, the picture is black                               |
 | 1001 Spikes                              | `6B2E4F1B` | **Menu**     | Main menu with the right picture; reads the gamepad                                                                          |
-| 7 Days to Die                            | `039D30F6` | **Boots**    | Unity. Presents frames; picture not looked at yet                                                                            |
-| A KING'S TALE: FINAL FANTASY XV          | `05401907` | **Intro**    |                                                                                                                              |
+| 7 Days to Die                            | `039D30F6` | **Menu**     | Unity. 1080p title screen ("7 Days to Die / Press Menu"); 1,000+ frames                                                      |
+| A KING'S TALE: FINAL FANTASY XV          | `05401907` | **Menu**     | Direct3D 11.X. Pixel-art title screen at 1080p after intro logos; 1,000+ frames, audio, reads the gamepad                    |
 | Cyberpunk 2077                           | `0D42AD14` | **Nothing**  |                                                                                                                              |
 | Dance Central Spotlight                  | `295F3C44` | **In-game**  | First kits. Harmonix intro, loading screen, and in-game pause menu; 1,000+ frames, reads the gamepad and writes saves        |
 | DARK SOULS: REMASTERED NETWORK TEST VER. | `27EDC966` | **Menu**     |                                                                                                                              |
 | FIFA 15                                  | `64B02253` | **Intro**    | First kits. Its opening screen with the right picture                                                                        |
-| FRU                                      | `3C646A12` | **Boots**    | Unity. Presents frames, the picture is black: the game is played with the Kinect sensor                                      |
+| FRU                                      | `3C646A12` | **Intro**    | Unity. Studio logo ("Through Games!") and loading animation; the game is played with the Kinect sensor                       |
 | FUSER Demo                               | `61BEB2FD` | **Boots**    | Unreal Engine 4 on Direct3D 12. One frame, then a fault                                                                      |
 | Just Dance 2020                          | `13E02891` | **Menu**     | Direct3D 11.X. Interactive mode-selection menu with the right picture, 1,000+ frames, and saves                              |
 | Minecraft Story Mode                     | `781521BD` | **In-game**  | Direct3D 11.X. 3D title screen, interactive main menu, saves, and enters Episode 1                                           |
 | Peggle 2                                 | `32966611` | **Playable** | Launch kit, Direct3D 11. Plays, with the right picture                                                                       |
-| Pixel Piracy                             | `30D1E0F7` | **Boots**    | Unity. Presents frames, the picture is black                                                                                 |
+| Pixel Piracy                             | `30D1E0F7` | **Menu**     | Unity. Animated main menu ("Start Game / Settings") with audio and gamepad input                                             |
 | Project Spark                            | `60D19E14` | **Menu**     | Title screen with the right picture, after its screen calibration; not online                                                |
 | Promenade (Demo)                         | `6DBB4B4C` | **Intro**    | GDK title on Direct3D 12. Loads FMOD Studio plugins, writes XGameSave, and presents its 4K splash screen without device loss |
 | Rayman Legends                           | `27BDEA18` | **Menu**     | Launch kit, Direct3D 11. Title screen with the right picture                                                                 |
 | Saints Row Boss Factory                  | `65D9BC13` | **Nothing**  | GDK title on Direct3D 12. Faults while it waits for its files, before its device                                             |
-| Seasons after Fall                       | `30AD5A99` | **Boots**    | Unity. Presents frames, the picture is black                                                                                 |
+| Seasons after Fall                       | `30AD5A99` | **Menu**     | Unity. Main menu ("Start Game / Change profile / Settings / Credits / Extra") at 1080p                                       |
 | Shadow of the Tomb Raider                | `36773C0D` | **Boots**    | A few frames, then it faults: it sizes texture memory by the console's tiled layouts, which are not known here               |
 | Slender - The Arrival                    | `458E04D7` | **Playable** | Unity. Plays from its opening on                                                                                             |
 | SONIC FORCES                             | `07B5597E` | **Playable** | Gets in game and plays; some textures of its HUD lack their transparency                                                     |

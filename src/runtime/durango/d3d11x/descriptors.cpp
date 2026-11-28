@@ -57,8 +57,18 @@ void put_buffer(void *object, ID3D11Buffer *host, std::uintptr_t address,
     std::memcpy(at, &base, 8);
     std::memcpy(at + 8, &desc.ByteWidth, 4);
     const std::lock_guard lock(mutex);
+    auto *const key = owner ? owner : host;
+    for (auto [it, end] = addresses_of.equal_range(key); it != end;) {
+        if (const auto b = buffers.find(it->second);
+            b != buffers.end() && b->second.buffer == host) {
+            buffers.erase(b);
+            it = addresses_of.erase(it);
+        } else {
+            ++it;
+        }
+    }
     buffers[address] = {address + desc.ByteWidth, host};
-    addresses_of.emplace(owner ? owner : host, address);
+    addresses_of.emplace(key, address);
 }
 template <class T> T *object_of(const std::uint32_t *descriptor, std::uint32_t kind = magic) {
     if (descriptor[1] != kind)

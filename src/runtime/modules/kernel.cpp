@@ -553,11 +553,15 @@ FARPROC WINAPI get_proc_address_of(HMODULE module, const char *name) {
     if (!function)
         function = GetProcAddress(module, name);
     const auto error = GetLastError();
-    const bool ordinal = reinterpret_cast<std::uintptr_t>(name) < 0x10000;
-    std::fprintf(stderr, "[Runtime] GetProcAddress(%s%s) -> %p\n", ordinal ? "#" : name,
-                 ordinal ? std::to_string(reinterpret_cast<std::uintptr_t>(name)).c_str() : "",
-                 reinterpret_cast<void *>(function));
-    std::fflush(stderr);
+    static std::atomic<unsigned> logged{0};
+    if (!function || logged.fetch_add(1, std::memory_order_relaxed) < 64 ||
+        std::getenv("XV_FILE_TRACE")) {
+        const bool ordinal = reinterpret_cast<std::uintptr_t>(name) < 0x10000;
+        std::fprintf(stderr, "[Runtime] GetProcAddress(%s%s) -> %p\n", ordinal ? "#" : name,
+                     ordinal ? std::to_string(reinterpret_cast<std::uintptr_t>(name)).c_str() : "",
+                     reinterpret_cast<void *>(function));
+        std::fflush(stderr);
+    }
     SetLastError(error);
     return function;
 }
