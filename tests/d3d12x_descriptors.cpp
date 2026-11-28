@@ -152,6 +152,33 @@ TEST_CASE("structured buffer views with explicit formats and cross-dimension tex
     rtv3d.Texture3D = {0, 5, 1};
     title().call<void>(device(), 20, tex, &rtv3d, rtv_heap.cpu);
 
+    // Unaligned CreateConstantBufferView (17) inside a mapped buffer copies to a 256-byte aligned
+    // slot
+    void *buf_cpu = nullptr;
+    REQUIRE(buf->Map(0, nullptr, &buf_cpu) == S_OK);
+    std::memset(buf_cpu, 0x2a, 256);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC unaligned_cbv{buf->GetGPUVirtualAddress() + 0x30, 176};
+    title().call<void>(device(), 17, &unaligned_cbv, cbv_srv_uav.cpu + 96);
+    buf->Unmap(0, nullptr);
+
+    // ResourceBarrier (26) on an UPLOAD heap buffer is ignored without dropping the device
+    ID3D12CommandAllocator *alloc_cmd = nullptr;
+    ID3D12GraphicsCommandList *cmd = nullptr;
+    REQUIRE(device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             IID_PPV_ARGS(&alloc_cmd)) == S_OK);
+    REQUIRE(title().call(device(), 12, 0u, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc_cmd,
+                         static_cast<ID3D12PipelineState *>(nullptr),
+                         &__uuidof(ID3D12GraphicsCommandList),
+                         reinterpret_cast<void **>(&cmd)) == S_OK);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {buf, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER};
+    title().call<void>(cmd, 26, 1u, &barrier);
+    CHECK(title().call(cmd, 9) == S_OK);
+    cmd->Release();
+    alloc_cmd->Release();
+
     CHECK(removed_reason() == S_OK);
     tex->Release();
     buf->Release();

@@ -2528,23 +2528,44 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
         // they are when the view is made (a title may make its views as it draws).
         const auto given = host.BufferLocation;
         const auto direct = gpu_address(given);
-        host.BufferLocation =
-            direct ? direct : (console == Target::scarlett ? root_address(given) : 0);
+        host.BufferLocation = direct ? direct : root_address(given);
         MEMORY_BASIC_INFORMATION info{};
         const bool readable_title =
             VirtualQuery(reinterpret_cast<void *>(given), &info, sizeof info) &&
             info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
         // root_address has copied what is memory of the title's and in no buffer
-        copied = console == Target::scarlett && !direct && host.BufferLocation != given &&
-                 readable_title;
-        if (console == Target::scarlett && (host.BufferLocation & 255) && readable_title) {
-            const auto avail =
-                readable_bytes(reinterpret_cast<const void *>(given), host.SizeInBytes);
-            if (avail)
-                if (const auto copy = ring_copy(reinterpret_cast<const void *>(given), avail)) {
-                    host.BufferLocation = copy;
-                    copied = true;
+        copied = !direct && host.BufferLocation != given && readable_title;
+        if (host.BufferLocation & 255) {
+            if (readable_title) {
+                const auto avail =
+                    readable_bytes(reinterpret_cast<const void *>(given), host.SizeInBytes);
+                if (avail)
+                    if (const auto copy = ring_copy(reinterpret_cast<const void *>(given), avail)) {
+                        host.BufferLocation = copy;
+                        copied = true;
+                    }
+            } else if (buffer) {
+                const auto avail = std::min<std::uint64_t>(host.SizeInBytes, room);
+                std::uint64_t kept = 0;
+                const bool mapped = mapped_address(buffer, kept);
+                void *memory = reinterpret_cast<void *>(kept);
+                const D3D12_RANGE read{static_cast<SIZE_T>(offset),
+                                       static_cast<SIZE_T>(offset + avail)};
+                if (avail && (mapped || (SUCCEEDED(buffer->Map(0, &read, &memory)) && memory))) {
+                    const auto copy =
+                        ring_copy(static_cast<const std::uint8_t *>(memory) + offset, avail);
+                    if (!mapped) {
+                        const D3D12_RANGE none{0, 0};
+                        buffer->Unmap(0, &none);
+                    }
+                    if (copy) {
+                        host.BufferLocation = copy;
+                        copied = true;
+                    }
                 }
+            }
+            if (host.BufferLocation & 255)
+                host.BufferLocation = buffer ? (host.BufferLocation & ~255ull) : 0;
         }
         if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_LOST") && shown++ < 12) {
             std::fprintf(stderr,
@@ -5113,6 +5134,9 @@ HRESULT with_driver_blob(std::uint64_t key, D3D12_CACHED_PIPELINE_STATE &cached,
     }
     return result;
 }
+bool host_set_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *state);
+bool faults_when_set(ID3D12Device *device, ID3D12PipelineState *state,
+                     ID3D12RootSignature *signature, bool graphics = false);
 // CreateGraphicsPipelineState (10): the console's flags, as for compute pipelines
 HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
                                                    const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
@@ -5319,27 +5343,37 @@ bool host_set_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *sta
 bool host_set_table(ID3D12GraphicsCommandList *list, UINT parameter,
                     D3D12_GPU_DESCRIPTOR_HANDLE table);
 bool faults_when_set(ID3D12Device *device, ID3D12PipelineState *state,
-                     ID3D12RootSignature *signature) {
+                     ID3D12RootSignature *signature, bool graphics) {
     static std::mutex mutex;
     static ID3D12CommandAllocator *allocator = nullptr;
     static ID3D12GraphicsCommandList *list = nullptr;
+    static ID3D12Device *list_device = nullptr;
     static unsigned set = 0;
     const std::lock_guard lock(mutex);
+    if (list_device != device) {
+        list = nullptr;
+        allocator = nullptr;
+        list_device = device;
+    }
     // what the list records is never run: it is begun again now and then
     if (list && ++set % 1024 == 0 &&
         (FAILED(list->Close()) || FAILED(allocator->Reset()) ||
          FAILED(list->Reset(allocator, nullptr))))
         return false;
     if (!list) {
-        if (!allocator && FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+        if (!allocator && FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                                 IID_PPV_ARGS(&allocator))))
             return false;
-        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator, nullptr,
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
                                              IID_PPV_ARGS(&list))))
             return false;
     }
-    if (signature)
-        list->SetComputeRootSignature(signature);
+    if (signature) {
+        if (graphics)
+            list->SetGraphicsRootSignature(signature);
+        else
+            list->SetComputeRootSignature(signature);
+    }
     if (host_set_pipeline(list, state))
         return false;
     // what the driver had of the list is not to be trusted after that
@@ -6312,6 +6346,16 @@ void STDMETHODCALLTYPE resource_barrier(void *self, UINT count,
     std::vector<D3D12_RESOURCE_BARRIER> host(barriers, barriers + (barriers ? count : 0));
     for (auto &barrier : host)
         if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+            if (barrier.Transition.pResource) {
+                D3D12_HEAP_PROPERTIES heap_props{};
+                if (SUCCEEDED(
+                        barrier.Transition.pResource->GetHeapProperties(&heap_props, nullptr)) &&
+                    (heap_props.Type == D3D12_HEAP_TYPE_UPLOAD ||
+                     heap_props.Type == D3D12_HEAP_TYPE_READBACK)) {
+                    barrier.Transition.StateAfter = barrier.Transition.StateBefore;
+                    continue;
+                }
+            }
             barrier.Transition.StateBefore = host_state(barrier.Transition.StateBefore);
             barrier.Transition.StateAfter = host_state(barrier.Transition.StateAfter);
             // a depth buffer the console also writes otherwise is only one here (host_rules):
@@ -6985,14 +7029,16 @@ void STDMETHODCALLTYPE set_compute_root_signature(void *self, ID3D12RootSignatur
     list->compute_root = signature;
     list->compute_arguments.clear();
     list->compute_ours_bound = false;
-    host_of(self)->SetComputeRootSignature(signature);
+    if (signature)
+        host_of(self)->SetComputeRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_graphics_root_signature(void *self, ID3D12RootSignature *signature) {
     auto *const list = static_cast<ListProxy *>(self);
     list->graphics_root = signature;
     list->graphics_arguments.clear();
     list->ours_bound = false;
-    host_of(self)->SetGraphicsRootSignature(signature);
+    if (signature)
+        host_of(self)->SetGraphicsRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
                                               D3D12_GPU_DESCRIPTOR_HANDLE table) {
@@ -7051,7 +7097,7 @@ void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
     list->argument(parameter) = {1, table.ptr, {}};
     decode_table(list->graphics_root, parameter, table.ptr);
     bind_heap_of(self, table.ptr);
-    if (!list->ours_bound)
+    if (!list->ours_bound && list->graphics_root && table_parameter(list->graphics_root, parameter))
         host_of(self)->SetGraphicsRootDescriptorTable(
             parameter, host_gpu(list, table, table_span(list->graphics_root, parameter)));
 }
@@ -7072,8 +7118,10 @@ void keep_constants(ListProxy *list, bool compute, UINT parameter, UINT count, c
 // driver writes over the next parameter's.
 void host_constants(ListProxy *list, bool compute, UINT parameter, UINT count, const void *data,
                     UINT offset, void *from) {
-    const auto room = constants_room(compute ? list->compute_root : list->graphics_root, parameter,
-                                     offset, count);
+    auto *const root = compute ? list->compute_root : list->graphics_root;
+    if (!root)
+        return;
+    const auto room = constants_room(root, parameter, offset, count);
     if (room < count)
         if (static std::atomic<int> told{0}; told++ < 4) {
             std::fprintf(stderr,
@@ -8964,16 +9012,20 @@ void configure_lists() {
     };
     list_vtable[console == Target::durango ? 110 : 111] =
         reinterpret_cast<Slot>(&write_buffer_immediate);
+    list_vtable[83] = reinterpret_cast<Slot>(&copy_texture_region_x);
+    list_vtable[59] = reinterpret_cast<Slot>(&execute_indirect);
+    // SetPredicationBufferX: nothing is drawn by a predicate here
+    ignore({85});
+    // ID3D12GraphicsCommandList7::Barrier, in the lists of a title built with a later kit
+    list_vtable[144] = reinterpret_cast<Slot>(&barrier_by_layout<144>);
+    list_vtable[146] = reinterpret_cast<Slot>(&barrier_by_layout<146>);
+    if (std::getenv("XV_D3D_NO_QUERIES"))
+        ignore({28, 29, 30});
     if (console == Target::durango) {
         // PrefetchMemoryX and PrefetchPipelineStateX
         ignore({98, 99});
         return;
     }
-    list_vtable[83] = reinterpret_cast<Slot>(&copy_texture_region_x);
-    // XV_D3D_NO_QUERIES: no queries (BeginQuery, EndQuery, ResolveQueryData), which the
-    // debug layer does not get through with some titles
-    if (std::getenv("XV_D3D_NO_QUERIES"))
-        ignore({28, 29, 30});
     list_vtable[98] = reinterpret_cast<Slot>(&dispatch_mesh_x);
     list_vtable[127] = reinterpret_cast<Slot>(&dispatch_mesh);
     for (std::size_t slot = 117; slot <= 121; ++slot)
@@ -8981,12 +9033,6 @@ void configure_lists() {
     // DriverHintX, the counters, and the binning of primitive batches
     ignore({99, 100, 101, 102, 103, 104});
     list_vtable[113] = reinterpret_cast<Slot>(&begin_render_pass);
-    // SetPredicationBufferX: nothing is drawn by a predicate here
-    ignore({85});
-    // ID3D12GraphicsCommandList7::Barrier, in the lists of a title built with a later kit
-    list_vtable[144] = reinterpret_cast<Slot>(&barrier_by_layout<144>);
-    list_vtable[146] = reinterpret_cast<Slot>(&barrier_by_layout<146>);
-    list_vtable[59] = reinterpret_cast<Slot>(&execute_indirect);
 }
 // XV_D3D_LOST: every method of a list looks whether the host still has the device
 template <std::size_t Index>

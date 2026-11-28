@@ -875,6 +875,55 @@ std::span<const std::uint8_t> rectangle_shader(Bytes vertex, bool sm50) {
         .first->second;
 }
 
+std::span<const std::uint8_t> quad_shader(Bytes vertex, bool sm50) {
+    auto outputs = signature(vertex, "OSG1");
+    if (outputs.empty())
+        outputs = signature(vertex, "OSGN");
+    if (outputs.empty())
+        return {};
+    std::string source = hlsl_struct("Vertex", outputs, false) +
+                         "[maxvertexcount(4)] void main(lineadj Vertex input[4], inout "
+                         "TriangleStream<Vertex> stream) {\n"
+                         "    stream.Append(input[0]);\n    stream.Append(input[1]);\n"
+                         "    stream.Append(input[3]);\n    stream.Append(input[2]);\n}\n";
+    static std::mutex quads_mutex;
+    static std::map<std::string, std::vector<std::uint8_t>> quads;
+    const std::lock_guard lock(quads_mutex);
+    const bool newer = !sm50 && !part(vertex, "DXIL").empty();
+    const auto key = (sm50 ? "50" : newer ? "6" : "5") + source;
+    if (const auto found = quads.find(key); found != quads.end())
+        return found->second;
+    if (sm50) {
+        static const auto fn = [] {
+            const auto lib =
+                LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            return lib ? reinterpret_cast<Compile>(GetProcAddress(lib, "D3DCompile")) : nullptr;
+        }();
+        std::vector<std::uint8_t> bytes;
+        IUnknown *code = nullptr, *errors = nullptr;
+        if (fn) {
+            const auto st = _mm_getcsr();
+            _mm_setcsr(0x1f80);
+            const auto hr = fn(source.data(), source.size(), "quad_gs", nullptr, nullptr, "main",
+                               "gs_5_0", 0, 0, &code, &errors);
+            _mm_setcsr(st);
+            if (SUCCEEDED(hr) && code) {
+                auto *const blob = static_cast<Blob *>(code);
+                const auto *const p = static_cast<const std::uint8_t *>(blob->GetBufferPointer());
+                bytes.assign(p, p + blob->GetBufferSize());
+            }
+            if (code)
+                code->Release();
+            if (errors)
+                errors->Release();
+        }
+        return quads.emplace(key, std::move(bytes)).first->second;
+    }
+    return quads
+        .emplace(key, compile_now(ShaderStage::geometry_lines, source, true, nullptr, true, newer))
+        .first->second;
+}
+
 std::string shader_signature(Bytes container) {
     std::string text = console_only_shader(container) ? "(console code only) " : "";
     for (const auto *name : {"ISG1", "OSG1"}) {

@@ -234,14 +234,29 @@ dependency_directories(const std::filesystem::path &package) {
 
 std::filesystem::path detail::title_dll(const std::filesystem::path &directory,
                                         std::string_view module) {
-    const auto name = lower(module);
+    auto name = lower(module);
     if (directory.empty() || name.empty() || name.find_first_of("\\/:") != std::string::npos)
         return {};
+    if (name.find('.') == std::string::npos)
+        name += ".dll";
     const auto root = package_directory(directory);
     std::error_code error;
     for (auto folder = directory;; folder = folder.parent_path()) {
         if (std::filesystem::is_regular_file(folder / name, error))
             return folder / name;
+        for (const auto *sub : {"Data/Plugins", "Data/Plugins/x86_64", "Plugins", "Plugins/x86_64"})
+            if (std::filesystem::is_regular_file(folder / sub / name, error))
+                return folder / sub / name;
+        for (const auto &entry : std::filesystem::directory_iterator(folder, error)) {
+            if (!entry.is_directory(error))
+                continue;
+            const auto dir_name = lower(entry.path().filename().string());
+            if (dir_name.ends_with("_data")) {
+                for (const auto *sub : {"Plugins", "Plugins/x86_64"})
+                    if (std::filesystem::is_regular_file(entry.path() / sub / name, error))
+                        return entry.path() / sub / name;
+            }
+        }
         if (folder == root || folder == folder.parent_path())
             break;
     }

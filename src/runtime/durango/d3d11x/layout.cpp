@@ -275,6 +275,7 @@ std::map<SliceCbKey, std::pair<ID3D11Buffer *, UINT>> slice_cbs;
 std::mutex rect_gs_mutex;
 std::map<ID3D11VertexShader *, std::vector<std::uint8_t>> vs_bytecodes;
 std::map<ID3D11VertexShader *, ID3D11GeometryShader *> rect_geometry_shaders;
+std::map<ID3D11VertexShader *, ID3D11GeometryShader *> quad_geometry_shaders;
 std::map<void *, bool> rect_gs_bound;
 
 HRESULT STDMETHODCALLTYPE create_vertex_shader(void *self, const void *code, SIZE_T size,
@@ -461,6 +462,39 @@ HRESULT STDMETHODCALLTYPE create_shader_resource_view(void *self, void *resource
         retry.Format = depth_family_format(host, false);
         if (retry.Format != DXGI_FORMAT_UNKNOWN && retry.Format != desc->Format)
             result = device->CreateShaderResourceView(host, &retry, view ? &created : nullptr);
+    }
+    if (result == E_INVALIDARG && desc && desc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D &&
+        desc->Format != DXGI_FORMAT_UNKNOWN) {
+        if (ID3D11Texture2D *tex = nullptr; host && SUCCEEDED(host->QueryInterface(&tex))) {
+            D3D11_TEXTURE2D_DESC of{};
+            tex->GetDesc(&of);
+            tex->Release();
+            if (of.SampleDesc.Count > 1 || of.Format != desc->Format) {
+                const std::uint64_t zero = 0;
+                const D3D11_SUBRESOURCE_DATA init{&zero, 8, 8};
+                D3D11_TEXTURE2D_DESC dummy{1,
+                                           1,
+                                           1,
+                                           1,
+                                           desc->Format,
+                                           {1, 0},
+                                           D3D11_USAGE_DEFAULT,
+                                           D3D11_BIND_SHADER_RESOURCE,
+                                           0,
+                                           0};
+                ID3D11Texture2D *fallback = nullptr;
+                if (SUCCEEDED(device->CreateTexture2D(&dummy, &init, &fallback)) && fallback) {
+                    D3D11_SHADER_RESOURCE_VIEW_DESC fallback_desc{};
+                    fallback_desc.Format = desc->Format;
+                    fallback_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    fallback_desc.Texture2D.MostDetailedMip = 0;
+                    fallback_desc.Texture2D.MipLevels = 1;
+                    result = device->CreateShaderResourceView(fallback, &fallback_desc,
+                                                              view ? &created : nullptr);
+                    fallback->Release();
+                }
+            }
+        }
     }
     if (FAILED(result)) {
         D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -1616,25 +1650,28 @@ void apply_context_state(void *self) {
         static_cast<ID3D11PixelShader *>(unwrap(state::read<void *>(self, state::pixel_shader))),
         nullptr, 0);
     const auto value = state::read<std::uint64_t>(self, state::topology);
-    const bool is_rect =
-        (value & 0xffffffffull) == 0xc0009e00ull && ((value >> 37) & 0x3full) == 0x11ull;
-    if (is_rect) {
-        host->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const auto prim = (value & 0xffffffffull) == 0xc0009e00ull ? ((value >> 37) & 0x3full) : 0ull;
+    if (prim == 0x11ull || prim == 0x13ull) {
+        const bool quad = prim == 0x13ull;
+        host->IASetPrimitiveTopology(quad ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ
+                                          : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D11GeometryShader *gs = nullptr;
         if (vs) {
             const std::lock_guard lock(rect_gs_mutex);
-            const auto existing = rect_geometry_shaders.find(vs);
-            if (existing != rect_geometry_shaders.end()) {
+            auto &cache = quad ? quad_geometry_shaders : rect_geometry_shaders;
+            const auto existing = cache.find(vs);
+            if (existing != cache.end()) {
                 gs = existing->second;
             } else if (const auto code = vs_bytecodes.find(vs); code != vs_bytecodes.end()) {
-                const auto made = modules::rectangle_shader(code->second, true);
+                const auto made = quad ? modules::quad_shader(code->second, true)
+                                       : modules::rectangle_shader(code->second, true);
                 if (!made.empty()) {
                     ID3D11Device *dev = nullptr;
                     host->GetDevice(&dev);
                     dev->CreateGeometryShader(made.data(), made.size(), nullptr, &gs);
                     dev->Release();
                 }
-                rect_geometry_shaders[vs] = gs;
+                cache[vs] = gs;
             }
             rect_gs_bound[self] = true;
         }
@@ -1648,11 +1685,18 @@ void apply_context_state(void *self) {
             host->GSSetShader(nullptr, nullptr, 0);
         }
     }
+    bool matched = false;
     for (std::size_t topology = 1; topology < std::size(state::topologies); ++topology)
         if (state::topologies[topology] == value && value != state::topologies[0]) {
             host->IASetPrimitiveTopology(static_cast<D3D11_PRIMITIVE_TOPOLOGY>(topology));
+            matched = true;
             break;
         }
+    if (!matched && value && value != state::topologies[0]) {
+        if (static std::atomic<int> shown{0}; shown++ < 4)
+            std::fprintf(stderr, "[Runtime] unknown console topology word 0x%llx\n",
+                         static_cast<unsigned long long>(value));
+    }
 }
 // DrawIndexed through the in-object table: (index count << 32 | first index, base vertex)
 void STDMETHODCALLTYPE draw_indexed(void *self, UINT64 count_and_start, INT base_vertex) {

@@ -67,6 +67,7 @@ std::vector<std::uint8_t> console_program_shader(ShaderStage stage,
 // outputs it passes on. Empty if none could be made.
 std::span<const std::uint8_t> rectangle_shader(std::span<const std::uint8_t> vertex,
                                                bool sm50 = false);
+std::span<const std::uint8_t> quad_shader(std::span<const std::uint8_t> vertex, bool sm50 = false);
 // the inputs and outputs of a shader, by semantic, for a line of a log
 std::string shader_signature(std::span<const std::uint8_t> container);
 // The host's shader for it, from the cache or made now. It stays where it is for as long

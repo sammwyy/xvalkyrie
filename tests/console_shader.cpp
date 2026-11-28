@@ -310,9 +310,14 @@ TEST_CASE("a rectangle list's fourth corner comes from a geometry shader") {
         {static_cast<const std::uint8_t *>(code->GetBufferPointer()), code->GetBufferSize()}, true);
     REQUIRE(sm50.size() > 4);
     CHECK(!std::memcmp(sm50.data(), "DXBC", 4));
+    const auto quad50 = quad_shader(
+        {static_cast<const std::uint8_t *>(code->GetBufferPointer()), code->GetBufferSize()}, true);
+    REQUIRE(quad50.size() > 4);
+    CHECK(!std::memcmp(quad50.data(), "DXBC", 4));
     code->Release();
     const std::uint8_t nothing[16] = {};
     CHECK(rectangle_shader(nothing).empty());
+    CHECK(quad_shader(nothing).empty());
 }
 
 TEST_CASE("a pixel DPP8 move can rearrange the four lanes of each quad") {
