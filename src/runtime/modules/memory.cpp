@@ -133,6 +133,10 @@ void release_page(Physical &state, ULONG_PTR number) {
                      static_cast<unsigned long long>(state.where.find(number)->second), 10);
         std::fflush(stderr);
     }
+    if (state.view)
+        VirtualAlloc(state.view + number * page, page, MEM_RESET, PAGE_READWRITE);
+    for (auto [at, end] = state.mapped_at.equal_range(number); at != end; ++at)
+        VirtualAlloc(reinterpret_cast<void *>(at->second), page, MEM_RESET, PAGE_READWRITE);
     state.used[number] = false;
     state.dirty[number] = true;
 }
@@ -155,6 +159,8 @@ void unmap(Physical &state, Reservation &reservation, std::uintptr_t address,
     const auto view = reservation.views.find(address);
     if (view == reservation.views.end())
         return;
+    if (view->second.owned)
+        VirtualAlloc(reinterpret_cast<void *>(address), page, MEM_RESET, PAGE_READWRITE);
     UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void *>(address),
                      MEM_PRESERVE_PLACEHOLDER);
     if (state.check) {

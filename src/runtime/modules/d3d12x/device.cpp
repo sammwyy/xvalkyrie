@@ -12004,8 +12004,74 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         }
     }
     ID3D12Device *host = nullptr;
-    const auto result =
-        create ? create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)) : E_NOTIMPL;
+    HRESULT result = E_NOTIMPL;
+    if (create) {
+        IDXGIFactory6 *factory = nullptr;
+        IDXGIAdapter1 *chosen = nullptr;
+        int best_score = -1;
+        if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) && factory) {
+            IDXGIAdapter1 *candidate = nullptr;
+            for (UINT idx = 0; SUCCEEDED(factory->EnumAdapterByGpuPreference(
+                     idx, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate)));
+                 ++idx, candidate = nullptr) {
+                DXGI_ADAPTER_DESC1 desc{};
+                candidate->GetDesc1(&desc);
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+                    candidate->Release();
+                    continue;
+                }
+                ID3D12Device *probe = nullptr;
+                if (FAILED(create(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&probe))) ||
+                    !probe) {
+                    candidate->Release();
+                    continue;
+                }
+                D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
+                const bool sm66 = SUCCEEDED(probe->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,
+                                                                       &sm, sizeof sm)) &&
+                                  sm.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
+                D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+                const bool mesh = SUCCEEDED(probe->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7,
+                                                                       &opt7, sizeof opt7)) &&
+                                  opt7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
+                probe->Release();
+                const int score = (mesh ? 4 : 0) + (sm66 ? 2 : 0) + (idx == 0 ? 1 : 0);
+                if (score > best_score) {
+                    if (chosen)
+                        chosen->Release();
+                    chosen = candidate;
+                    best_score = score;
+                    if (mesh && sm66)
+                        break;
+                } else {
+                    candidate->Release();
+                }
+            }
+            factory->Release();
+        }
+        if (chosen) {
+            DXGI_ADAPTER_DESC1 desc{};
+            chosen->GetDesc1(&desc);
+            result = create(chosen, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host));
+            if (SUCCEEDED(result) && host) {
+                D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
+                host->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm);
+                D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+                host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opt7, sizeof opt7);
+                std::fprintf(stderr,
+                             "[Runtime] Direct3D 12 adapter: %ls (%llu MiB VRAM, SM %u.%u, mesh "
+                             "tier %u)\n",
+                             desc.Description,
+                             static_cast<unsigned long long>(desc.DedicatedVideoMemory >> 20),
+                             (static_cast<unsigned>(sm.HighestShaderModel) >> 4) & 0xf,
+                             static_cast<unsigned>(sm.HighestShaderModel) & 0xf,
+                             static_cast<unsigned>(opt7.MeshShaderTier));
+            }
+            chosen->Release();
+        }
+        if (FAILED(result))
+            result = create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host));
+    }
     if (SUCCEEDED(result)) {
         d3d12_device = host;
         graphics::drawing_with("Direct3D 12");

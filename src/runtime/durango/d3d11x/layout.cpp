@@ -11,6 +11,7 @@
 #include "runtime/modules/placement.hpp"
 #include "runtime/modules/watchdog.hpp"
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -148,7 +149,40 @@ HRESULT STDMETHODCALLTYPE create_texture2d(void *self, const D3D11_TEXTURE2D_DES
             host.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
     }
     ID3D11Texture2D *created = nullptr;
-    const auto result = device->CreateTexture2D(&host, initial, texture ? &created : nullptr);
+    auto result = device->CreateTexture2D(&host, initial, texture ? &created : nullptr);
+    while (result == E_OUTOFMEMORY && (host.Width > 4 || host.Height > 4)) {
+        const UINT orig_mips =
+            host.MipLevels
+                ? host.MipLevels
+                : 1u + static_cast<UINT>(std::bit_width(std::max(host.Width, host.Height)) - 1);
+        host.Width = std::max(host.Width >> 1, 1u);
+        host.Height = std::max(host.Height >> 1, 1u);
+        if (host.MipLevels > 1)
+            --host.MipLevels;
+        const bool block_fmt =
+            (host.Format >= DXGI_FORMAT_BC1_TYPELESS && host.Format <= DXGI_FORMAT_BC5_SNORM) ||
+            (host.Format >= DXGI_FORMAT_BC6H_TYPELESS && host.Format <= DXGI_FORMAT_BC7_UNORM_SRGB);
+        if (block_fmt && (host.Width < 4 || host.Height < 4)) {
+            host.Width = std::max(host.Width, 4u);
+            host.Height = std::max(host.Height, 4u);
+            host.MipLevels = 1;
+        }
+        std::vector<D3D11_SUBRESOURCE_DATA> shifted;
+        const D3D11_SUBRESOURCE_DATA *sub_init = nullptr;
+        if (initial && orig_mips > (host.MipLevels ? host.MipLevels : 1u)) {
+            const UINT new_mips = host.MipLevels ? host.MipLevels : 1u;
+            const UINT drop = orig_mips - new_mips;
+            const UINT slices = std::max(host.ArraySize, 1u);
+            shifted.reserve(std::size_t{slices} * new_mips);
+            for (UINT s = 0; s < slices; ++s)
+                for (UINT m = 0; m < new_mips; ++m)
+                    shifted.push_back(initial[s * orig_mips + drop + m]);
+            sub_init = shifted.data();
+        }
+        result = device->CreateTexture2D(&host, sub_init, texture ? &created : nullptr);
+        if (host.Width <= 4 && host.Height <= 4)
+            break;
+    }
     if (FAILED(result)) {
         std::fprintf(stderr,
                      "[Runtime] CreateTexture2D %ux%u mips %u array %u format %u samples %u/%u "
