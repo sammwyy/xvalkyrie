@@ -2259,16 +2259,38 @@ class Translator {
                 }
                 return resource;
             }
-            if (known.dynamic >= 0)
-                give_up("a descriptor of a table picked while the shader runs");
             const auto in = table_register_.find(known.value);
+            if (in == table_register_.end())
+                give_up("a descriptor of a table with no register");
+            if (known.dynamic >= 0) {
+                bool readable = false, writable = false, constants = false, sampler = false;
+                for (const auto &range : ranges) {
+                    readable |= range.type == 0;
+                    writable |= range.type == 1;
+                    constants |= range.type == 2;
+                    sampler |= range.type == 3;
+                }
+                resource.type = sampler && !readable && !writable && !constants ? 3u
+                                : constants && !readable && !writable           ? 2u
+                                : facts_.written.count(known.origin)            ? 1u
+                                : (!readable && writable)                       ? 1u
+                                                                                : 0u;
+                resource.loaded = true;
+                return resource;
+            }
             for (const auto &bound : bound_)
-                if (bound.offset == known.offset && in != table_register_.end() &&
-                    bound.reg == in->second) {
-                    if (bound.type == 3)
-                        give_up("a sampler of a table");
+                if (bound.offset == known.offset && bound.reg == in->second) {
                     resource.type = bound.type;
-                    resource.reg = known.offset / 32;
+                    resource.reg = known.offset / (bound.type == 3 ? 16 : 32);
+                    resource.loaded = true;
+                    return resource;
+                }
+            const auto index = known.offset / descriptor_size(known.value);
+            for (const auto &range : ranges)
+                if (index >= range.offset &&
+                    (range.count == ~0u || index - range.offset < range.count)) {
+                    resource.type = range.type;
+                    resource.reg = index;
                     resource.loaded = true;
                     return resource;
                 }
@@ -2380,14 +2402,19 @@ class Translator {
                                   true};
         }
         if (resource.heap && resource.dynamic >= 0) {
-            // by its byte offset in the heap, which is known where it is used
+            // by its byte offset in the heap or table, which is known where it is used
             const auto name = "h" + std::to_string(temporaries_++);
             uses_heap_ = needs_sm6_ = true;
+            std::string idx = "(d" + std::to_string(resource.dynamic) +
+                              (resource.type == 3 ? " >> 4)" : " >> 5)");
+            if (!heap_parameter_.count(resource.parameter)) {
+                const auto slot = table_register_[resource.parameter] - user_first();
+                idx = "xv_ud" + std::to_string(slot) + " + " + idx;
+            }
             line(type + " " + name + " = " +
-                 (resource.type == 3 ? "SamplerDescriptorHeap[NonUniformResourceIndex(min(d"
-                                     : "ResourceDescriptorHeap[NonUniformResourceIndex(min(d") +
-                 std::to_string(resource.dynamic) +
-                 (resource.type == 3 ? " >> 4, 2047u))];" : " >> 5, 999999u))];"));
+                 (resource.type == 3 ? "SamplerDescriptorHeap[NonUniformResourceIndex(min("
+                                     : "ResourceDescriptorHeap[NonUniformResourceIndex(min(") +
+                 idx + (resource.type == 3 ? ", 2047u))];" : ", 999999u))];"));
             return name;
         }
         if (resource.heap && heap_parameter_.count(resource.parameter)) {
@@ -2423,6 +2450,9 @@ class Translator {
             const auto slot = table_register_[resource.parameter] - user_first();
             auto name = std::string("h") + letter + std::to_string(slot) + "_" +
                         std::to_string(resource.reg);
+            const char *const heap_name = resource.type == 3 ? "SamplerDescriptorHeap[min(xv_ud"
+                                                             : "ResourceDescriptorHeap[min(xv_ud";
+            const char *const max_idx = resource.type == 3 ? "u, 2047u)];\n" : "u, 999999u)];\n";
             const auto found = declared_.find(name);
             if (found != declared_.end()) {
                 if (found->second == type)
@@ -2433,16 +2463,14 @@ class Translator {
                 const auto alt_name = name + "_" + std::to_string(temporaries_++);
                 declared_[alt_key] = alt_name;
                 uses_heap_ = needs_sm6_ = true;
-                prologue_ += "    " + type + " " + alt_name +
-                             " = ResourceDescriptorHeap[min(xv_ud" + std::to_string(slot) + " + " +
-                             std::to_string(resource.reg) + "u, 999999u)];\n";
+                prologue_ += "    " + type + " " + alt_name + " = " + heap_name +
+                             std::to_string(slot) + " + " + std::to_string(resource.reg) + max_idx;
                 return alt_name;
             }
             declared_[name] = type;
             uses_heap_ = needs_sm6_ = true;
-            prologue_ += "    " + type + " " + name + " = ResourceDescriptorHeap[min(xv_ud" +
-                         std::to_string(slot) + " + " + std::to_string(resource.reg) +
-                         "u, 999999u)];\n";
+            prologue_ += "    " + type + " " + name + " = " + heap_name + std::to_string(slot) +
+                         " + " + std::to_string(resource.reg) + max_idx;
             return name;
         }
         if (resource.dynamic < 0) {

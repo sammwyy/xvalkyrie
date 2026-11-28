@@ -224,3 +224,71 @@ TEST_CASE("a list's copies, fills and values in memory are done when it runs, in
     CHECK(memory[64] == 9);
     VirtualFree(memory, 0, MEM_RELEASE);
 }
+
+TEST_CASE("a copy queue executes both DMA command lists and copy lists with shader transitions") {
+    if (!device())
+        return;
+    std::uint64_t src_addr = 0, dst_addr = 0;
+    auto *const src = buffer(4096, src_addr, D3D12_HEAP_TYPE_UPLOAD);
+    auto *const dst = buffer(4096, dst_addr);
+    const std::uint32_t v0 = 0xdeadbeefu, v1 = 0xcafebabeu;
+    std::memcpy(reinterpret_cast<void *>(src_addr), &v0, 4);
+    std::memcpy(reinterpret_cast<void *>(src_addr + 4), &v1, 4);
+
+    // CreateCommandQueueX (48) with D3D12_COMMAND_LIST_TYPE_COPY (3), engine 1
+    const UINT qdesc[4]{D3D12_COMMAND_LIST_TYPE_COPY, 0, 1, 0};
+    void *copy_queue = nullptr;
+    REQUIRE(title().call(device(), 48, qdesc, &__uuidof(ID3D12CommandQueue), &copy_queue) == S_OK);
+    REQUIRE(copy_queue);
+    D3D12_COMMAND_QUEUE_DESC got_qdesc{};
+    title().call<D3D12_COMMAND_QUEUE_DESC *>(copy_queue, 26, &got_qdesc);
+    CHECK(got_qdesc.Type == D3D12_COMMAND_LIST_TYPE_COPY);
+
+    // CreateCommandListX (73) with DMA list type (16), submitted on the COPY queue
+    const UINT dma_desc[4]{16, 2, 0, 0};
+    void *dma_list = nullptr;
+    REQUIRE(title().call(device(), 73, dma_desc, static_cast<ID3D12CommandAllocator *>(nullptr),
+                         static_cast<ID3D12PipelineState *>(nullptr), &__uuidof(ID3D12CommandList),
+                         &dma_list) == S_OK);
+    REQUIRE(dma_list);
+    // DMA CopyBufferRegion (11) and Close (9)
+    title().call<void>(dma_list, 11, dst, UINT64{0}, src, UINT64{0}, UINT64{4});
+    CHECK(title().call(dma_list, 9) == S_OK);
+
+    // Also a COPY command list (CreateCommandList1 at slot 90, + allocator at 9 + Reset at 10)
+    ID3D12CommandAllocator *copy_alloc = nullptr;
+    REQUIRE(title().call(device(), 9, UINT{D3D12_COMMAND_LIST_TYPE_COPY},
+                         &__uuidof(ID3D12CommandAllocator),
+                         reinterpret_cast<void **>(&copy_alloc)) == S_OK);
+    void *copy_list = nullptr;
+    REQUIRE(title().call(device(), 90, 0u, D3D12_COMMAND_LIST_TYPE_COPY,
+                         D3D12_COMMAND_LIST_FLAG_NONE, &__uuidof(ID3D12GraphicsCommandList),
+                         &copy_list) == S_OK);
+    CHECK(title().call<UINT>(copy_list, 8) == D3D12_COMMAND_LIST_TYPE_COPY);
+    REQUIRE(title().call(copy_list, 10, copy_alloc, static_cast<ID3D12PipelineState *>(nullptr)) ==
+            S_OK);
+    title().call<void>(copy_list, 15, dst, UINT64{4}, src, UINT64{4}, UINT64{4});
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    title().call<void>(copy_list, 26, 1u, &barrier);
+    CHECK(title().call(copy_list, 9) == S_OK);
+
+    void *const lists[]{dma_list, copy_list};
+    title().call<void>(copy_queue, 10, 2u, lists);
+    auto *const done = fence();
+    REQUIRE(title().call(copy_queue, 14, done, UINT64{1}) == S_OK);
+    CHECK(reaches(done, 1, 10000));
+    CHECK(removed_reason() == S_OK);
+    CHECK(words(dst_addr)[0] == v0);
+    CHECK(words(dst_addr)[1] == v1);
+
+    done->Release();
+    static_cast<IUnknown *>(copy_list)->Release();
+    copy_alloc->Release();
+    static_cast<IUnknown *>(dma_list)->Release();
+    static_cast<IUnknown *>(copy_queue)->Release();
+    dst->Release();
+    src->Release();
+}

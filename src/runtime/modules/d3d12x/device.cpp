@@ -794,8 +794,9 @@ std::vector<ID3D12Resource *> written_textures() {
 namespace {
 // Before a direct queue runs lists: each texture whose memory of ours (scratch_memory) the
 // title wrote since the last time gets that memory copied in, on that queue, first.
+bool is_direct_queue(ID3D12CommandQueue *queue);
 void upload_scratch(ID3D12CommandQueue *queue) {
-    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+    if (!is_direct_queue(queue))
         return;
     struct Written {
         ID3D12Resource *texture, *upload;
@@ -4894,20 +4895,31 @@ std::filesystem::path driver_blob_path(std::uint64_t key) {
     std::snprintf(name, sizeof name, "%016llx.pso", static_cast<unsigned long long>(key));
     return folder / "driver" / name;
 }
+HRESULT call_create_pso(HRESULT (*invoke)(void *), void *context) {
+    __try {
+        return invoke(context);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        return E_FAIL;
+    }
+}
 // `create` makes the pipeline with `cached` as its cached form
 template <class Create>
 HRESULT with_driver_blob(std::uint64_t key, D3D12_CACHED_PIPELINE_STATE &cached, void **state,
                          Create create) {
+    const auto safe_create = [&] {
+        return call_create_pso(+[](void *ctx) { return (*static_cast<Create *>(ctx))(); }, &create);
+    };
     const auto path = driver_blob_path(key);
     if (path.empty() || cached.pCachedBlob)
-        return create();
+        return safe_create();
     std::error_code error;
     if (std::ifstream file(path, std::ios::binary | std::ios::ate); file) {
         std::vector<char> blob(static_cast<std::size_t>(std::max<std::streamoff>(file.tellg(), 0)));
         file.seekg(0);
         if (!blob.empty() && file.read(blob.data(), static_cast<std::streamsize>(blob.size()))) {
             cached = {blob.data(), blob.size()};
-            const auto result = create();
+            const auto result = safe_create();
             cached = {};
             if (SUCCEEDED(result)) {
                 ++driver_blobs.given;
@@ -4919,7 +4931,7 @@ HRESULT with_driver_blob(std::uint64_t key, D3D12_CACHED_PIPELINE_STATE &cached,
         std::filesystem::remove(path, error);
     }
     const auto started = std::chrono::steady_clock::now();
-    const auto result = create();
+    const auto result = safe_create();
     if (FAILED(result) || !state || !*state ||
         std::chrono::steady_clock::now() - started < std::chrono::milliseconds(250))
         return result;
@@ -5347,6 +5359,7 @@ struct QueueProxy {
     Slot *vtable;
     ID3D12CommandQueue *host;
     std::atomic<ULONG> references;
+    D3D12_COMMAND_LIST_TYPE title_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 };
 ID3D12CommandQueue *queue_host(void *self) { return static_cast<QueueProxy *>(self)->host; }
 template <std::size_t Index>
@@ -5402,8 +5415,12 @@ HRESULT STDMETHODCALLTYPE queue_signal_x(void *self, ID3D12Fence *fence, UINT64 
 D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_get_desc(void *self,
                                                            D3D12_COMMAND_QUEUE_DESC *desc) {
     using Get = D3D12_COMMAND_QUEUE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_COMMAND_QUEUE_DESC *);
-    auto *const host = queue_host(self);
-    return reinterpret_cast<Get>((*reinterpret_cast<Slot **>(host))[18])(host, desc);
+    auto *const proxy = static_cast<QueueProxy *>(self);
+    auto *const host = proxy->host;
+    auto *const out = reinterpret_cast<Get>((*reinterpret_cast<Slot **>(host))[18])(host, desc);
+    if (out)
+        out->Type = proxy->title_type;
+    return out;
 }
 // slot 29: CopyPageMappingsBatchX(count, batches, pool, pool pages, flags). A title maps
 // physical pages into a pool of its memory and has the GPU map them into a heap it reserved:
@@ -5539,8 +5556,14 @@ std::array<Slot, 48> layout_queue_vtable_of(std::index_sequence<Index...>) {
     return vtable;
 }
 std::array<Slot, 48> layout_queue_vtable = layout_queue_vtable_of(std::make_index_sequence<34>{});
-void *make_queue_proxy(ID3D12CommandQueue *host) {
-    return new QueueProxy{layout_queue_vtable.data(), host, 1};
+D3D12_COMMAND_LIST_TYPE host_list_type(UINT type) {
+    return type == D3D12_COMMAND_LIST_TYPE_COPY || type == 16
+               ? D3D12_COMMAND_LIST_TYPE_DIRECT
+               : static_cast<D3D12_COMMAND_LIST_TYPE>(type);
+}
+void remember_copy_queue(ID3D12CommandQueue *queue);
+void *make_queue_proxy(ID3D12CommandQueue *host, D3D12_COMMAND_LIST_TYPE title_type) {
+    return new QueueProxy{layout_queue_vtable.data(), host, 1, title_type};
 }
 // slot 48: CreateCommandQueue(desc, iid, queue), by its arguments at Unreal's call site
 HRESULT STDMETHODCALLTYPE create_command_queue(ID3D12Device *self,
@@ -5548,19 +5571,30 @@ HRESULT STDMETHODCALLTYPE create_command_queue(ID3D12Device *self,
                                                void **queue) {
     using Create =
         HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **);
-    const auto result = original<Create>(self, 8)(self, desc, iid, queue);
-    if (FAILED(result) && desc) {
+    D3D12_COMMAND_QUEUE_DESC host_desc{};
+    if (desc) {
+        host_desc = *desc;
+        host_desc.Type = host_list_type(static_cast<UINT>(desc->Type));
+    }
+    const auto result = original<Create>(self, 8)(self, desc ? &host_desc : nullptr, iid, queue);
+    if ((FAILED(result) || std::getenv("XV_D3D_TRACE")) && desc) {
         std::fprintf(stderr,
-                     "[Runtime] CreateCommandQueue type %d priority %d flags 0x%x node 0x%x: "
-                     "0x%08lx%c",
-                     desc->Type, desc->Priority, desc->Flags, desc->NodeMask,
+                     "[Runtime] CreateCommandQueue type %d (host %d) priority %d flags 0x%x node "
+                     "0x%x -> %p: 0x%08lx%c",
+                     desc->Type, host_desc.Type, desc->Priority, desc->Flags, desc->NodeMask,
+                     SUCCEEDED(result) && queue ? *queue : nullptr,
                      static_cast<unsigned long>(result), 10);
         std::fflush(stderr);
     }
     auto *const host =
         SUCCEEDED(result) && queue ? static_cast<ID3D12CommandQueue *>(*queue) : nullptr;
-    if (host)
-        *queue = make_queue_proxy(host);
+    const auto title_type = desc ? desc->Type : D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (host) {
+        if (title_type != D3D12_COMMAND_LIST_TYPE_DIRECT &&
+            host_desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+            remember_copy_queue(host);
+        *queue = make_queue_proxy(host, title_type);
+    }
     if (SUCCEEDED(result) && queue && *queue && desc &&
         desc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
         ID3D12CommandQueue *expected = nullptr;
@@ -5570,15 +5604,17 @@ HRESULT STDMETHODCALLTYPE create_command_queue(ID3D12Device *self,
     return result;
 }
 // CreateCommandQueueX (48): the type, the flags, and which engine and queue of the hardware.
-// The copy engine's queue (type 16) is a direct queue here, whose lists take any transition.
+// Copy and DMA queues (types 3 and 16) are direct queues here: titles execute DMA lists on copy
+// queues and record transitions desktop copy queues refuse.
 HRESULT STDMETHODCALLTYPE create_command_queue_x(ID3D12Device *self, const UINT *desc, REFIID iid,
                                                  void **queue) {
     if (!desc)
         return E_INVALIDARG;
-    const D3D12_COMMAND_QUEUE_DESC host{desc[0] == 16
-                                            ? D3D12_COMMAND_LIST_TYPE_DIRECT
-                                            : static_cast<D3D12_COMMAND_LIST_TYPE>(desc[0]),
-                                        0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(desc[1] & 1), 0};
+    if (std::getenv("XV_D3D_TRACE"))
+        std::fprintf(stderr, "[Runtime] CreateCommandQueueX raw (%u, 0x%x, 0x%x, 0x%x)\n", desc[0],
+                     desc[1], desc[2], desc[3]);
+    const D3D12_COMMAND_QUEUE_DESC host{static_cast<D3D12_COMMAND_LIST_TYPE>(desc[0]), 0,
+                                        static_cast<D3D12_COMMAND_QUEUE_FLAGS>(desc[1] & 1), 0};
     return create_command_queue(self, &host, iid, queue);
 }
 // What the host insists on where the console takes anything: a resource of an upload heap
@@ -5817,6 +5853,7 @@ struct ListProxy {
     // last recordings, as a list may be recorded again while the GPU still runs the last one
     std::deque<std::vector<std::wstring>> marks;
     bool clamp_ring_used = false; // the ring of bounded indirect records moved out of common
+    UINT title_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     RootArgument &argument(UINT parameter, bool compute = false) {
         auto &arguments = compute ? compute_arguments : graphics_arguments;
         if (arguments.size() <= parameter)
@@ -6961,7 +6998,8 @@ void fill_user(ListProxy *list, const HeapUses::Stage &stage,
             }
             // the table's first descriptor in the host's heap, for as many as the shader reads
             if (tables[at]) {
-                UINT span = 1;
+                const void *const root = first == 0 ? list->compute_root : list->graphics_root;
+                UINT span = std::max(1u, table_span(root, entry.slot));
                 for (const auto &use : stage.uses)
                     if (use.reg == entry.reg)
                         span = std::max(span, use.place + 1);
@@ -8171,12 +8209,16 @@ void STDMETHODCALLTYPE clear_uav_float(void *self, D3D12_GPU_DESCRIPTOR_HANDLE g
 }
 void STDMETHODCALLTYPE ignored_list_method(void *) {}
 void STDMETHODCALLTYPE flush_pipeline_x(void *self, UINT, std::uint64_t, std::uint64_t);
+UINT STDMETHODCALLTYPE list_get_type(void *self) {
+    return static_cast<ListProxy *>(self)->title_type;
+}
 template <std::size_t... Index>
 std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     std::array<Slot, list_slots> vtable{reinterpret_cast<Slot>(&list_method<Index>)...};
     vtable[0] = reinterpret_cast<Slot>(&list_query);
     vtable[1] = reinterpret_cast<Slot>(&list_add_ref);
     vtable[2] = reinterpret_cast<Slot>(&list_release);
+    vtable[8] = reinterpret_cast<Slot>(&list_get_type);
     vtable[9] = reinterpret_cast<Slot>(&close_list);
     vtable[10] = reinterpret_cast<Slot>(&reset_list);
     // the later layout's 139 (137 here, see list_by_layout): Reset with one argument more
@@ -8824,7 +8866,7 @@ std::array<Slot, list_slots> checked_list_vtable_of(std::index_sequence<Index...
 }
 std::array<Slot, list_slots> checked_list_vtable =
     checked_list_vtable_of(std::make_index_sequence<list_slots>{});
-void *make_list_proxy(List *host) {
+void *make_list_proxy(List *host, UINT title_type = UINT_MAX) {
     auto *const proxy = new ListProxy{};
     // the slots both layouts share, as they are now
     static const bool filled = [] {
@@ -8840,6 +8882,7 @@ void *make_list_proxy(List *host) {
     }
     proxy->host = host;
     proxy->references = 1;
+    proxy->title_type = title_type == UINT_MAX ? static_cast<UINT>(host->GetType()) : title_type;
     const std::lock_guard lock(proxy_mutex);
     list_proxies.insert(proxy);
     return proxy;
@@ -8980,13 +9023,24 @@ HRESULT STDMETHODCALLTYPE create_command_list(ID3D12Device *self, const UINT *de
                                               ID3D12PipelineState *state, REFIID, void **list) {
     if (!desc || !list)
         return E_INVALIDARG;
-    if (desc[0] == dma_list_type)
-        return make_dma_list(self, list);
+    if (desc[0] == dma_list_type) {
+        const auto result = make_dma_list(self, list);
+        if (std::getenv("XV_D3D_TRACE"))
+            std::fprintf(stderr, "[Runtime] CreateCommandListX DMA (%u, 0x%x, 0x%x) -> %p\n",
+                         desc[0], desc[1], desc[2], SUCCEEDED(result) ? *list : nullptr);
+        return result;
+    }
     List *host = nullptr;
-    const auto result =
-        self->CreateCommandList(desc[2], static_cast<D3D12_COMMAND_LIST_TYPE>(desc[0]), allocator,
-                                host_pipeline(state), IID_PPV_ARGS(&host));
-    *list = SUCCEEDED(result) ? make_list_proxy(host) : nullptr;
+    const auto result = self->CreateCommandList(desc[2], host_list_type(desc[0]), allocator,
+                                                host_pipeline(state), IID_PPV_ARGS(&host));
+    *list = SUCCEEDED(result) ? make_list_proxy(host, desc[0]) : nullptr;
+    if (std::getenv("XV_D3D_TRACE"))
+        std::fprintf(stderr,
+                     "[Runtime] CreateCommandListX type %u flags 0x%x nodes 0x%x allocator %p -> "
+                     "%p (host %p): 0x%08lx\n",
+                     desc[0], desc[1], desc[2], static_cast<void *>(allocator),
+                     SUCCEEDED(result) ? *list : nullptr, static_cast<void *>(host),
+                     static_cast<unsigned long>(result));
     if (FAILED(result)) {
         std::fprintf(stderr,
                      "[Runtime] CreateCommandListX type %u flags 0x%x nodes 0x%x allocator %p: "
@@ -9085,7 +9139,7 @@ struct Uploader {
 std::mutex uploader_mutex;
 void upload_placements_d3d12(ID3D12CommandQueue *queue) {
     // shader resource states are a direct queue's: the uploads wait for one
-    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+    if (!is_direct_queue(queue))
         return;
     auto uploads = take_d3d12_uploads();
     if (uploads.empty())
@@ -9356,8 +9410,20 @@ void note_queue_wait(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value
     const std::lock_guard lock(order_mutex);
     note_wait(queue_orders[queue], fence, value);
 }
+std::set<ID3D12CommandQueue *> copy_queues;
+void remember_copy_queue(ID3D12CommandQueue *queue) {
+    const std::lock_guard lock(order_mutex);
+    copy_queues.insert(queue);
+}
+bool is_direct_queue(ID3D12CommandQueue *queue) {
+    if (!queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return false;
+    const std::lock_guard lock(order_mutex);
+    return !copy_queues.contains(queue);
+}
 void forget_queue(ID3D12CommandQueue *queue) {
     const std::lock_guard lock(order_mutex);
+    copy_queues.erase(queue);
     const auto found = queue_orders.find(queue);
     if (found == queue_orders.end())
         return;
@@ -9410,7 +9476,7 @@ void sync_aliased_textures(ID3D12CommandQueue *queue) {
         const auto *const v = std::getenv("XV_ALIAS_SYNC");
         return v && std::string_view(v) == "0";
     }();
-    if (off || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+    if (off || !is_direct_queue(queue))
         return;
     std::vector<AliasedTexture> items;
     {
@@ -9642,8 +9708,8 @@ HRESULT STDMETHODCALLTYPE ignored_allocator_method(void *) { return S_OK; }
 HRESULT STDMETHODCALLTYPE create_command_allocator(ID3D12Device *self, UINT type, REFIID iid,
                                                    void **allocator) {
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, REFIID, void **);
-    const auto result = original<Create>(self, 9)(
-        self, type == 16 ? D3D12_COMMAND_LIST_TYPE_DIRECT : type, iid, allocator);
+    const auto result =
+        original<Create>(self, 9)(self, static_cast<UINT>(host_list_type(type)), iid, allocator);
     if (SUCCEEDED(result) && allocator && *allocator)
         console_command_allocator(*allocator);
     return result;
@@ -9757,9 +9823,31 @@ HRESULT STDMETHODCALLTYPE create_command_list_desktop(ID3D12Device *self, UINT n
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, D3D12_COMMAND_LIST_TYPE,
                                                 ID3D12CommandAllocator *, ID3D12PipelineState *,
                                                 REFIID, void **);
-    const auto result = original<Create>(self, 12)(self, node, type, allocator,
-                                                   host_pipeline(state), IID_PPV_ARGS(&host));
-    *list = SUCCEEDED(result) ? make_list_proxy(host) : nullptr;
+    const auto result =
+        original<Create>(self, 12)(self, node, host_list_type(static_cast<UINT>(type)), allocator,
+                                   host_pipeline(state), IID_PPV_ARGS(&host));
+    *list = SUCCEEDED(result) ? make_list_proxy(host, static_cast<UINT>(type)) : nullptr;
+    if (std::getenv("XV_D3D_TRACE"))
+        std::fprintf(stderr,
+                     "[Runtime] CreateCommandList node %u type %d allocator %p -> %p (host %p): "
+                     "0x%08lx\n",
+                     node, static_cast<int>(type), static_cast<void *>(allocator),
+                     SUCCEEDED(result) ? *list : nullptr, static_cast<void *>(host),
+                     static_cast<unsigned long>(result));
+    return result;
+}
+HRESULT STDMETHODCALLTYPE create_command_list_1(ID3D12Device *self, UINT node,
+                                                D3D12_COMMAND_LIST_TYPE type,
+                                                D3D12_COMMAND_LIST_FLAGS flags, REFIID,
+                                                void **list) {
+    if (!list)
+        return E_POINTER;
+    List *host = nullptr;
+    using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, D3D12_COMMAND_LIST_TYPE,
+                                                D3D12_COMMAND_LIST_FLAGS, REFIID, void **);
+    const auto result = original<Create>(self, 51)(
+        self, node, host_list_type(static_cast<UINT>(type)), flags, IID_PPV_ARGS(&host));
+    *list = SUCCEEDED(result) ? make_list_proxy(host, static_cast<UINT>(type)) : nullptr;
     return result;
 }
 // The console's ID3D12Device goes on past the desktop's 44 methods with its own. Those not
@@ -11815,6 +11903,7 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         for (std::size_t slot = 105; slot <= 112; ++slot)
             overrides.push_back({slot, later[slot - 84]});
         overrides.push_back({86, reinterpret_cast<Slot>(&deferred_pipeline_state)});
+        overrides.push_back({90, reinterpret_cast<Slot>(&create_command_list_1)});
         overrides.push_back({108, reinterpret_cast<Slot>(&resource_allocation_info_2)});
         overrides.push_back({109, reinterpret_cast<Slot>(&create_committed_resource_2)});
         overrides.push_back({111, reinterpret_cast<Slot>(&create_feedback_view)});

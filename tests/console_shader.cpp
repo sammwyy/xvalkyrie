@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <d3d12.h>
 #include <d3dcompiler.h>
 #include <filesystem>
 #include <fstream>
@@ -493,4 +494,58 @@ TEST_CASE("a start reads only the journal's entries its index does not know") {
     std::filesystem::remove(journal / "index.txt");
     CHECK(run() == 1);
     std::filesystem::remove_all(folder);
+}
+
+TEST_CASE("a heap shader indexes dynamic table views and sampler tables in the descriptor heaps") {
+    // s_load_dwordx8 s[12:19], s[8:9], s9; s_load_dwordx4 s[24:27], s[10:11], 0x20;
+    // image_get_lod v[0:1], v[0:1], s[12:19], s[24:27] dmask:0x3 dim:SQ_RSRC_IMG_2D;
+    // exp mrt0 v0, v1, off, off done vm
+    const std::uint32_t code[] = {0xf40c0304, 0x12000000, 0xf4080605, 0xfa000020, 0xf1800308,
+                                  0x00c30000, 0xf8001803, 0x00000100, end_program};
+    constexpr std::size_t region = 0x140, header = 0x28;
+    std::vector<std::uint8_t> file(region + header + sizeof code);
+    const auto put = [&](std::size_t offset, std::uint32_t value) {
+        std::memcpy(file.data() + offset, &value, sizeof value);
+    };
+    std::memcpy(file.data(), "FSSM", 4);
+    for (std::size_t s = 0x18; s < 0x78; s += 8)
+        put(s, 0xdeadbeef);
+    put(0x20, region); // pixel record
+    put(0xc0, region);
+    put(0xc8, header + sizeof code);
+    put(region + 0x10, region + header);
+    put(region + 0x18, sizeof code);
+    std::memcpy(file.data() + region + header, code, sizeof code);
+
+    const D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, ~0u, 0, 0, 0};
+    const D3D12_DESCRIPTOR_RANGE smp_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 4, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = {1, &srv_range};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {0, 0, 1};
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable = {1, &smp_range};
+    const D3D12_ROOT_SIGNATURE_DESC rs_desc{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob *rs_blob = nullptr;
+    REQUIRE(SUCCEEDED(
+        D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rs_blob, nullptr)));
+    const auto *const dxbc = static_cast<const std::uint8_t *>(rs_blob->GetBufferPointer());
+    std::uint32_t chunk_at = 0, chunk_sz = 0;
+    std::memcpy(&chunk_at, dxbc + 32, 4);
+    std::memcpy(&chunk_sz, dxbc + chunk_at + 4, 4);
+    rdna::Shader shader{
+        file, {dxbc + chunk_at + 8, chunk_sz}, {}, {{"SV_Target", 0, 3, 2, false, 0, 3, 3}}};
+    shader.heaps = true;
+    std::string why;
+    bool needs_sm6 = false;
+    const auto source = rdna::translate(ShaderStage::pixel, shader, &why, nullptr, &needs_sm6);
+    rs_blob->Release();
+    INFO(why);
+    REQUIRE(source);
+    INFO(*source);
+    CHECK(needs_sm6);
+    CHECK(source->find("ResourceDescriptorHeap[NonUniformResourceIndex(min(xv_ud0 + (d0 >> 5)") !=
+          std::string::npos);
+    CHECK(source->find("SamplerDescriptorHeap[min(xv_ud2 + 2u, 2047u)]") != std::string::npos);
 }
